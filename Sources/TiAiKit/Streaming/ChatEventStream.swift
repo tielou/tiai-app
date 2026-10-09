@@ -102,3 +102,17 @@ public struct ChatEventStream: AsyncSequence, Sendable {
         }
     }
 }
+
+extension ChatEventStream {
+    /// Reads the stream to the end and discards what it yields.
+    ///
+    /// This is not a no-op. When a completion carries a message id the server
+    /// awaits the whole generation inside the request and answers with an empty
+    /// body at the end, so the content arrives over the socket and the REST body
+    /// is just a lifecycle signal: it closing means the run is over, and the
+    /// errors in it are real (`401`, `429`) even though the text is not. A
+    /// client that never reads it also never learns the request failed.
+    public func drain() async throws {
+        for try await _ in self {}
+    }
+}

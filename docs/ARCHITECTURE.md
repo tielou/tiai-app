@@ -152,15 +152,46 @@ Reference notes; the code links back to this section.
 * **M0 — probe.** Done, see `docs/M0-FINDINGS.md`. `swift run tiaiprobe`.
 * **M1 — kit.** Auth + keychain, models, chat list/detail, SSE streaming,
   cancel, error taxonomy, contract tests. **Done.**
-* **M2 — conversation.** The transcript screen: incremental markdown, code
-  blocks, reasoning disclosure, composer with model and feature pickers,
-  attachments, regenerate/edit/branch, stop. First TestFlight build.
+* **M2 — conversation.** Transcript screen, streaming, reasoning disclosure,
+  code blocks, composer with model and feature pickers, stop, regenerate.
+  **Done** — and the socket.io channel moved here from M4, because the probe
+  proved it is the only way to stream a persisted exchange.
+  Still open inside M2: attachments, edit-and-resend, branch navigation ("2/3").
 * **M3 — around the chat.** Memory, prompts, search, share/export, settings,
   diagnostics, theme.
-* **M4 — live events.** socket.io side channel for status, tool cards and
-  citations, replacing the post-stream reconcile.
+* **M4 — live events.** The remaining socket payloads the app does not yet use:
+  status trails, tool cards, citations.
 * **M5 — the native-only layer.** Voice (on-device STT/TTS), widgets, Live
   Activity for long generations, share extension, Shortcuts, iPad/Mac.
+
+## The conversation layer
+
+Three pieces, and the split is by lifetime rather than by size.
+
+`ChatEventHub` owns the app's single socket. The server emits to the room
+`user:<id>`, so one connection carries every chat and each screen filters by
+`chat_id`; one reconnect on a bad wifi instead of one per screen. It hands out
+per-chat `AsyncStream`s and has no replay — a frame nobody is listening for is
+gone, which is why a conversation subscribes *before* it sends.
+
+`ConversationModel` is one conversation's state machine. Four rules, all
+measured rather than assumed (see `M0-FINDINGS.md`):
+
+1. create the chat before the completion, or the answer streams to a chat id you
+   never learn;
+2. send the assistant message id as `id`, or nothing is persisted;
+3. the POST blocks for the whole generation with an empty body, so it runs in one
+   task while frames are read in another;
+4. `finish_reason` ends the run — there is no `done` frame.
+
+Deltas are buffered and published on a 60 ms timer rather than per token, and
+the buffer is flushed by the timer rather than by the next frame: a stream that
+falls silent without a terminal frame would otherwise leave its last tokens
+buffered and invisible.
+
+`Turn` is one bubble. `Markdown.blocks` splits prose from fenced code, treating
+an unterminated fence as code so a block appears as code the moment the opening
+fence lands instead of flickering between prose and code as tokens arrive.
 
 ## Working on it
 

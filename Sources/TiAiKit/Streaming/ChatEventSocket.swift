@@ -98,6 +98,11 @@ public final class ChatEventSocket: @unchecked Sendable {
             return decoded
         }
 
+        /// Which model actually answered. Usually the one asked; an arena or
+        /// auto-routed model reports something else here, and the transcript
+        /// should say what really replied.
+        public var answeredModel: String? { inner?["model"]?.stringValue }
+
         /// An error the model run reported mid-stream, if any.
         public var errorText: String? {
             data["error"]?.stringValue ?? inner?["error"]?.stringValue

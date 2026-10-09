@@ -108,6 +108,7 @@ public struct ConnectView: View {
 public struct ChatListView: View {
     @Bindable private var session: SessionStore
     @State private var chats: Resource<[ChatSummary]>
+    @State private var models: [ChatModel] = []
     @State private var query = ""
     @State private var searchResults: [ChatSummary] = []
 
@@ -153,13 +154,24 @@ public struct ChatListView: View {
                 }
             }
             .navigationTitle("Chats")
-            .navigationDestination(for: String.self) { _ in
-                // The conversation screen is milestone M2.
-                Text("Conversation")
+            .navigationDestination(for: String.self) { id in
+                ConversationView(session: session, chatID: id, models: models)
             }
             .searchable(text: $query)
             .refreshable { await chats.refresh() }
-            .task { await chats.refresh() }
+            .task {
+                await chats.refresh()
+                if models.isEmpty { models = (try? await session.client.models()) ?? [] }
+            }
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    NavigationLink {
+                        ConversationView(session: session, chatID: nil, models: models)
+                    } label: {
+                        Label("New chat", systemImage: "square.and.pencil")
+                    }
+                }
+            }
             .overlay {
                 if chats.unauthorized {
                     ContentUnavailableView(

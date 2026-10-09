@@ -218,12 +218,28 @@ growing. Sample, wait 4 s, sample again, and it also reports whether the REST
 stream closed after the stop or was still open 45 s later. Until that prints a
 pass, the Stop button is unverified, not verified.
 
-## Still to verify
+## Closed
 
-* [ ] **assumption 2, re-run after the `id` fix** — after the stream,
-      `GET /chats/{id}` contains both turns, with `done`, `statusHistory` and `usage`
-* [ ] `POST /api/tasks/chat/{id}/stop` actually stops generation
-* [ ] deleting the probe chat works (passed in round 3)
+Final run against `https://chat.wobker.co`, Open WebUI 0.11.4 — **all checks
+passed**, 49 kit tests green:
+
+| check | result |
+|---|---|
+| health, version, config | 0.11.4, websocket advertised |
+| password sign-in | `thilo@wobker.co`, role admin |
+| model list | 5 models, capabilities and `defaultFeatureIds` as recorded above |
+| socket.io connects | `/ws/socket.io`, websocket-only, bearer token in CONNECT |
+| create chat | `POST /chats/new` with the `{"chat": {…}}` envelope |
+| completion streams | 52 frames, answer reconstructed, first token 1.7 s |
+| persisted | `user → assistant`, `done: true` |
+| stop | fired at the 6th delta; stored answer did not grow over the next 4 s |
+| memories / prompts / chat list | 6 / 0 / 142 |
+| delete chat | gone |
+
+Two things this deliberately does **not** prove, because the models on this
+server never emitted them: `usage` on the socket, and `status` / tool / citation
+frames. Those decoders are tolerant and unproven, and will stay that way until a
+model that emits them is probed.
 
 ## Decisions this has already changed
 

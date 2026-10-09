@@ -265,15 +265,6 @@ func storedLength(_ client: OWUIClient, _ chatID: String) async throws -> Int {
     try await client.chat(id: chatID).thread.last(where: \.isAssistant)?.content.text.count ?? 0
 }
 
-extension ChatEventStream {
-    /// Reads a completion stream to the end. The body is empty when a message id
-    /// was sent; draining it is what keeps the connection honest and the error
-    /// handling honest too — a 401 surfaces from here.
-    func drain() async throws {
-        for try await _ in self {}
-    }
-}
-
 /// A lock-guarded counter, so the socket callback can tally frames it ignores
 /// without the probe pretending Swift 6 concurrency does not exist.
 final class Counter: @unchecked Sendable {

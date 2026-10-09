@@ -48,6 +48,23 @@ public final class SessionStore {
 
     public var client: OWUIClient { OWUIClient(server: server) }
 
+    /// The app's one socket.
+    ///
+    /// One connection for every screen because the server emits to the room
+    /// `user:<id>` — all chats arrive on a single connection and each screen
+    /// filters. It is rebuilt when the server changes (sign-in, URL edit) so a
+    /// stale socket cannot outlive the token it authenticated with.
+    public func eventHub() -> ChatEventHub {
+        if let hub, hubServer == server { return hub }
+        let hub = ChatEventHub(server: server)
+        self.hub = hub
+        hubServer = server
+        return hub
+    }
+
+    @ObservationIgnored private var hub: ChatEventHub?
+    @ObservationIgnored private var hubServer: Server?
+
     // MARK: - connecting
 
     public func setURL(_ text: String) {

@@ -1,0 +1,369 @@
+import Foundation
+
+/// The state behind one conversation.
+///
+/// Everything here follows from four things the probe measured rather than
+/// assumed, and they are worth writing down because all four are
+/// counter-intuitive:
+///
+/// 1. The chat must exist before the completion is sent. A server-minted new
+///    chat id is announced only over the socket, so a client that lets the
+///    server create the chat cannot subscribe in time to hear its own answer.
+/// 2. The completion must carry the assistant message id as `id`. Without it the
+///    server creates no event emitter and the exchange is silently never written
+///    to the transcript — the answer arrives, and then never happened.
+/// 3. The POST does not return until the model has finished, and its body is
+///    empty. Content arrives over the socket, so the POST runs in one task while
+///    this reads frames in another.
+/// 4. The end of a run is a `finish_reason`, not a `done` frame.
+@MainActor
+@Observable
+public final class ConversationModel {
+    public enum Phase: Equatable {
+        case loading
+        case ready
+        /// Sent, waiting for the first token.
+        case waiting
+        /// Tokens arriving.
+        case streaming
+        /// Stop requested, waiting for the run to actually end.
+        case stopping
+
+        public var isBusy: Bool { self != .ready && self != .loading }
+    }
+
+    public private(set) var turns: [Turn] = []
+    public private(set) var phase: Phase = .ready
+    public private(set) var error: String?
+    public private(set) var title: String
+    /// Nil until the chat exists. It is set by `createChat`, not by the caller —
+    /// a new conversation learns its own id mid-send.
+    public private(set) var chatID: String?
+
+    /// What the composer holds. On the model rather than in `@State` so a draft
+    /// survives navigating away and back.
+    public var draft = ""
+    public var model: String
+    public var features: [String: Bool]
+    public var modelIDs: [String] = []
+
+    private let client: OWUIClient
+    private let hub: ChatEventHub
+    private var run: Task<Void, Never>?
+    private var post: Task<Void, Never>?
+    /// The message the next reply will be filed under. Tracked explicitly rather
+    /// than derived from `turns`, because "the last thing in the tree" is exactly
+    /// the thing regenerate and edit change.
+    private var leafID: String?
+
+    /// How long to wait on a silent stream before calling it dead. Longer than
+    /// the slowest cold prefill you have seen, shorter than someone's patience.
+    static let silenceLimit: Duration = .seconds(180)
+    /// Deltas are coalesced before they reach observable state: a model emitting
+    /// token by token would otherwise invalidate the transcript view per token,
+    /// which is the difference between a smooth stream and a stuttering one.
+    static let flushInterval: Duration = .milliseconds(60)
+
+    public init(
+        chatID: String?,
+        title: String = "New Chat",
+        models: [ChatModel] = [],
+        client: OWUIClient,
+        hub: ChatEventHub
+    ) {
+        self.chatID = chatID
+        self.title = title
+        self.client = client
+        self.hub = hub
+        modelIDs = models.map(\.id)
+        model = models.first?.id ?? ""
+        // Seed the toggles from what the server says this model wants by
+        // default, so a model configured for web search starts with it on
+        // instead of making the user rediscover it in every chat.
+        features = Dictionary(
+            uniqueKeysWithValues: (models.first?.defaultFeatureIDs ?? []).map { ($0, true) })
+    }
+
+    public var canSend: Bool {
+        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !phase.isBusy
+    }
+
+    public func setModels(_ models: [ChatModel]) {
+        modelIDs = models.map(\.id)
+        if model.isEmpty { model = models.first?.id ?? "" }
+    }
+
+    /// Called when the model changes: the defaults belong to the model, so the
+    /// toggles have to follow it rather than keep the previous model's settings.
+    public func select(model id: String, from models: [ChatModel]) {
+        model = id
+        features = Dictionary(
+            uniqueKeysWithValues: (models.first { $0.id == id }?.defaultFeatureIDs ?? []).map { ($0, true) })
+    }
+
+    /// Connects the shared socket. Failures are not fatal: the REST calls still
+    /// work, and a chat that cannot stream is better than a screen that refuses
+    /// to open — so this records the problem and lets the run fail on its own.
+    public func connect() async {
+        do { try await hub.connect() }
+        catch let problem { error = "Live streaming is unavailable: \(problem.localizedDescription)" }
+    }
+
+    // MARK: - loading
+
+    public func load() async {
+        guard let chatID else { return }
+        phase = .loading
+        do {
+            let detail = try await client.chat(id: chatID)
+            title = detail.title
+            turns = detail.thread.map(Turn.init)
+            leafID = turns.last?.id
+            if let used = detail.models.first, !used.isEmpty { model = used }
+            phase = .ready
+        } catch {
+            self.error = error.localizedDescription
+            phase = .ready
+        }
+    }
+
+    // MARK: - sending
+
+    public func send() {
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !phase.isBusy else { return }
+        draft = ""
+        error = nil
+        // Set here rather than inside the task: the button's feedback should not
+        // wait for a scheduling hop, and a caller that then awaits something
+        // conditioned on the phase would otherwise race the run it just started.
+        phase = .waiting
+        run = Task { await self.exchange(text: text, regenerating: nil) }
+    }
+
+    /// Re-runs the last user message. That message's id is reused, so the server
+    /// files the new answer as a sibling in the message tree instead of a new
+    /// turn — which is what makes the web UI's "2/3" possible, and costs nothing
+    /// here because the app already knows the id.
+    public func regenerate() {
+        guard !phase.isBusy, let index = turns.lastIndex(where: \.isUser) else { return }
+        let last = turns[index]
+        error = nil
+        turns.removeSubrange(turns.index(after: index)..<turns.endIndex)
+        leafID = last.id
+        phase = .waiting
+        run = Task { await self.exchange(text: last.text, regenerating: last.id) }
+    }
+
+    /// Asks the server to halt the run in flight.
+    ///
+    /// It has to be a separate request: the completion POST is still open for the
+    /// whole generation, so there is no other channel to shout down. A 200 here
+    /// is not proof anything stopped — hence `stopping` rather than `ready`, and
+    /// the terminal frame is what actually ends it.
+    public func stop() {
+        guard let chatID, phase.isBusy else { return }
+        phase = .stopping
+        Task {
+            do { try await client.stop(chatID: chatID) }
+            catch { self.error = error.localizedDescription }
+        }
+    }
+
+    /// Gives up on the local view of a run — used when the app goes to the
+    /// background, where the socket will be cut anyway.
+    public func abandon() {
+        run?.cancel()
+        post?.cancel()
+        post = nil
+        if let index = turns.lastIndex(where: \.isAssistant) { turns[index].streaming = false }
+        phase = .ready
+    }
+
+    // MARK: - the exchange
+
+    private struct Located {
+        var turn: Turn
+        var index: Int
+    }
+
+    private func exchange(text: String, regenerating: String?) async {
+        guard !model.isEmpty else {
+            error = "No model selected."
+            return
+        }
+        phase = .waiting
+        let chat: String
+        do {
+            chat = try await ensureChat(named: text)
+        } catch {
+            self.error = error.localizedDescription
+            phase = .ready
+            return
+        }
+
+        let userMessageID = regenerating ?? UUID().uuidString
+        let assistantID = UUID().uuidString
+        let parentID = regenerating ?? leafID
+
+        if regenerating == nil {
+            turns.append(Turn(id: userMessageID, role: "user", text: text))
+        }
+        let history = wireHistory(through: userMessageID, userText: text)
+        turns.append(Turn(id: assistantID, role: "assistant", streaming: true))
+        let assistantIndex = turns.count - 1
+
+        // Subscribing before the POST matters: frames can arrive while the
+        // request is still in flight, and the socket has no replay.
+        let frames = hub.frames(for: chat)
+        let request = CompletionRequest(
+            model: model,
+            messages: history,
+            chatID: chat,
+            parentID: parentID.map(CompletionRequest.ParentID.message) ?? .root,
+            userMessage: CompletionRequest.WireMessage(
+                id: userMessageID, role: "user", content: .text(text),
+                parentID: parentID, model: model),
+            messageID: assistantID,
+            features: features)
+
+        // Blocks for the whole generation and yields no body; what is left for it
+        // to do is fail loudly (401, 429) and to close. The task inherits this
+        // actor's isolation, so reporting from it needs no hop.
+        post = Task {
+            do { try await self.client.stream(request).drain() }
+            catch { self.recordPostError(error) }
+        }
+
+        var sawTerminal = false
+        var failure: String?
+        // Buffered off the frame loop so a timer, not the next frame, decides
+        // when it becomes visible. Flushing only "when a frame arrives and 60 ms
+        // have passed" loses the tail: a stream that stops without a terminal
+        // frame would leave its last tokens buffered and unseen.
+        pending = Turn(id: assistantID, role: "assistant", streaming: true)
+        let flusher = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.flushInterval)
+                guard !Task.isCancelled else { return }
+                self?.publishPending(keeping: assistantID, index: assistantIndex)
+            }
+        }
+        let watchdog = Task { [hub] in
+            try? await Task.sleep(for: Self.silenceLimit)
+            hub.expire(chatID: chat)
+        }
+
+        for await frame in frames {
+            if let messageID = frame.messageID, messageID != assistantID { continue }
+            if let delta = frame.delta { pending?.text += delta }
+            if let thinking = frame.reasoningDelta { pending?.reasoning += thinking }
+            if let usage = frame.usage { pending?.usage = usage }
+            if let problem = frame.errorText { failure = problem }
+            if let answered = frame.answeredModel { pending?.model = answered }
+            if frame.isTerminal { sawTerminal = true; break }
+        }
+        watchdog.cancel()
+        flusher.cancel()
+
+        var finished = pending ?? Turn(id: assistantID, role: "assistant")
+        finished.streaming = false
+        finished.error = failure
+        flush(finished, into: assistantIndex, final: true)
+        pending = nil
+        post?.cancel()
+        post = nil
+
+        if sawTerminal {
+            leafID = assistantID
+        } else if failure == nil {
+            failure = phase == .stopping ? "Stopped." : "The server sent nothing."
+        }
+        if let failure { error = failure }
+        phase = .ready
+    }
+
+    /// A failed POST is reported only if the run has not already ended on its own
+    /// terms — a stream closed by `stop()` errors on the way out, and calling
+    /// that a failure would be a lie the user cannot act on.
+    private func recordPostError(_ error: Error) {
+        guard phase.isBusy else { return }
+        if let api = error as? APIError, api.isUnauthorized { self.error = "Signed out." }
+        else { self.error = error.localizedDescription }
+    }
+
+    /// Text accumulated from the socket but not yet published.
+    @ObservationIgnored private var pending: Turn?
+
+    /// Publishes whatever has arrived. Runs on the flush timer, so it must not
+    /// invent a turn if the run has already been replaced (a regenerate, say).
+    private func publishPending(keeping id: String, index: Int) {
+        guard let pending, pending.id == id else { return }
+        flush(pending, into: index)
+    }
+
+    /// Publishes buffered text. Only touches `turns` on a flush, so the view
+    /// diffs at ~16 Hz instead of once per token.
+    private func flush(_ source: Turn, into index: Int, final: Bool = false) {
+        guard index < turns.count else { return }
+        var turn = turns[index]
+        turn.text = source.text
+        turn.reasoning = source.reasoning
+        turn.usage = source.usage ?? turn.usage
+        turn.model = source.model ?? turn.model
+        turn.error = source.error
+        turn.streaming = final ? false : turn.streaming
+        turns[index] = turn
+        if !final && (!source.text.isEmpty || !source.reasoning.isEmpty), phase.isBusy {
+            phase = .streaming
+        }
+    }
+
+    /// The chat has to exist before the completion is sent, and a brand-new
+    /// conversation does not exist until this returns.
+    private func ensureChat(named text: String) async throws -> String {
+        if let chatID { return chatID }
+        let created = try await client.createChat(title: Self.title(from: text))
+        chatID = created.id
+        title = created.title
+        return created.id
+    }
+
+    static func title(from text: String) -> String {
+        let line = text.split(separator: "\n", omittingEmptySubsequences: true).first.map(String.init) ?? text
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "New Chat" : String(trimmed.prefix(40))
+    }
+
+    /// The thread in the shape the completion endpoint wants: oldest first, each
+    /// message pointing at its parent. The message being (re)asked is included
+    /// with the caller's text, since locally it is still the empty placeholder or
+    /// the previous answer's text.
+    private func wireHistory(through userMessageID: String, userText: String)
+        -> [CompletionRequest.WireMessage]
+    {
+        var out: [CompletionRequest.WireMessage] = []
+        var parent: String?
+        for turn in turns {
+            let message: CompletionRequest.WireMessage?
+            if turn.id == userMessageID {
+                message = .init(
+                    id: turn.id, role: "user", content: .text(userText), parentID: parent, model: model)
+            } else if turn.isAssistant, !turn.text.isEmpty, !turn.streaming {
+                message = .init(
+                    id: turn.id, role: "assistant", content: .text(turn.text), parentID: parent,
+                    model: turn.model ?? model)
+            } else if turn.isUser, !turn.text.isEmpty {
+                message = .init(
+                    id: turn.id, role: "user", content: .text(turn.text), parentID: parent, model: model)
+            } else {
+                message = nil
+            }
+            if let message {
+                out.append(message)
+                parent = message.id
+            }
+        }
+        return out
+    }
+}
