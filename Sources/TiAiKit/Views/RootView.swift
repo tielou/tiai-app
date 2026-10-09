@@ -174,6 +174,11 @@ public struct ChatListView: View {
                         Label("New chat", systemImage: "square.and.pencil")
                     }
                 }
+                // `.navigation` rather than `.topBarLeading`: the kit builds for
+                // macOS too, where the latter does not exist.
+                ToolbarItem(placement: .navigation) {
+                    AppearancePicker()
+                }
             }
             .overlay {
                 if chats.unauthorized {

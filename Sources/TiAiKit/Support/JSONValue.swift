@@ -43,8 +43,13 @@ public enum JSONValue: Hashable, Sendable {
         }
     }
 
-    public var boolValue: Bool? {
-        if case let .bool(value) = self { value } else { nil }
+    public var boolValue: Bool? {        if case let .bool(value) = self { value } else { nil }
+    }
+
+    /// True for an explicit JSON `null`, which is different from the key being
+    /// absent — the server uses that difference in places.
+    public var isNull: Bool {
+        if case .null = self { true } else { false }
     }
 
     public var objectValue: [String: JSONValue]? {

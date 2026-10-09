@@ -17,6 +17,8 @@ import UIKit
 struct ComposerView: View {
     @Bindable var conversation: ConversationModel
     var models: [ChatModel] = []
+    /// MCP servers configured on the instance, passed through to the `+` sheet.
+    var toolServers: [ToolServer] = []
 
     @State private var sheet: Sheet?
     @State private var pending: Pending?
@@ -66,7 +68,7 @@ struct ComposerView: View {
             switch which {
             case .add:
                 AddToChatSheet(
-                    conversation: conversation, models: models,
+                    conversation: conversation, models: models, servers: toolServers,
                     onCamera: { hand(.camera) }, onPhotos: { hand(.photos) },
                     onFiles: { hand(.files) })
             case .models:
@@ -212,6 +214,9 @@ struct AttachmentChip: View {
 struct AddToChatSheet: View {
     @Bindable var conversation: ConversationModel
     var models: [ChatModel]
+    /// MCP servers configured on the instance. Empty hides the section entirely:
+    /// a "Servers" heading with nothing under it reads as a bug, not as "none".
+    var servers: [ToolServer] = []
     var onCamera: () -> Void
     var onPhotos: () -> Void
     var onFiles: () -> Void
@@ -230,6 +235,23 @@ struct AddToChatSheet: View {
                         Spacer()
                     }
                     .frame(height: 78)
+                }
+
+                if !servers.isEmpty {
+                    Section("Servers") {
+                        ForEach(servers) { server in
+                            Toggle(isOn: serverBinding(server)) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(server.name)
+                                    if server.url != nil {
+                                        Text(server.id).font(.caption).foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                }
+                            }
+                            .disabled(!server.reachable)
+                        }
+                    }
                 }
 
                 Section("Tools") {
@@ -265,6 +287,15 @@ struct AddToChatSheet: View {
     }
 
     private var currentModel: ChatModel? { models.first { $0.id == conversation.model } }
+
+    private func serverBinding(_ server: ToolServer) -> Binding<Bool> {
+        Binding(
+            get: { conversation.servers.contains(server.id) },
+            set: { on in
+                if on { conversation.servers.append(server.id) }
+                else { conversation.servers.removeAll { $0 == server.id } }
+            })
+    }
 
     private func binding(for feature: ChatFeature) -> Binding<Bool> {
         Binding(

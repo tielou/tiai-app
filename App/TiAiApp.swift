@@ -7,10 +7,16 @@ import TiAiKit
 @main
 struct TiAiApp: App {
     @State private var session = SessionStore()
+    @State private var appearance = AppearanceStore.shared
 
     var body: some Scene {
         WindowGroup {
             RootView(session: session)
+                // `nil` for "follow the system", which is the default and the
+                // right answer for almost everyone; the picker exists for the
+                // person whose phone is dark at night and who still wants the
+                // chat light, or who picked dark in the web UI.
+                .preferredColorScheme(appearance.mode.colorScheme)
         }
     }
 }

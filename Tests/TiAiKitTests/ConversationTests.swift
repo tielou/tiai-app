@@ -629,3 +629,39 @@ enum AskUserFixture {
     #expect(calls[0].status == .completed)
     #expect(!calls[0].isAwaitingUser)
 }
+
+@Test func anAnsweredCallReadsAsASentenceNotAsJSON() throws {
+    let items: [JSONValue] = [
+        .object([
+            "type": .string("function_call"), "call_id": .string("c1"),
+            "name": .string("ask_user"), "status": .string("completed"), "arguments": .string("{}"),
+        ]),
+        .object([
+            "type": .string("function_call_output"), "call_id": .string("c1"),
+            "output": .array([.object([
+                "type": .string("input_text"),
+                "text": .string(#"{"status":"answered","answers":{"meal":"Pizza"}}"#),
+            ])]),
+            "status": .string("completed"),
+        ]),
+    ]
+    let call = try #require(ToolCall.calls(from: items).first)
+    // The transcript should say what was picked, not show the wire payload.
+    #expect(call.answerSummary == "Pizza")
+}
+
+@Test func toolServersComeFromTheServerNotFromTheApp() throws {
+    let payload: [JSONValue] = [
+        .object(["url": .string("https://sonos.home.lan/mcp"), "name": .string("Sonos")]),
+        .object(["url": .string("https://mcp.notion.com/mcp"), "key": .string("notion")]),
+        // An entry with nothing to identify it is dropped, not shown blank.
+        .object(["description": .string("mystery")]),
+    ]
+    let servers = payload.compactMap(ToolServer.init)
+    #expect(servers.map(\.id) == ["https://sonos.home.lan/mcp", "https://mcp.notion.com/mcp"])
+    #expect(servers[0].name == "Sonos")
+    // No name falls back to the host rather than the whole URL.
+    #expect(servers[1].name == "mcp.notion.com")
+    // Unverified is not broken: only an explicit error disables a server.
+    #expect(servers[0].reachable)
+}

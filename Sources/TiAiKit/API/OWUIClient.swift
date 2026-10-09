@@ -301,6 +301,19 @@ public struct OWUIClient: Sendable {
 
     // MARK: - tool calls
 
+    /// The MCP tool servers the operator has configured.
+    ///
+    /// Read from the instance rather than listed in the app, so a server added
+    /// in the admin UI shows up in the chat without an app release. The response
+    /// is an array of configuration blobs whose shape belongs to the admin UI,
+    /// not to the API contract, so it is decoded tolerantly and unreadable
+    /// entries are dropped rather than failing the whole list.
+    public func toolServers() async throws -> [ToolServer] {
+        struct Envelope: Decodable { let data: [JSONValue] }
+        let envelope: Envelope = try await request("GET", "/configs/tool_servers")
+        return envelope.data.compactMap(ToolServer.init)
+    }
+
     /// Answers a tool call and lets the parked run continue.
     ///
     /// One route, three actions: `approve` and `reject` for a tool the model

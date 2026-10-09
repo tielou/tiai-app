@@ -48,6 +48,9 @@ public final class ConversationModel {
     /// Tool ids to offer this run. Empty means the server's own default set for
     /// the model, which is what almost every chat wants.
     public var tools: [String] = []
+    /// MCP tool servers selected for this chat, keyed by url — what the server
+    /// matches on. Empty means the instance's default set.
+    public var servers: [String] = []
     /// The chat's template variables, carried back untouched on every send.
     public var chatVariables: JSONValue?
     public var modelIDs: [String] = []
@@ -299,6 +302,7 @@ public final class ConversationModel {
             // right for a headless client and wrong for one in the hand.
             params: CompletionRequest.Params(toolApprovalMode: "ask"),
             toolIDs: tools.isEmpty ? nil : tools,
+            toolServerIDs: servers.isEmpty ? nil : servers,
             chatVariables: chatVariables,
             sessionID: hub.sessionID)
 
@@ -471,9 +475,33 @@ public final class ConversationModel {
             }
             if outcome.sawTerminal { self.leafID = messageID }
             else if outcome.failure == nil { outcome.failure = "The server sent nothing." }
+            await self.refresh(messageID: messageID)
             if let failure = outcome.failure { self.error = failure }
             self.phase = .ready
         }
+    }
+
+    /// Pulls the stored message back after a resumed run.
+    ///
+    /// The answer the model gives after a question is real and saved — the web
+    /// UI shows it — but this client has never caught it live, and the frame
+    /// shape of a resumed run is not worth guessing at: a guess works until the
+    /// server changes and then fails quietly. One GET is always right, and the
+    /// comparison is by length so a partial live stream is only ever replaced by
+    /// something more complete, never by less.
+    private func refresh(messageID: String) async {
+        guard let chat = chatID,
+              let detail = try? await client.chat(id: chat),
+              let message = detail.messages[messageID],
+              let index = turns.firstIndex(where: { $0.id == messageID })
+        else { return }
+        let fresh = Turn(message)
+        var turn = turns[index]
+        if fresh.text.count > turn.text.count { turn.text = fresh.text }
+        if fresh.reasoning.count > turn.reasoning.count { turn.reasoning = fresh.reasoning }
+        if !fresh.calls.isEmpty { turn.calls = fresh.calls }
+        turn.usage = fresh.usage ?? turn.usage
+        turns[index] = turn
     }
 
     /// A failed POST is reported only if the run has not already ended on its own

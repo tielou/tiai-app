@@ -77,6 +77,26 @@ public struct ToolCall: Equatable, Sendable, Identifiable {
         self.resultText = Self.text(from: object["output"])
     }
 
+    /// What the user actually chose, pulled out of the tool's own reply.
+    ///
+    /// The stored result is the JSON the tool was handed back —
+    /// `{"status":"answered","answers":{"meal":"Pizza"}}` — and showing that
+    /// verbatim, as the first builds did, puts a JSON blob where a sentence
+    /// belongs. The user picked Pizza; the transcript should say Pizza.
+    public var answerSummary: String? {
+        guard let raw = resultText else { return nil }
+        guard let data = raw.data(using: .utf8),
+              let json = try? JSONDecoder().decode(JSONValue.self, from: data)
+        else { return raw }
+
+        let values = (json["answers"]?.objectValue ?? [:]).values.compactMap { value -> String? in
+            if let text = value.stringValue { return text }
+            let list = value.arrayValue?.compactMap { $0.stringValue }
+            return list?.isEmpty == false ? list!.joined(separator: ", ") : nil
+        }
+        return values.isEmpty ? raw : values.joined(separator: " · ")
+    }
+
     /// Folds a message's `output` array into calls.
     ///
     /// The array holds a `function_call` and, once resolved, a separate

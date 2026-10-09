@@ -15,6 +15,9 @@ public struct ConversationView: View {
     @State private var conversation: ConversationModel
     @State private var atBottom = true
     @Environment(\.scenePhase) private var scenePhase
+    /// MCP servers offered by the instance. Loaded lazily and ignored if the
+    /// deployment has none, so the `+` sheet simply has no Servers section.
+    @State private var toolServers: [ToolServer] = []
     /// Kept for the composer and the model sheet: the conversation only needs the
     /// id to seed itself, but the UI needs the whole record to show what each
     /// model can do. Dropping this is how the model sheet renders empty.
@@ -45,7 +48,7 @@ public struct ConversationView: View {
                     .padding(.vertical, 6)
                     .background(.red.opacity(0.08))
             }
-            ComposerView(conversation: conversation, models: models)
+            ComposerView(conversation: conversation, models: models, toolServers: toolServers)
         }
         .inlineTitle(conversation.title)
         .toolbar { toolbar }
@@ -56,6 +59,7 @@ public struct ConversationView: View {
             // a chat; a conversation with no model to name cannot send anything.
             if models.isEmpty { models = (try? await session.client.models()) ?? [] }
             conversation.setModels(models)
+            toolServers = (try? await session.client.toolServers()) ?? []
         }
         .onChange(of: scenePhase) { _, phase in
             // iOS kills the socket on background anyway; saying so locally beats
@@ -460,7 +464,7 @@ struct ToolCallCard: View {
     private var summary: String {
         if call.isAskUser {
             if call.status == .rejected { return "Skipped" }
-            let answer = call.resultText ?? "Answered"
+            guard let answer = call.answerSummary else { return "Answered" }
             return answer.count > 120 ? String(answer.prefix(120)) + "…" : answer
         }
         return call.status == .rejected ? "\(call.name) rejected" : call.name
