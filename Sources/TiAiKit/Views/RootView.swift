@@ -27,15 +27,17 @@ public struct ConnectView: View {
                             reachable = nil
                         }
 
-                    if session.hasServerURL {
-                        LabeledContent("Status") {
-                            switch reachable {
-                            case .some(true): Label("Reachable", systemImage: "checkmark.circle.fill")
-                                    .foregroundStyle(.green)
-                            case .some(false): Label("Not reachable", systemImage: "xmark.circle.fill")
-                                    .foregroundStyle(.red)
-                            case nil: Text("—").foregroundStyle(.secondary)
-                            }
+                    // Always present rather than added once a URL exists: a row
+                    // that appears mid-typing makes the form jump, and an `if`
+                    // around a Form row is also how you get a phantom empty row
+                    // left behind when the condition flips.
+                    LabeledContent("Status") {
+                        switch reachable {
+                        case .some(true): Label("Reachable", systemImage: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                        case .some(false): Label("Not reachable", systemImage: "xmark.circle.fill")
+                                .foregroundStyle(.red)
+                        case nil: Text("—").foregroundStyle(.secondary)
                         }
                     }
                 } header: {
@@ -51,13 +53,14 @@ public struct ConnectView: View {
                         .autocorrectionDisabled()
                     SecureField("Password", text: $password)
                         .textContentType(.password)
+                    // In the body, not the footer: a control in a footer renders
+                    // outside the grouped box, which reads as a stray switch
+                    // floating under the form.
+                    Toggle("Stay signed in", isOn: $session.remembersPassword)
                 } header: {
                     Text("Sign in")
                 } footer: {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Toggle("Stay signed in", isOn: $session.remembersPassword)
-                        Text("Open WebUI tokens expire after a few weeks and cannot be refreshed. Turning this on keeps your password in this phone's keychain so the app can sign itself back in instead of interrupting you.")
-                    }
+                    Text("Open WebUI tokens expire after a few weeks and cannot be refreshed. Turning this on keeps your password in this phone's keychain so the app can sign itself back in instead of interrupting you.")
                 }
 
                 if let error = session.lastError {

@@ -456,3 +456,19 @@ struct ServerTests {
         #expect(try server.raw("/health").absoluteString == "https://chat.example.co/health")
     }
 }
+
+@Test func anEmptyURLShellIsNotAServer() {
+    // The connect screen's placeholder is `https://`, which is a valid URL and a
+    // nonsense host. It used to be reported as "Not reachable" before anyone had
+    // typed anything.
+    let shell = Server(baseURL: URL(string: "https://")!)
+    #expect(!shell.hasURL)
+    #expect(!shell.isConfigured)
+
+    let real = Server(baseURL: URL(string: "https://chat.example.co")!, token: "t")
+    #expect(real.hasURL)
+    #expect(real.isConfigured)
+
+    let hostless = Server(baseURL: URL(string: "https://")!, token: "t")
+    #expect(!hostless.isConfigured)
+}

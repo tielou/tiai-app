@@ -2,17 +2,39 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
 	<string>tiAi</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
-	<!-- Standard TLS only, so there is nothing to declare. Without this key
-	     every TestFlight build lands flagged for export compliance and has to
-	     be clicked through by hand. -->
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<false/>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>tiAi talks to your assistant on the local network when you point it at a LAN address instead of a hostname.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Voice mode records on this device and sends audio to your own server, if you turn it on.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Dictation for the composer is transcribed on this device.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>
@@ -21,22 +43,5 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
-	<!-- The whole point of this app is that the server is wherever the user's
-	     server is, and plenty of people run Open WebUI on a LAN address with a
-	     self-signed certificate. ATS is relaxed for local networking only; a
-	     public hostname still has to be TLS. -->
-	<key>NSAppTransportSecurity</key>
-	<dict>
-		<key>NSAllowsLocalNetworking</key>
-		<true/>
-		<key>NSAllowsArbitraryLoads</key>
-		<false/>
-	</dict>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>tiAi talks to your assistant on the local network when you point it at a LAN address instead of a hostname.</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>Voice mode records on this device and sends audio to your own server, if you turn it on.</string>
-	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Dictation for the composer is transcribed on this device.</string>
 </dict>
 </plist>

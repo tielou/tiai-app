@@ -19,8 +19,15 @@ public struct Server: Codable, Equatable, Sendable {
         self.token = token
     }
 
-    public var isConfigured: Bool { !baseURL.absoluteString.isEmpty && !token.isEmpty }
-    public var hasURL: Bool { !baseURL.absoluteString.isEmpty }
+    /// A URL counts as set only if it has a host.
+    ///
+    /// `https://` is a perfectly valid URL and an absurd server. Treating the
+    /// empty shell as one produced a connect screen reporting "Not reachable"
+    /// before anyone had typed a character — a status about the user's
+    /// blank field, presented as a fact about their network.
+    public var hasURL: Bool { !(baseURL.host()?.isEmpty ?? true) }
+
+    public var isConfigured: Bool { hasURL && !token.isEmpty }
 
     /// The same server with a different token, so a candidate token can be
     /// tested before it is written to the keychain.
