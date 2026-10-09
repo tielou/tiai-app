@@ -118,6 +118,24 @@ public final class ChatEventSocket: @unchecked Sendable {
         /// Marks the end of the model's output. Not the same as `isDone`: the
         /// server still writes the transcript and emits a terminal frame after
         /// it, so a client that stops here loses the tail.
+        /// Tool calls and `ask_user` questions the run is waiting on.
+        ///
+        /// When the server pauses for a decision it emits
+        /// `chat:completion` with `{done: false, output: […]}` and returns —
+        /// there is no terminal frame, because from the server's side the run is
+        /// not over, it is parked. A client that only watches deltas keeps
+        /// spinning here.
+        public var outputItems: [ToolCall]? {
+            guard let items = inner?["output"]?.arrayValue ?? data["output"]?.arrayValue else { return nil }
+            let calls = items.compactMap(ToolCall.init)
+            return calls.isEmpty ? nil : calls
+        }
+
+        /// Whether this frame says "the run is parked waiting for the user".
+        public var isAwaitingUser: Bool {
+            outputItems?.contains(where: \ .isAwaitingUser) ?? false
+        }
+
         public var isFinish: Bool { finishReason != nil }
 
         /// What the app should treat as the end. On 0.11.4 this is reached via

@@ -70,7 +70,10 @@ public struct ConversationView: View {
                 LazyVStack(alignment: .leading, spacing: 14) {
                     if conversation.turns.isEmpty { EmptyTranscript(model: conversation.model) }
                     ForEach(conversation.turns) { turn in
-                        MessageRow(turn: turn)
+                        MessageRow(turn: turn) { call, action, answers in
+                            conversation.resolve(
+                                messageID: turn.id, call: call, action: action, answers: answers)
+                        }
                             .id(turn.id)
                     }
                     // Reserves room so the last line is not hidden behind the
@@ -160,6 +163,9 @@ private struct EmptyTranscript: View {
 /// code blocks and tables and a bubble's inset is stolen from the code.
 struct MessageRow: View {
     let turn: Turn
+    /// Answers a parked tool call. Nil on previews and on turns with nothing to
+    /// answer, which is most of them.
+    var onResolve: ((ToolCall, ToolCallAction, JSONValue?) -> Void)?
 
     var body: some View {
         if turn.isUser {
@@ -181,6 +187,11 @@ struct MessageRow: View {
                 }
                 ForEach(Array(Markdown.blocks(TextSanitizer.clean(turn.text)).enumerated()), id: \.offset) { _, block in
                     MarkdownBlockView(block: block, streaming: turn.streaming)
+                }
+                ForEach(turn.calls) { call in
+                    ToolCallCard(call: call) { action, answers in
+                        onResolve?(call, action, answers)
+                    }
                 }
                 if let error = turn.error {
                     Label(error, systemImage: "exclamationmark.octagon.fill")
@@ -303,5 +314,153 @@ struct CodeBlockView: View {
         }
         .background(.quaternary.opacity(0.35), in: .rect(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(.quaternary))
+    }
+}
+
+/// A tool call the run is waiting on, or the record of one that was answered.
+///
+/// Two very different things share this card: `ask_user`, where the model is
+/// asking a question and the answer is free-form, and every other tool, where
+/// the question is just "may I". They resolve through the same route with
+/// different actions, and the server rejects the wrong pairing, so the card
+/// decides which actions to offer from the call itself.
+struct ToolCallCard: View {
+    let call: ToolCall
+    var onResolve: (ToolCallAction, JSONValue?) -> Void
+
+    @State private var picked: Set<String> = []
+    @State private var typed = ""
+
+    private var prompt: AskUserPrompt? { AskUserPrompt(arguments: call.arguments) }
+
+    /// Used when the arguments did not parse into a recognisable question.
+    private var questionFallback: String {
+        call.arguments.flatMap { $0["question"] }?.stringValue
+            ?? "The model is asking a question."
+    }
+
+    var body: some View {
+        Group {
+            if call.isAwaitingUser { waiting } else { settled }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.background.secondary, in: .rect(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.separator))
+    }
+
+    @ViewBuilder private var waiting: some View {
+        if call.isAskUser, let prompt {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(prompt.questions) { question in
+                    Text(question.text).font(.body)
+                    ForEach(question.options) { option in
+                        Button {
+                            toggle(option.label, multi: question.multiSelect)
+                        } label: {
+                            HStack(alignment: .firstTextBaseline) {
+                                Image(
+                                    systemName: picked.contains(option.label)
+                                        ? (question.multiSelect ? "checkmark.square.fill" : "largecircle.fill.circle")
+                                        : (question.multiSelect ? "square" : "circle"))
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(option.label)
+                                    if let detail = option.detail {
+                                        Text(detail).font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .contentShape(.rect)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                if prompt.questions.allSatisfy({ $0.options.isEmpty }) || !typed.isEmpty {
+                    TextField("Type an answer", text: $typed, axis: .vertical)
+                        .textFieldStyle(.plain)
+                }
+                HStack {
+                    Button("Send") { send(prompt) }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(picked.isEmpty && typed.trimmingCharacters(in: .whitespaces).isEmpty)
+                    Button("Skip") { onResolve(.reject, nil) }
+                        .foregroundStyle(.secondary)
+                }
+                .font(.body)
+            }
+        } else if call.isAskUser {
+            // The schema was not recognised. Showing the raw question beats
+            // showing nothing: the user can still answer by typing.
+            VStack(alignment: .leading, spacing: 8) {
+                Text(questionFallback)
+                TextField("Type an answer", text: $typed, axis: .vertical).textFieldStyle(.plain)
+                Button("Send") { onResolve(.answer, .object(["answer": .string(typed)])) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(typed.isEmpty)
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Run \(call.name)?", systemImage: "wrench.and.screwdriver")
+                    .font(.body.weight(.medium))
+                if let arguments = call.arguments?.jsonText {
+                    Text(arguments)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .textSelection(.enabled)
+                }
+                HStack {
+                    Button("Approve") { onResolve(.approve, nil) }
+                        .buttonStyle(.borderedProminent)
+                    Button("Reject", role: .destructive) { onResolve(.reject, nil) }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var settled: some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .foregroundStyle(call.status == .rejected || call.status == .failed ? .red : .secondary)
+            Text(summary).font(.callout).foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var icon: String {
+        switch call.status {
+        case .rejected: "xmark.circle"
+        case .failed: "exclamationmark.triangle"
+        case .completed: "checkmark.circle"
+        default: "circle"
+        }
+    }
+
+    private var summary: String {
+        if call.isAskUser {
+            if call.status == .rejected { return "Skipped" }
+            let answer = call.resultText ?? "Answered"
+            return answer.count > 120 ? String(answer.prefix(120)) + "…" : answer
+        }
+        return call.status == .rejected ? "\(call.name) rejected" : call.name
+    }
+
+    private func toggle(_ label: String, multi: Bool) {
+        if multi {
+            if picked.contains(label) { picked.remove(label) } else { picked.insert(label) }
+        } else {
+            picked = [label]
+            typed = ""
+        }
+    }
+
+    private func send(_ prompt: AskUserPrompt) {
+        var selections: [String: [String]] = [:]
+        for question in prompt.questions {
+            if !picked.isEmpty { selections[question.text] = Array(picked) }
+            else { selections[question.text] = [typed] }
+        }
+        onResolve(.answer, prompt.answers(for: selections))
     }
 }

@@ -299,6 +299,48 @@ public struct OWUIClient: Sendable {
         }
     }
 
+    // MARK: - tool calls
+
+    /// Answers a tool call and lets the parked run continue.
+    ///
+    /// One route, three actions: `approve` and `reject` for a tool the model
+    /// wants to run, `answer` for `ask_user`. The server refuses the wrong one —
+    /// approving an `ask_user` is a 400 — so the caller picks by what the call
+    /// actually is rather than by what seems reasonable.
+    ///
+    /// The response is not the answer. Resolving starts a *new* completion on
+    /// the server, whose tokens arrive on the socket under the same assistant
+    /// message id, so the caller must still be listening when this returns.
+    public func resolveToolCall(
+        chatID: String,
+        messageID: String,
+        callID: String,
+        action: ToolCallAction,
+        answers: JSONValue? = nil,
+        timedOut: Bool = false
+    ) async throws {
+        var body: [String: JSONValue] = [
+            "call_id": .string(callID),
+            "action": .string(action.rawValue),
+            "timed_out": .bool(timedOut),
+        ]
+        if let answers { body["answers"] = answers }
+        let data = (try? JSONEncoder().encode(body)) ?? Data("{}".utf8)
+
+        let (payload, http) = try await perform(
+            "POST", server.api("/chats/\(chatID)/messages/\(messageID)/resolve"), bodyData: data)
+        switch http.statusCode {
+        case 200..<300: break
+        case 401: throw APIError.unauthorized
+        case 409:
+            // Already resolved — usually a second device or a second tap.
+            throw APIError.http(status: 409, message: "That answer was already given.")
+        default:
+            throw APIError.http(
+                status: http.statusCode, message: Self.detail(from: payload) ?? "\(http.statusCode)")
+        }
+    }
+
     // MARK: - memories
 
     public func memories() async throws -> [Memory] {

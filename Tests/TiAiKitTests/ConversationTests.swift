@@ -238,6 +238,7 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     private(set) var paths: [String] = []
     private(set) var completionBodies: [Data] = []
     private(set) var uploads: [Data] = []
+    private(set) var resolveBodies: [Data] = []
     var completionBody: Data? { completionBodies.last }
 
     var chatDetail: Data {
@@ -252,6 +253,10 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
         let path = request.url?.path ?? ""
         paths.append(path)
         if path.hasSuffix("/chats/new") { return (chatDetail, response(for: request, 200)) }
+        if path.hasSuffix("/resolve") {
+            resolveBodies.append(request.httpBody ?? Data())
+            return (Data(#"{"status":true}"#.utf8), response(for: request, 200))
+        }
         if path.hasSuffix("/files") || path.hasSuffix("/files/") {
             uploads.append(request.httpBody ?? Data())
             return (Data(#"{"id":"file-1","filename":"notes.txt","type":"text/plain","updated_at":1}"#.utf8),
@@ -407,4 +412,134 @@ extension ChatModel {
     conversation.features["web_search"] = false
     conversation.setModels([remembering, plain])
     #expect(conversation.features["web_search"] == false)
+}
+
+/// The frame the server emits when it parks a run on `ask_user`. `arguments` is
+/// a JSON string inside a JSON object, because the wire carries it that way.
+enum AskUserFixture {
+    static let arguments =
+        """
+        {"questions":[{"question":"Which city do you mean?","options":["Berlin","Munich"]}]}
+        """
+
+    static var outputItem: [String: Any] {
+        [
+            "type": "function_call", "call_id": "call_1", "name": "ask_user",
+            "status": "pending", "arguments": arguments,
+        ]
+    }
+}
+
+@Test @MainActor func anAskUserCallParksTheRunInsteadOfEndingIt() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"),
+                           transport: transport),
+        hub: hub)
+
+    conversation.draft = "book me a trip"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let assistantID = try #require(transport.assistantMessageID)
+
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: assistantID,
+        inner: ["done": false, "output": [AskUserFixture.outputItem]]))
+    try await waitUntil { conversation.phase == .ready }
+
+    let turn = try #require(conversation.turns.last)
+    #expect(turn.awaitingCall?.name == "ask_user")
+    // Parked is not finished and not failed. There is no terminal frame, so a
+    // client that treats this as the end reports "the server sent nothing".
+    #expect(conversation.error == nil)
+    #expect(conversation.phase == .ready)
+}
+
+@Test @MainActor func answeringAToolCallResumesTheSameTurn() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"),
+                           transport: transport),
+        hub: hub)
+
+    conversation.draft = "book me a trip"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let assistantID = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: assistantID,
+        inner: ["done": false, "output": [AskUserFixture.outputItem]]))
+    try await waitUntil { conversation.phase == .ready }
+
+    let call = try #require(conversation.turns.last?.awaitingCall)
+    conversation.resolve(
+        messageID: assistantID, call: call, action: .answer,
+        answers: .object(["Which city do you mean?": .string("Berlin")]))
+
+    try await waitUntil { !transport.resolveBodies.isEmpty }
+    let body = try #require(transport.resolveBodies.first)
+    let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    #expect(json["call_id"] as? String == "call_1")
+    #expect(json["action"] as? String == "answer")
+    #expect((json["answers"] as? [String: String])?["Which city do you mean?"] == "Berlin")
+    #expect(transport.paths.contains("/api/v1/chats/chat-1/messages/\(assistantID)/resolve"))
+
+    // The resumed run streams under the same assistant message id, so the answer
+    // continues the turn that asked instead of starting a new one.
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: assistantID,
+        inner: ["type": "response.output_text.delta", "delta": "Berlin it is."]))
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: assistantID,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    try await waitUntil { conversation.phase == .ready }
+
+    #expect(conversation.turns.count == 2)  // user + one assistant, not three
+    #expect(conversation.turns.last?.text == "Berlin it is.")
+    #expect(conversation.turns.last?.awaitingCall == nil)
+}
+
+@Test func askUserPromptParsesQuestionsAndOptions() {
+    let data = Data(AskUserFixture.arguments.utf8)
+    let arguments = try! JSONDecoder().decode(JSONValue.self, from: data)
+    let prompt = try? #require(AskUserPrompt(arguments: arguments))
+    #expect(prompt?.questions.count == 1)
+    #expect(prompt?.questions[0].text == "Which city do you mean?")
+    #expect(prompt?.questions[0].options.map(\.label) == ["Berlin", "Munich"])
+
+    let answers = prompt!.answers(for: ["Which city do you mean?": ["Berlin"]])
+    #expect(answers["Which city do you mean?"]?.stringValue == "Berlin")
+}
+
+@Test @MainActor func theCompletionCarriesTheFieldsTheServerAccepts() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"),
+                           transport: transport),
+        hub: hub)
+    conversation.tools = ["homelab"]
+    conversation.chatVariables = .object(["room": .string("studio")])
+
+    conversation.draft = "lights off"
+    conversation.send()
+    try await transport.awaitCompletion()
+
+    let body = try #require(transport.completionBody)
+    let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    // Without `ask` the server runs every tool without asking, and the approval
+    // UI in this app would never appear.
+    #expect((json["params"] as? [String: Any])?["tool_approval_mode"] as? String == "ask")
+    #expect(json["tool_ids"] as? [String] == ["homelab"])
+    #expect((json["chat_variables"] as? [String: Any])?["room"] as? String == "studio")
+    // Fields nobody set must stay off the wire, not arrive as nulls the server
+    // reads as "clear this".
+    #expect(json["tool_servers"] == nil)
+    #expect(json["session_id"] == nil)
+    #expect(json["filter_ids"] == nil)
 }

@@ -76,10 +76,18 @@ public struct CompletionRequest: Encodable, Sendable {
         public var system: String?
         public var reasoning: String?
         public var streamDeltaChunkSize: Int?
+        /// `native`, `raython`… left nil so the model's own configured value
+        /// (or the server's default of `native`) wins.
+        public var functionCalling: String?
+        /// `ask` makes the server park on every tool call until the user says
+        /// yes; `full` runs them without asking. Sent as `ask` — see the comment
+        /// on `CompletionRequest.params` at the call site.
+        public var toolApprovalMode: String?
 
         public init(
             temperature: Double? = nil, topP: Double? = nil, maxTokens: Int? = nil,
-            system: String? = nil, reasoning: String? = nil, streamDeltaChunkSize: Int? = nil
+            system: String? = nil, reasoning: String? = nil, streamDeltaChunkSize: Int? = nil,
+            functionCalling: String? = nil, toolApprovalMode: String? = nil
         ) {
             self.temperature = temperature
             self.topP = topP
@@ -87,6 +95,8 @@ public struct CompletionRequest: Encodable, Sendable {
             self.system = system
             self.reasoning = reasoning
             self.streamDeltaChunkSize = streamDeltaChunkSize
+            self.functionCalling = functionCalling
+            self.toolApprovalMode = toolApprovalMode
         }
 
         enum CodingKeys: String, CodingKey {
@@ -95,6 +105,8 @@ public struct CompletionRequest: Encodable, Sendable {
             case maxTokens = "max_tokens"
             case system, reasoning
             case streamDeltaChunkSize = "stream_delta_chunk_size"
+            case functionCalling = "function_calling"
+            case toolApprovalMode = "tool_approval_mode"
         }
     }
 
@@ -113,6 +125,17 @@ public struct CompletionRequest: Encodable, Sendable {
     public var files: [String]?
     public var params: Params
     public var folderID: String?
+    /// Tools and MCP servers for this run. The server reads these top level, not
+    /// inside `features`, so a `[String: Bool]` `features` map cannot carry them.
+    public var toolIDs: [String]?
+    public var toolServerIDs: [String]?
+    /// Filter functions to run over this exchange.
+    public var filterIDs: [String]?
+    /// Template variables for the prompt, and the chat's own long-lived ones.
+    public var variables: [String: JSONValue]?
+    public var chatVariables: JSONValue?
+    /// Terminal/session to keep using, when the chat has one.
+    public var sessionID: String?
 
     public init(
         model: String,
@@ -126,7 +149,13 @@ public struct CompletionRequest: Encodable, Sendable {
         files: [String]? = nil,
         params: Params = Params(),
         stream: Bool = true,
-        folderID: String? = nil
+        folderID: String? = nil,
+        toolIDs: [String]? = nil,
+        toolServerIDs: [String]? = nil,
+        filterIDs: [String]? = nil,
+        variables: [String: JSONValue]? = nil,
+        chatVariables: JSONValue? = nil,
+        sessionID: String? = nil
     ) {
         self.model = model
         self.messages = messages
@@ -140,6 +169,12 @@ public struct CompletionRequest: Encodable, Sendable {
         self.files = files
         self.params = params
         self.folderID = folderID
+        self.toolIDs = toolIDs
+        self.toolServerIDs = toolServerIDs
+        self.filterIDs = filterIDs
+        self.variables = variables
+        self.chatVariables = chatVariables
+        self.sessionID = sessionID
     }
 
     enum Keys: String, CodingKey {
@@ -150,6 +185,12 @@ public struct CompletionRequest: Encodable, Sendable {
         case messageID = "id"
         case assistantMessageID = "assistant_message_id"
         case folderID = "folder_id"
+        case toolIDs = "tool_ids"
+        case toolServerIDs = "tool_servers"
+        case filterIDs = "filter_ids"
+        case variables
+        case chatVariables = "chat_variables"
+        case sessionID = "session_id"
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -174,6 +215,12 @@ public struct CompletionRequest: Encodable, Sendable {
         if let assistantMessageID { try c.encode(assistantMessageID, forKey: .assistantMessageID) }
         if let files { try c.encode(files, forKey: .files) }
         if let folderID { try c.encode(folderID, forKey: .folderID) }
+        if let toolIDs { try c.encode(toolIDs, forKey: .toolIDs) }
+        if let toolServerIDs { try c.encode(toolServerIDs, forKey: .toolServerIDs) }
+        if let filterIDs { try c.encode(filterIDs, forKey: .filterIDs) }
+        if let variables { try c.encode(variables, forKey: .variables) }
+        if let chatVariables { try c.encode(chatVariables, forKey: .chatVariables) }
+        if let sessionID { try c.encode(sessionID, forKey: .sessionID) }
     }
 }
 

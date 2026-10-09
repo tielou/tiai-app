@@ -18,6 +18,10 @@ public struct Turn: Identifiable, Equatable, Sendable {
     public var error: String?
     public var model: String?
     public var usage: TokenUsage?
+    /// Tool calls and `ask_user` questions attached to this message. A turn with
+    /// one that is still awaiting the user is a run that is parked, not a run
+    /// that finished, and the UI has to say so.
+    public var calls: [ToolCall]
     public var createdAt: Date
 
     public init(
@@ -29,6 +33,7 @@ public struct Turn: Identifiable, Equatable, Sendable {
         error: String? = nil,
         model: String? = nil,
         usage: TokenUsage? = nil,
+        calls: [ToolCall] = [],
         createdAt: Date = .now
     ) {
         self.id = id
@@ -39,11 +44,15 @@ public struct Turn: Identifiable, Equatable, Sendable {
         self.error = error
         self.model = model
         self.usage = usage
+        self.calls = calls
         self.createdAt = createdAt
     }
 
     public var isUser: Bool { role == "user" }
     public var isAssistant: Bool { role == "assistant" }
+
+    /// The call the user still has to answer, if any.
+    public var awaitingCall: ToolCall? { calls.first(where: \ .isAwaitingUser) }
 
     /// Nothing to show yet, but something is happening.
     public var isWaitingForFirstToken: Bool {
@@ -59,6 +68,7 @@ public struct Turn: Identifiable, Equatable, Sendable {
         error = message.error
         model = message.model
         usage = message.usage
+        calls = message.toolCalls
         createdAt = message.timestamp ?? .now
     }
 }

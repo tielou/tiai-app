@@ -24,6 +24,16 @@ public enum JSONValue: Hashable, Sendable {
 
     public var firstArrayElement: JSONValue? { arrayValue?.first }
 
+    /// Compact JSON, for showing a tool call's arguments to a human.
+    ///
+    /// Nil only if re-encoding fails, which for a value that was just decoded
+    /// means the two encoders disagree — worth showing as nothing rather than
+    /// crashing a transcript over.
+    public var jsonText: String? {
+        guard let data = try? JSONEncoder().encode(self) else { return nil }
+        return String(decoding: data, as: UTF8.self)
+    }
+
     public var stringValue: String? {
         switch self {
         case let .string(value): value

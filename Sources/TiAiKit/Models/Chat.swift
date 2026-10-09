@@ -56,6 +56,8 @@ public struct ChatDetail: Codable, Equatable, Sendable {
     public var tags: [String]
     public var messages: [String: ChatMessage]
     public var currentID: String?
+    /// The chat's own template variables, passed back on every completion.
+    public var variables: JSONValue?
 
     enum Keys: String, CodingKey {
         case id, title, chat, meta, pinned, archived, summary, tags
@@ -66,7 +68,7 @@ public struct ChatDetail: Codable, Equatable, Sendable {
     }
 
     enum ChatKeys: String, CodingKey {
-        case models, tags, history, title
+        case models, tags, history, title, variables
         case currentId
     }
 
@@ -98,6 +100,10 @@ public struct ChatDetail: Codable, Equatable, Sendable {
         if let chat = try? c.nestedContainer(keyedBy: ChatKeys.self, forKey: .chat) {
             models = (try? chat.decode([String].self, forKey: .models)) ?? []
             tags = (try? chat.decode([String].self, forKey: .tags)) ?? []
+            // Long-lived per-chat values the prompt template can reference. Sent
+            // back untouched so a chat edited on the phone keeps the variables
+            // someone set on the web.
+            variables = try? chat.decode(JSONValue.self, forKey: .variables)
             if let history = try? chat.nestedContainer(keyedBy: HistoryKeys.self, forKey: .history) {
                 currentID = try? history.decode(String.self, forKey: .currentId)
                 messages = (try? history.decode([String: ChatMessage].self, forKey: .messages)) ?? [:]
@@ -135,12 +141,25 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
     public var statusHistory: [StatusEntry]
     public var usage: TokenUsage?
     public var meta: JSONValue?
+    /// Raw `output` array as stored on the message.
+    ///
+    /// Kept unparsed so the message stays trivially `Codable` and nothing is lost
+    /// to a schema change; `toolCalls` is the typed view of it.
+    public var output: [JSONValue]
+
+    /// Tool calls and `ask_user` questions on this message.
+    ///
+    /// This is the only place a parked question survives an app restart: the
+    /// socket does not replay, so a question that arrived and was never answered
+    /// exists only here. A client that reads deltas alone loses it and leaves the
+    /// user staring at a half answer with no way to continue.
+    public var toolCalls: [ToolCall] { output.compactMap(ToolCall.init) }
 
     public var isUser: Bool { role == "user" }
     public var isAssistant: Bool { role == "assistant" }
 
     enum Keys: String, CodingKey {
-        case id, role, content, model, done, error, sources, files, embeds, meta, usage, timestamp
+        case id, role, content, model, done, error, sources, files, embeds, meta, usage, timestamp, output
         case parentID = "parentId"
         case childrenIDs = "childrenIds"
         case statusHistory = "statusHistory"
@@ -171,6 +190,7 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
         statusHistory = (try? c.decode([StatusEntry].self, forKey: .statusHistory)) ?? []
         usage = try? c.decode(TokenUsage.self, forKey: .usage)
         meta = try? c.decode(JSONValue.self, forKey: .meta)
+        output = (try? c.decode([JSONValue].self, forKey: .output)) ?? []
     }
 
     enum ErrorKeys: String, CodingKey { case content }

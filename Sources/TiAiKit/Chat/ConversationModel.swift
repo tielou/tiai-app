@@ -45,6 +45,11 @@ public final class ConversationModel {
     public var draft = ""
     public var model: String
     public var features: [String: Bool]
+    /// Tool ids to offer this run. Empty means the server's own default set for
+    /// the model, which is what almost every chat wants.
+    public var tools: [String] = []
+    /// The chat's template variables, carried back untouched on every send.
+    public var chatVariables: JSONValue?
     public var modelIDs: [String] = []
 
     private let client: OWUIClient
@@ -134,6 +139,7 @@ public final class ConversationModel {
             title = detail.title
             turns = detail.thread.map(Turn.init)
             leafID = turns.last?.id
+            chatVariables = detail.variables
             if let used = detail.models.first, !used.isEmpty { model = used }
             phase = .ready
         } catch {
@@ -287,7 +293,13 @@ public final class ConversationModel {
                 parentID: parentID, model: model),
             messageID: assistantID,
             features: features,
-            files: files.isEmpty ? nil : files.map(\.id))
+            files: files.isEmpty ? nil : files.map(\.id),
+            // `ask` is what makes the server park on a tool call and wait for a
+            // tap. Left unset the server runs every tool without asking, which is
+            // right for a headless client and wrong for one in the hand.
+            params: CompletionRequest.Params(toolApprovalMode: "ask"),
+            toolIDs: tools.isEmpty ? nil : tools,
+            chatVariables: chatVariables)
 
         // Blocks for the whole generation and yields no body; what is left for it
         // to do is fail loudly (401, 429) and to close. The task inherits this
@@ -297,23 +309,71 @@ public final class ConversationModel {
             catch { self.recordPostError(error) }
         }
 
+        var outcome = await drain(frames, assistantID: assistantID, index: assistantIndex)
+        post?.cancel()
+        post = nil
+
+        if outcome.parked {
+            // The run is parked on a question, not finished. `leafID` stays where
+            // it was: the answer this turn is still owed, and resending would
+            // fork the chat instead of continuing it.
+            phase = .ready
+            return
+        }
+        if outcome.sawTerminal {
+            leafID = assistantID
+        } else if outcome.failure == nil {
+            outcome.failure = phase == .stopping ? "Stopped." : "The server sent nothing."
+        }
+        if let failure = outcome.failure { error = failure }
+        phase = .ready
+    }
+
+    struct DrainOutcome {
         var sawTerminal = false
+        /// Waiting on the user to answer a tool call. Distinct from finishing,
+        /// because nothing more will arrive until they do.
+        var parked = false
         var failure: String?
+    }
+
+    /// Drains frames for one assistant message until the run ends, is stopped,
+    /// or parks on a tool call.
+    ///
+    /// Shared by sending and by resuming, because resolving a tool call starts a
+    /// *new* completion on the server whose tokens arrive under the same
+    /// assistant message id — the client has to listen again exactly as it did
+    /// the first time, and a second copy of this loop is how the two would drift.
+    private func drain(
+        _ frames: AsyncStream<ChatEventSocket.Frame>,
+        assistantID: String,
+        index: Int,
+        continuing: Bool = false
+    ) async -> DrainOutcome {
+        var outcome = DrainOutcome()
         // Buffered off the frame loop so a timer, not the next frame, decides
         // when it becomes visible. Flushing only "when a frame arrives and 60 ms
         // have passed" loses the tail: a stream that stops without a terminal
         // frame would leave its last tokens buffered and unseen.
-        pending = Turn(id: assistantID, role: "assistant", streaming: true)
+        // On a resume the turn already holds the text streamed before the
+        // question. Starting from an empty turn would let the first delta of the
+        // continuation overwrite everything the answer said up to there.
+        if continuing, let existing = turns.first(where: { $0.id == assistantID }) {
+            pending = existing
+            pending?.streaming = true
+        } else {
+            pending = Turn(id: assistantID, role: "assistant", streaming: true)
+        }
         let flusher = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: Self.flushInterval)
                 guard !Task.isCancelled else { return }
-                self?.publishPending(keeping: assistantID, index: assistantIndex)
+                self?.publishPending(keeping: assistantID, index: index)
             }
         }
         let watchdog = Task { [hub] in
             try? await Task.sleep(for: Self.silenceLimit)
-            hub.expire(chatID: chat)
+            hub.expire(chatID: chatID ?? "")
         }
 
         for await frame in frames {
@@ -321,28 +381,79 @@ public final class ConversationModel {
             if let delta = frame.delta { pending?.text += delta }
             if let thinking = frame.reasoningDelta { pending?.reasoning += thinking }
             if let usage = frame.usage { pending?.usage = usage }
-            if let problem = frame.errorText { failure = problem }
+            if let problem = frame.errorText { outcome.failure = problem }
             if let answered = frame.answeredModel { pending?.model = answered }
-            if frame.isTerminal { sawTerminal = true; break }
+            if let calls = frame.outputItems { pending?.calls = calls }
+            if frame.isTerminal { outcome.sawTerminal = true; break }
+            // Checked after the terminal test: a frame that both finishes and
+            // asks would be a finished run with a question left on screen.
+            if frame.isAwaitingUser { outcome.parked = true; break }
         }
         watchdog.cancel()
         flusher.cancel()
 
         var finished = pending ?? Turn(id: assistantID, role: "assistant")
         finished.streaming = false
-        finished.error = failure
-        flush(finished, into: assistantIndex, final: true)
+        finished.error = outcome.failure
+        flush(finished, into: index, final: true)
         pending = nil
-        post?.cancel()
-        post = nil
+        return outcome
+    }
 
-        if sawTerminal {
-            leafID = assistantID
-        } else if failure == nil {
-            failure = phase == .stopping ? "Stopped." : "The server sent nothing."
+    // MARK: - tool calls
+
+    /// Answers a parked tool call and picks the run back up.
+    ///
+    /// The server resumes under the same assistant message id, so the answer
+    /// continues the existing turn rather than starting a new one — which is
+    /// what the transcript looks like when it works, and what makes it obvious
+    /// when the client has gotten it wrong.
+    public func resolve(
+        messageID: String,
+        call: ToolCall,
+        action: ToolCallAction,
+        answers: JSONValue? = nil
+    ) {
+        guard let chat = chatID, !phase.isBusy,
+              let index = turns.firstIndex(where: { $0.id == messageID })
+        else { return }
+
+        phase = .streaming
+        error = nil
+        // Mark the call answered locally first. The round trip takes a moment and
+        // a still-tappable button invites a second tap, which the server answers
+        // with a 409.
+        turns[index].calls = turns[index].calls.map { entry in
+            guard entry.callID == call.callID else { return entry }
+            var answered = entry
+            answered.status = action == .reject ? .rejected : .completed
+            return answered
         }
-        if let failure { error = failure }
-        phase = .ready
+
+        // Subscribe before the POST: the resumed run can emit before the
+        // response comes back, and the socket does not replay.
+        let frames = hub.frames(for: chat)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.client.resolveToolCall(
+                    chatID: chat, messageID: messageID, callID: call.callID,
+                    action: action, answers: answers)
+            } catch {
+                self.error = error.localizedDescription
+                self.phase = .ready
+                return
+            }
+            var outcome = await self.drain(frames, assistantID: messageID, index: index, continuing: true)
+            if outcome.parked {
+                self.phase = .ready
+                return
+            }
+            if outcome.sawTerminal { self.leafID = messageID }
+            else if outcome.failure == nil { outcome.failure = "The server sent nothing." }
+            if let failure = outcome.failure { self.error = failure }
+            self.phase = .ready
+        }
     }
 
     /// A failed POST is reported only if the run has not already ended on its own
@@ -374,6 +485,10 @@ public final class ConversationModel {
         turn.usage = source.usage ?? turn.usage
         turn.model = source.model ?? turn.model
         turn.error = source.error
+        // A parked call has to survive the flush or the question vanishes the
+        // moment it arrives, which is worse than never showing it: the user sees
+        // the answer stop and has no idea why.
+        if !source.calls.isEmpty { turn.calls = source.calls }
         turn.streaming = final ? false : turn.streaming
         turns[index] = turn
         if !final && (!source.text.isEmpty || !source.reasoning.isEmpty), phase.isBusy {
