@@ -14,10 +14,16 @@ import Foundation
 ///   the model still answers, but the transcript in the database does not
 ///   contain the question, and the same conversation opened in the browser is
 ///   missing a turn.
-/// * `id` is the *assistant* message id the client generated, so the server can
-///   write the placeholder it will later fill in. That is what lets the web UI
-///   and the phone agree on message identity — and what makes "regenerate"
-///   create a sibling instead of a new chat.
+/// * `id` is the *assistant* message id the client generated. The server reads
+///   `message_ids` from it (`main.py`: `message_ids = [{'model_id': model_id,
+///   'message_id': form_data.pop('id', None)}]`), and that value becomes
+///   `metadata['message_id']` — the key the event emitter needs to exist at
+///   all. Omit it and the model still answers, the stream still completes, and
+///   **the assistant turn is never written to the chat**: `get_event_emitter`
+///   returns None without a message id, and every persistence path is gated on
+///   it. The probe found this the hard way: `persisted turns: user`.
+///   `assistant_message_id` is a different thing — it means "continue this
+///   existing message", used by regenerate.
 /// * `features` is a dict of booleans, not the list of strings older versions
 ///   took.
 public struct CompletionRequest: Encodable, Sendable {
@@ -98,6 +104,10 @@ public struct CompletionRequest: Encodable, Sendable {
     public var chatID: String?
     public var parentID: ParentID
     public var userMessage: WireMessage?
+    /// The assistant message id this completion will fill in. Required for the
+    /// exchange to be persisted at all — see the type comment.
+    public var messageID: String?
+    /// Set only when continuing or regenerating an existing assistant message.
     public var assistantMessageID: String?
     public var features: [String: Bool]
     public var files: [String]?
@@ -110,6 +120,7 @@ public struct CompletionRequest: Encodable, Sendable {
         chatID: String? = nil,
         parentID: ParentID = .unspecified,
         userMessage: WireMessage? = nil,
+        messageID: String? = nil,
         assistantMessageID: String? = nil,
         features: [String: Bool] = [:],
         files: [String]? = nil,
@@ -123,6 +134,7 @@ public struct CompletionRequest: Encodable, Sendable {
         self.chatID = chatID
         self.parentID = parentID
         self.userMessage = userMessage
+        self.messageID = messageID
         self.assistantMessageID = assistantMessageID
         self.features = features
         self.files = files
@@ -135,6 +147,7 @@ public struct CompletionRequest: Encodable, Sendable {
         case chatID = "chat_id"
         case parentID = "parent_id"
         case userMessage = "user_message"
+        case messageID = "id"
         case assistantMessageID = "assistant_message_id"
         case folderID = "folder_id"
     }
@@ -157,6 +170,7 @@ public struct CompletionRequest: Encodable, Sendable {
 
         if let chatID { try c.encode(chatID, forKey: .chatID) }
         if let userMessage { try c.encode(userMessage, forKey: .userMessage) }
+        if let messageID { try c.encode(messageID, forKey: .messageID) }
         if let assistantMessageID { try c.encode(assistantMessageID, forKey: .assistantMessageID) }
         if let files { try c.encode(files, forKey: .files) }
         if let folderID { try c.encode(folderID, forKey: .folderID) }

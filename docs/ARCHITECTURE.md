@@ -117,6 +117,15 @@ Reference notes; the code links back to this section.
   app creates the chat first with `POST /chats/new` and streams into it. One
   extra round trip, and the chat appears in the list immediately like it does in
   the browser.
+  * `id` is the assistant message id the client generated, and it is **not
+    optional**: the server derives `metadata['message_id']` from it, and
+    `get_event_emitter` returns `None` without one — which silently disables
+    every persistence path. Omit it and the model answers, the stream finishes,
+    the reply is never stored, and nothing reports an error.
+  * `assistant_message_id` is a different field: "continue this existing
+    message", used by regenerate.
+* **The task routes are unversioned.** `POST /api/tasks/chat/{id}/stop` has no
+  `/api/v1` alias; asking for one is a 405.
 * **Streaming.** The REST response is SSE of OpenAI `chat.completion.chunk`
   frames, terminated by `data: [DONE]`. **The rich events are not on it.**
   `status`, `message`, `replace`, `source`/`citation`, `embeds`, `files`,

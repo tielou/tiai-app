@@ -285,8 +285,18 @@ public struct OWUIClient: Sendable {
     /// Stops a generation the user cancelled. Cancelling the local task is not
     /// enough on its own: the server keeps generating into the chat otherwise,
     /// and the message lands in the transcript half-written.
+    ///
+    /// Note the prefix. The task routes are mounted at the root (`/api/...`)
+    /// and have **no `/api/v1` alias** — asking for the versioned one is a 405,
+    /// which is what the probe reported before this was fixed.
     public func stop(chatID: String) async throws {
-        try await expectStatus("POST", "/tasks/chat/\(chatID)/stop")
+        let (data, http) = try await perform(
+            "POST", server.raw("/api/tasks/chat/\(chatID)/stop"), bodyData: Data("{}".utf8))
+        switch http.statusCode {
+        case 200..<300: break
+        case 401: throw APIError.unauthorized
+        default: throw APIError.http(status: http.statusCode, message: Self.detail(from: data) ?? "\(http.statusCode)")
+        }
     }
 
     // MARK: - memories

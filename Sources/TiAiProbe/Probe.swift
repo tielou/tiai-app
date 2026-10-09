@@ -121,7 +121,7 @@ struct Probe {
             parentID: .root,
             userMessage: CompletionRequest.WireMessage(
                 id: userMessageID, role: "user", content: .text(prompt), parentID: nil, model: model),
-            assistantMessageID: assistantMessageID,
+            messageID: assistantMessageID,
             features: [:],
             stream: true)
 
@@ -181,7 +181,7 @@ struct Probe {
                     id: id, role: "user",
                     content: .text("Count slowly from 1 to 500, one number per line, with a short comment on each."),
                     parentID: assistantMessageID, model: model),
-                assistantMessageID: UUID().uuidString,
+                messageID: UUID().uuidString,
                 stream: true)
 
             var deltas = 0

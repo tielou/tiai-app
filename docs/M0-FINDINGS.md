@@ -71,23 +71,61 @@ While in there: there is **no `/chats/{id}/title` route** (rename goes through
 `archive` are **toggles** with no per-chat un-pin/un-archive, so the client
 reports the new state instead of asserting a wanted one.
 
+## Round 3 — the completion handshake
+
+**Assumption 1 holds.** A completion streams over plain REST SSE with no
+websocket session at all: deltas arrived, the text was exact, and
+**time to first token was 1.1 s** on a warm prompt.
+
+**Assumption 2 failed — and it was our bug, not the server's.** The read-back
+contained only the user's turn:
+
+```
+persisted turns: user
+FAIL the assistant turn is empty
+```
+
+The reason is worth keeping, because nothing in the API docs would tell you:
+the server derives its message id from the request's **`id`** field
+(`message_ids = [{'model_id': model_id, 'message_id': form_data.pop('id', None)}]`),
+and that becomes `metadata['message_id']`. Without it `get_event_emitter`
+returns `None`, and *every* persistence path is gated on the emitter existing.
+So the model answers, the stream completes, nothing is written, and no error is
+reported anywhere. `assistant_message_id` is a different field meaning
+"continue this existing message" — the name misled us.
+
+`stop` answered **405 Method Not Allowed** for the same family of reason: the
+task routes are mounted at the root (`/api/tasks/chat/{id}/stop`) and have no
+`/api/v1` alias, unlike the completion route.
+
+Also observed: **no `usage` on the stream**, because none of the models
+advertise a `usage` capability, so the server does not ask the upstream for
+`include_usage`. Token counts are therefore a nice-to-have in this deployment,
+not a guarantee — the UI must not assume they arrive.
+
+Memories: 6. Prompts: 0. Chats: 140.
+
 ## Still to verify
 
-* [ ] **assumption 1** — `POST /chat/completions` streams deltas over SSE with no socket session
-* [ ] time to first token on a cold prompt (halogen: expect 1–25 s depending on context)
-* [ ] **assumption 2** — after the stream, `GET /chats/{id}` contains both turns, with `done`, `statusHistory` and `usage`
-* [ ] `POST /tasks/chat/{id}/stop` actually stops generation
-* [ ] memories, prompts and the chat list decode
-* [ ] deleting the probe chat works
+* [ ] **assumption 2, re-run after the `id` fix** — after the stream,
+      `GET /chats/{id}` contains both turns, with `done`, `statusHistory` and `usage`
+* [ ] `POST /api/tasks/chat/{id}/stop` actually stops generation
+* [ ] deleting the probe chat works (passed in round 3)
 
 ## Decisions this has already changed
 
 * **The app creates chats before streaming into them.** Sending no `chat_id`
   makes the server mint its own and report it over the websocket, which a
   REST-only client never sees.
+* **Every completion must carry a client-generated `id`.** Not optional, and it
+  fails silently rather than loudly — `completionCarriesTheAssistantMessageID`
+  is the only thing standing between a refactor and a chat app that loses every
+  reply.
+* **The task routes are unversioned.** `Server.api` vs `Server.raw` is not
+  cosmetic.
 * **`features` is a dict of booleans**, not the list of strings older versions took.
 * **Message keys inside a chat body are camelCase** while the rest of the API is
   snake_case, so no global `keyDecodingStrategy` is possible; every DTO maps its
   keys explicitly.
 * **Tests assert on requests, not only responses.** `RecordingTransport` exists
-  because of this bug.
+  because a response fixture alone could never have caught either of these.

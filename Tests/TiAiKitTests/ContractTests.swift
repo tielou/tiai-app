@@ -395,12 +395,35 @@ struct RequestTests {
             CompletionRequest(
                 model: "local-personal",
                 messages: [CompletionRequest.WireMessage(id: "1", role: "user", content: .text("hi"))],
-                chatID: "c1", parentID: .root))
+                chatID: "c1", parentID: .root, messageID: "a1"))
         #expect(transport.lastRequest?.url?.path == "/api/v1/chat/completions")
         #expect(transport.lastRequest?.value(forHTTPHeaderField: "Accept") == "text/event-stream")
         let sent = try JSONDecoder().decode([String: JSONValue].self, from: #require(transport.lastRequest?.httpBody))
         #expect(sent["parent_id"] == .null)
         #expect(sent["chat_id"] == .string("c1"))
+    }
+
+    /// The wire name for "the assistant message this completion fills in" is
+    /// `id`, and without it the server has no message id, `get_event_emitter`
+    /// returns None, and the assistant turn is never persisted. The probe found
+    /// this by reading back a chat that contained only the user's turn.
+    @Test func completionCarriesTheAssistantMessageID() async throws {
+        let transport = RecordingTransport()
+        transport.body = Data()
+        _ = try await client(transport).stream(
+            CompletionRequest(
+                model: "local-personal",
+                messages: [CompletionRequest.WireMessage(id: "u1", role: "user", content: .text("hi"))],
+                chatID: "c1", parentID: .root, messageID: "a1"))
+        let sent = try JSONDecoder().decode([String: JSONValue].self, from: #require(transport.lastRequest?.httpBody))
+        #expect(sent["id"] == .string("a1"))
+    }
+
+    /// The task routes have no `/api/v1` alias; asking for one is a 405.
+    @Test func stopUsesTheUnversionedTaskRoute() async throws {
+        let transport = RecordingTransport()
+        try await client(transport).stop(chatID: "c1")
+        #expect(transport.lastRequest?.url?.path == "/api/tasks/chat/c1/stop")
     }
 }
 
