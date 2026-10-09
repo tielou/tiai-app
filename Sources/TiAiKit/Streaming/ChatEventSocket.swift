@@ -81,7 +81,18 @@ public final class ChatEventSocket: @unchecked Sendable {
 
         public var delta: String? {
             if let type = innerType {
-                return type.hasSuffix(".delta") && !type.contains("reasoning") ? flatDelta : nil
+                // Everything that ends in `.delta` except the two that are not
+                // the answer. `response.function_call_arguments.delta` also ends
+                // in `.delta`, and streaming it into the prose prints the tool's
+                // JSON as the model's reply — which is exactly what happened on
+                // the first live `ask_user` call: the user read the schema
+                // instead of being asked the question.
+                guard type.hasSuffix(".delta"),
+                      !type.contains("reasoning"),
+                      !type.contains("function_call"),
+                      !type.contains("arguments")
+                else { return nil }
+                return flatDelta
             }
             return openAIDelta?["content"]?.stringValue
         }
@@ -127,13 +138,19 @@ public final class ChatEventSocket: @unchecked Sendable {
         /// spinning here.
         public var outputItems: [ToolCall]? {
             guard let items = inner?["output"]?.arrayValue ?? data["output"]?.arrayValue else { return nil }
-            let calls = items.compactMap(ToolCall.init)
+            let calls = ToolCall.calls(from: items)
             return calls.isEmpty ? nil : calls
         }
 
         /// Whether this frame says "the run is parked waiting for the user".
         public var isAwaitingUser: Bool {
             outputItems?.contains(where: \ .isAwaitingUser) ?? false
+        }
+
+        /// A streamed tool-call argument fragment. Not the answer, and a signal
+        /// that a pause frame is coming after the finish frame.
+        public var isToolArgumentsDelta: Bool {
+            innerType?.contains("function_call") == true || innerType?.contains("arguments") == true
         }
 
         public var isFinish: Bool { finishReason != nil }
@@ -187,6 +204,20 @@ public final class ChatEventSocket: @unchecked Sendable {
     }
 
     public var isConnected: Bool { client.status == .connected }
+
+    /// The socket's own session id, handed out by the server on connect.
+    ///
+    /// This is the switch that decides whether the server treats a completion
+    /// request as coming from a client it can talk back to. In `middleware.py`:
+    /// "Only inject when the request originates from the UI (identified by
+    /// session_id). API callers don't expect hidden tools." Without it the
+    /// builtin tools — `ask_user` among them — are simply not offered to the
+    /// model, and the model then says it has no such tool, which reads like a
+    /// client bug and is one, just not a visible one.
+    ///
+    /// Nil until the socket has connected, so a chat opened before the socket
+    /// came up sends without it and gets the plain tool set.
+    public var sessionID: String? { client.sid }
 
     public func disconnect() {
         client.disconnect()

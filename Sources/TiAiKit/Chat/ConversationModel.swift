@@ -299,7 +299,8 @@ public final class ConversationModel {
             // right for a headless client and wrong for one in the hand.
             params: CompletionRequest.Params(toolApprovalMode: "ask"),
             toolIDs: tools.isEmpty ? nil : tools,
-            chatVariables: chatVariables)
+            chatVariables: chatVariables,
+            sessionID: hub.sessionID)
 
         // Blocks for the whole generation and yields no body; what is left for it
         // to do is fail loudly (401, 429) and to close. The task inherits this
@@ -376,6 +377,8 @@ public final class ConversationModel {
             hub.expire(chatID: chatID ?? "")
         }
 
+        var sawToolArguments = false
+        var grace: Task<Void, Never>?
         for await frame in frames {
             if let messageID = frame.messageID, messageID != assistantID { continue }
             if let delta = frame.delta { pending?.text += delta }
@@ -384,12 +387,29 @@ public final class ConversationModel {
             if let problem = frame.errorText { outcome.failure = problem }
             if let answered = frame.answeredModel { pending?.model = answered }
             if let calls = frame.outputItems { pending?.calls = calls }
-            if frame.isTerminal { outcome.sawTerminal = true; break }
+            if frame.isToolArgumentsDelta { sawToolArguments = true }
+            if frame.isTerminal {
+                // `ask_user` streams its arguments, then finishes, and only then
+                // does the server stage the call and emit the pause frame with
+                // `output`. Breaking on the finish frame loses the question and
+                // leaves an empty turn — which is exactly what the first live
+                // test showed. Wait a moment for the pause instead.
+                if sawToolArguments && pending?.calls.isEmpty != false {
+                    grace = Task { [hub] in
+                        try? await Task.sleep(for: .seconds(3))
+                        if !Task.isCancelled { hub.expire(chatID: chatID ?? "") }
+                    }
+                    continue
+                }
+                outcome.sawTerminal = true
+                break
+            }
             // Checked after the terminal test: a frame that both finishes and
             // asks would be a finished run with a question left on screen.
             if frame.isAwaitingUser { outcome.parked = true; break }
         }
         watchdog.cancel()
+        grace?.cancel()
         flusher.cancel()
 
         var finished = pending ?? Turn(id: assistantID, role: "assistant")

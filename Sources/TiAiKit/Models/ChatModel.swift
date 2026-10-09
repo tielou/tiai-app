@@ -85,7 +85,6 @@ public struct ChatModel: Codable, Equatable, Sendable, Identifiable {
         return switch feature {
         case .webSearch: supportsWebSearch
         case .memory: supportsMemory
-        case .thinking: supports("thinking")
         case .codeInterpreter: supportsCodeInterpreter
         case .imageGeneration: supportsImageGeneration
         }
@@ -110,10 +109,17 @@ public struct ChatModel: Codable, Equatable, Sendable, Identifiable {
 
 /// The per-message feature toggles, and the wire names Open WebUI expects in
 /// `features` (a dict of booleans, not the list of strings older versions took).
+///
+/// Deliberately short. A toggle here is a promise that the server changes
+/// something when it flips, and only these four do. Thinking is *not* one of
+/// them: reasoning arrives from the model on its own (the transcript's
+/// "Thoughts" block is proof), the server has no `features.thinking` handler,
+/// and the real knob is `reasoning_effort`, a per-model parameter sitting next
+/// to temperature — not a per-message switch. Offering it as one was a control
+/// that did nothing.
 public enum ChatFeature: String, CaseIterable, Codable, Sendable {
     case webSearch = "web_search"
     case memory
-    case thinking
     case codeInterpreter = "code_interpreter"
     case imageGeneration = "image_generation"
 
@@ -122,7 +128,6 @@ public enum ChatFeature: String, CaseIterable, Codable, Sendable {
         switch self {
         case .webSearch: "search"
         case .memory: "memory"
-        case .thinking: "thinking"
         case .codeInterpreter: "code"
         case .imageGeneration: "images"
         }
@@ -132,7 +137,6 @@ public enum ChatFeature: String, CaseIterable, Codable, Sendable {
         switch self {
         case .webSearch: "Web search"
         case .memory: "Memory"
-        case .thinking: "Thinking"
         case .codeInterpreter: "Code interpreter"
         case .imageGeneration: "Image generation"
         }

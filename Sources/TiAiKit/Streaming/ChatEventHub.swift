@@ -18,6 +18,10 @@ public final class ChatEventHub {
     public private(set) var isConnected = false
     public private(set) var lastError: String?
 
+    /// See `ChatEventSocket.sessionID`. Sent as the completion's `session_id`,
+    /// which is what unlocks the server's builtin tools.
+    public var sessionID: String? { socket.sessionID }
+
     private let socket: ChatEventSocket
     private var subscribers: [UUID: Subscriber] = [:]
     private var installed = false

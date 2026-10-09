@@ -153,7 +153,7 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
     /// socket does not replay, so a question that arrived and was never answered
     /// exists only here. A client that reads deltas alone loses it and leaves the
     /// user staring at a half answer with no way to continue.
-    public var toolCalls: [ToolCall] { output.compactMap(ToolCall.init) }
+    public var toolCalls: [ToolCall] { ToolCall.calls(from: output) }
 
     public var isUser: Bool { role == "user" }
     public var isAssistant: Bool { role == "assistant" }

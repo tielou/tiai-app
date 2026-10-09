@@ -415,11 +415,15 @@ extension ChatModel {
 }
 
 /// The frame the server emits when it parks a run on `ask_user`. `arguments` is
-/// a JSON string inside a JSON object, because the wire carries it that way.
+/// a JSON string inside a JSON object, and the schema inside it is the one
+/// captured live from the server's own `ask_user` tool.
 enum AskUserFixture {
     static let arguments =
         """
-        {"questions":[{"question":"Which city do you mean?","options":["Berlin","Munich"]}]}
+        {"allow_other":true,"questions":[{"header":"Meal choice","id":"meal",\
+        "options":[{"description":"Classic, comforting","id":"pizza","label":"Pizza"},\
+        {"description":"Fun and customizable","id":"tacos","label":"Tacos"}],\
+        "question":"What would you like to eat?"}]}
         """
 
     static var outputItem: [String: Any] {
@@ -478,14 +482,14 @@ enum AskUserFixture {
     let call = try #require(conversation.turns.last?.awaitingCall)
     conversation.resolve(
         messageID: assistantID, call: call, action: .answer,
-        answers: .object(["Which city do you mean?": .string("Berlin")]))
+        answers: .object(["meal": .string("pizza")]))
 
     try await waitUntil { !transport.resolveBodies.isEmpty }
     let body = try #require(transport.resolveBodies.first)
     let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
     #expect(json["call_id"] as? String == "call_1")
     #expect(json["action"] as? String == "answer")
-    #expect((json["answers"] as? [String: String])?["Which city do you mean?"] == "Berlin")
+    #expect((json["answers"] as? [String: String])?["meal"] == "pizza")
     #expect(transport.paths.contains("/api/v1/chats/chat-1/messages/\(assistantID)/resolve"))
 
     // The resumed run streams under the same assistant message id, so the answer
@@ -503,16 +507,40 @@ enum AskUserFixture {
     #expect(conversation.turns.last?.awaitingCall == nil)
 }
 
-@Test func askUserPromptParsesQuestionsAndOptions() {
+@Test func askUserPromptParsesTheRealSchema() {
     let data = Data(AskUserFixture.arguments.utf8)
     let arguments = try! JSONDecoder().decode(JSONValue.self, from: data)
     let prompt = try? #require(AskUserPrompt(arguments: arguments))
+    #expect(prompt?.allowsOther == true)
     #expect(prompt?.questions.count == 1)
-    #expect(prompt?.questions[0].text == "Which city do you mean?")
-    #expect(prompt?.questions[0].options.map(\.label) == ["Berlin", "Munich"])
+    #expect(prompt?.questions[0].value == "meal")
+    #expect(prompt?.questions[0].header == "Meal choice")
+    #expect(prompt?.questions[0].text == "What would you like to eat?")
+    #expect(prompt?.questions[0].options.map(\.value) == ["pizza", "tacos"])
+    #expect(prompt?.questions[0].options[0].label == "Pizza")
+    #expect(prompt?.questions[0].options[0].detail == "Classic, comforting")
 
-    let answers = prompt!.answers(for: ["Which city do you mean?": ["Berlin"]])
-    #expect(answers["Which city do you mean?"]?.stringValue == "Berlin")
+    // Answers are keyed by the tool's own ids, not by the wording.
+    let answers = prompt!.answers(for: ["meal": ["pizza"]])
+    #expect(answers["meal"]?.stringValue == "pizza")
+}
+
+/// The tool's arguments stream as `response.function_call_arguments.delta`,
+/// which ends in `.delta` like every real content frame. Treating it as prose
+/// prints the tool's JSON as the model's reply; the first live `ask_user` call
+/// did exactly that, and the user read a schema instead of a question.
+@Test func functionCallArgumentsNeverReachTheAnswer() {
+    let frame = ChatEventSocket.Frame.fixture(
+        kind: "response:completion", chatID: "c", messageID: "m",
+        inner: ["type": "response.function_call_arguments.delta", "delta": "{}"])
+    #expect(frame.delta == nil)
+    #expect(frame.reasoningDelta == nil)
+
+    // The real answer frame still has to get through.
+    let answer = ChatEventSocket.Frame.fixture(
+        kind: "response:completion", chatID: "c", messageID: "m",
+        inner: ["type": "response.output_text.delta", "delta": "Pizza it is."])
+    #expect(answer.delta == "Pizza it is.")
 }
 
 @Test @MainActor func theCompletionCarriesTheFieldsTheServerAccepts() async throws {
@@ -542,4 +570,62 @@ enum AskUserFixture {
     #expect(json["tool_servers"] == nil)
     #expect(json["session_id"] == nil)
     #expect(json["filter_ids"] == nil)
+}
+
+/// The order the server actually sends: arguments, finish, and only then the
+/// pause frame with `output`. A client that ends the run on `finish_reason`
+/// shows an empty turn and no question.
+@Test @MainActor func thePauseFrameArrivesAfterTheFinishFrame() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"),
+                           transport: transport),
+        hub: hub)
+
+    conversation.draft = "what should I eat?"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let assistantID = try #require(transport.assistantMessageID)
+
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: assistantID,
+        inner: ["type": "response.function_call_arguments.delta", "delta": "{\"questions\":[…]}"]))
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: assistantID,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: assistantID,
+        inner: ["done": false, "output": [AskUserFixture.outputItem]]))
+
+    try await waitUntil { conversation.phase == .ready }
+    let turn = try #require(conversation.turns.last)
+    #expect(turn.awaitingCall?.name == "ask_user")
+    // The arguments are not the answer.
+    #expect(turn.text.isEmpty)
+    #expect(conversation.error == nil)
+}
+
+/// A resolved call arrives as two entries sharing one `call_id`: the
+/// `function_call` and its `function_call_output`. Reading them as two calls
+/// rendered the same question twice on the live test.
+@Test func aCallAndItsResultAreOneCard() {
+    let items: [JSONValue] = [
+        .object([
+            "type": .string("function_call"), "call_id": .string("c1"),
+            "name": .string("ask_user"), "status": .string("completed"),
+            "arguments": .string("{}"),
+        ]),
+        .object([
+            "type": .string("function_call_output"), "call_id": .string("c1"),
+            "output": .array([.object(["type": .string("input_text"), "text": .string("pizza")])]),
+            "status": .string("completed"),
+        ]),
+    ]
+    let calls = ToolCall.calls(from: items)
+    #expect(calls.count == 1)
+    #expect(calls[0].resultText == "pizza")
+    #expect(calls[0].status == .completed)
+    #expect(!calls[0].isAwaitingUser)
 }

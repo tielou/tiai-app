@@ -186,8 +186,9 @@ struct ModelDecodingTests {
         #expect(deep.supportsImageGeneration)
         #expect(deep.supports(.codeInterpreter))
         #expect(!personal.supports(.codeInterpreter))
-        // Thinking is a route (local-personal vs local-fast), not a capability.
-        #expect(!personal.supports(.thinking))
+        // Thinking is a route (local-personal vs local-fast), not a capability —
+        // which is why there is no thinking toggle in the composer.
+        #expect(!personal.supports("thinking"))
     }
 
     /// The fast and quick routes advertise nothing. "No metadata" must not

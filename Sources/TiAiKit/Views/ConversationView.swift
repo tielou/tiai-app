@@ -352,13 +352,19 @@ struct ToolCallCard: View {
     @ViewBuilder private var waiting: some View {
         if call.isAskUser, let prompt {
             VStack(alignment: .leading, spacing: 10) {
+                if let title = prompt.title {
+                    Text(title).font(.headline)
+                }
                 ForEach(prompt.questions) { question in
+                    if let header = question.header {
+                        Text(header).font(.caption).foregroundStyle(.secondary)
+                    }
                     Text(question.text).font(.body)
                     ForEach(question.options) { option in
                         Button {
-                            toggle(option.label, multi: question.multiSelect)
+                            toggle(option.value, multi: question.multiSelect)
                         } label: {
-                            HStack(alignment: .firstTextBaseline) {
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
                                 Image(
                                     systemName: picked.contains(option.label)
                                         ? (question.multiSelect ? "checkmark.square.fill" : "largecircle.fill.circle")
@@ -370,15 +376,29 @@ struct ToolCallCard: View {
                                     }
                                 }
                                 Spacer(minLength: 0)
+                                // The model's own hint, kept as a badge rather
+                                // than folded into the text: it is a tie-breaker
+                                // the reader should notice, not more prose.
+                                if option.recommended {
+                                    Text("Recommended")
+                                        .font(.caption2)
+                                        .padding(.horizontal, 6).padding(.vertical, 2)
+                                        .background(.quaternary, in: .capsule)
+                                }
                             }
                             .contentShape(.rect)
                         }
                         .buttonStyle(.plain)
                     }
                 }
-                if prompt.questions.allSatisfy({ $0.options.isEmpty }) || !typed.isEmpty {
-                    TextField("Type an answer", text: $typed, axis: .vertical)
-                        .textFieldStyle(.plain)
+                // Offered when the tool accepts free text — which it says it
+                // does, rather than the app assuming it.
+                if prompt.allowsOther {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("Other").font(.callout).foregroundStyle(.secondary)
+                        TextField("Type your answer", text: $typed, axis: .vertical)
+                            .textFieldStyle(.plain)
+                    }
                 }
                 HStack {
                     Button("Send") { send(prompt) }
@@ -456,10 +476,13 @@ struct ToolCallCard: View {
     }
 
     private func send(_ prompt: AskUserPrompt) {
+        // Keyed by question id, valued by option id: the tool minted both, so
+        // matching on the human-readable text would break the moment the model
+        // rephrases a label.
         var selections: [String: [String]] = [:]
         for question in prompt.questions {
-            if !picked.isEmpty { selections[question.text] = Array(picked) }
-            else { selections[question.text] = [typed] }
+            if !picked.isEmpty { selections[question.value] = Array(picked) }
+            else { selections[question.value] = [typed] }
         }
         onResolve(.answer, prompt.answers(for: selections))
     }
