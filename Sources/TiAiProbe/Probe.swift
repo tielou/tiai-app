@@ -144,6 +144,9 @@ struct Probe {
             guard outcome.sawDone || outcome.sawFinish else {
                 throw ProbeError.failure("no terminal frame (neither done nor finish_reason)")
             }
+            guard outcome.reasoning.isEmpty || (outcome.firstReasoning ?? .zero) < outcome.firstToken! else {
+                throw ProbeError.failure("reasoning arrived after the answer - the two streams are crossed")
+            }
         }
 
         // ---- 5. the transcript is actually on the server -------------------
@@ -261,12 +264,14 @@ final class FrameFeed {
 
     struct Outcome {
         var text = ""
+        var reasoning = ""
         var firstToken: Duration?
         var usage: TokenUsage?
         var kinds: [String: Int] = [:]
         var samples: [String: String] = [:]
         var sawDone = false
         var sawFinish = false
+        var firstReasoning: Duration?
         var errors: [String] = []
         var timedOut = false
         var otherChats = 0
@@ -320,9 +325,16 @@ final class FrameFeed {
             outcome.total += 1
             outcome.kinds[frame.kind, default: 0] += 1
             if outcome.samples[frame.kind] == nil { outcome.samples[frame.kind] = String(frame.raw.prefix(400)) }
-            if let delta = frame.delta ?? frame.reasoningDelta {
+            if let delta = frame.delta {
                 if outcome.firstToken == nil { outcome.firstToken = started.duration(to: .now) }
                 outcome.text += delta
+            }
+            if let thinking = frame.reasoningDelta {
+                // Reasoning arrives before the answer, so it must not count as
+                // time to first token - that number is what tells a user whether
+                // the model is thinking or the link is dead.
+                if outcome.firstReasoning == nil { outcome.firstReasoning = started.duration(to: .now) }
+                outcome.reasoning += thinking
             }
             outcome.usage = frame.usage ?? outcome.usage
             if let error = frame.errorText { outcome.errors.append(error) }
@@ -338,7 +350,7 @@ final class FrameFeed {
                     continuation.finish()
                 }
             }
-            if frame.isDone { outcome.sawDone = true; break }
+            if frame.isTerminal { outcome.sawDone = frame.isDone; break }
         }
         watchdog.cancel()
         outcome.otherChats = dropped.count
@@ -353,12 +365,19 @@ final class FrameFeed {
         report.note("frames", "\(outcome.total) for this chat, \(outcome.otherChats) for others")
         report.note("finish_reason seen", outcome.sawFinish ? "yes" : "no")
         for error in outcome.errors.prefix(3) { report.note("stream error", String(error.prefix(160))) }
+        report.note("time to first reasoning", outcome.firstReasoning.map(Probe.string) ?? "none")
         report.note("time to first token", Probe.string(outcome.firstToken ?? .zero))
+        report.note("reasoning", "\(outcome.reasoning.count) chars")
         report.note("text", String(outcome.text.prefix(120)).replacingOccurrences(of: "\n", with: " "))
         report.note(
             "usage", outcome.usage.map { "\($0.promptTokens ?? 0) in / \($0.completionTokens ?? 0) out" }
                 ?? "none reported")
-        report.note("terminal done event", outcome.sawDone ? "yes" : "no (timed out or ended early)")
+        report.note(
+            "terminal event",
+            outcome.sawDone
+                ? "done"
+                : (outcome.sawFinish
+                    ? "finish_reason, no done frame - the app must treat this as the end" : "none (timed out)"))
     }
 }
 

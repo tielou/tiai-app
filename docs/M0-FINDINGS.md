@@ -151,29 +151,51 @@ which is where the server's `connect(sid, environ, auth)` reads `auth['token']`.
 The library re-sends that payload once the engine opens, so starting the connect
 before the websocket is up does not lose it.
 
-## Round 7 — the event vocabulary, from live traffic
+## Round 7–8 — the event vocabulary, from live traffic
 
-The socket connects and the chat's frames arrive. On 0.11.4, one `events` frame
-per update, envelope `{chat_id, message_id, data:{type, data}}`:
+The socket connects, the room join works, and a short completion produced 52
+frames for the chat. Captured verbatim to `tiai-frames.jsonl` and checked in as
+`Tests/TiAiKitTests/Fixtures/socket-frames.jsonl`, with a test that replays all
+52 and asserts the answer reconstructs exactly.
 
-| `data.type` | what it carries |
-|---|---|
-| `response:completion` | the upstream OpenAI chunk, nearly verbatim — content at `data.data.choices[0].delta.content`, thinking at `delta.reasoning_content`, `finish_reason`, and `usage` when the provider reports it |
-| `chat:completion` | run-level updates (status, title) |
-| `chat:list` | chat-list mutations (id, folder_id, …) — the app can invalidate its list on these instead of polling |
+Envelope for every frame: `{chat_id, message_id, data: {type, data}}`.
 
-So the socket payload and the REST SSE payload are **the same OpenAI chunk
-shape**, one level deeper. The decoder is one path, not two.
+Outer `data.type`:
 
-The first attempt at decoding this reported "no text over the socket" while 50
-content frames sat in the same run's output: it looked for `data.delta`, the
-Responses-API spelling, instead of `data.data.choices[0].delta.content`. The
-frames were arriving the whole time; the reader was wrong. Now covered by
-`SocketFrameTests` against captured JSON.
+| type | count | meaning |
+|---|---|---|
+| `response:completion` | 50 | everything about the model's output |
+| `chat:completion` | 1 | the terminal frame (see below) |
+| `chat:list` | 1 | chat-list mutation — the app can invalidate its list on these instead of polling |
 
-`finish_reason` and `done` are different events — the model stops talking before
-the server finishes writing the transcript and emits its terminal frame, so a
-client that treats `finish_reason` as the end loses the tail.
+The inner `data.data` is **two different shapes inside one completion**:
+
+1. **OpenAI chunk** (`object: chat.completion.chunk`, `choices[]`) — only at the
+   boundaries. The opening frame announces `role: assistant` with empty content;
+   the closing frame carries `finish_reason: stop`.
+2. **Responses-API event** (`type`, `delta`, `item_id`, `output_index`) — every
+   real token. `response.output_text.delta` is the answer,
+   `response.reasoning_text.delta` is thinking, and thinking came first: 41
+   reasoning frames before the first answer frame.
+
+So `time to first token` has to ignore reasoning. Measured honestly on this run:
+first reasoning 0.2 s, first answer token later. A client that counts the first
+frame as a token reports 0 ms and shows nothing.
+
+**There is no `done` frame.** The only end-of-stream signal in a real run is the
+`chat:completion` frame carrying `finish_reason`. `Frame.isTerminal` is
+`isDone || isFinish` so the app has one thing to check and still works if a
+future version adds `done`.
+
+No `usage`, `error`, `status`, `citations` or tool frames appeared for this model
+— the local engine reports none. Those decoders stay tolerant and unproven until
+a model that emits them is probed.
+
+Both decoding mistakes were made against this capture: first reading only the
+Responses-API shape (found the deltas, missed the terminal frame), then only the
+OpenAI shape (found the terminal frame, lost the entire answer while 50 content
+frames sat in the same output). The replay test is what makes a third attempt
+expensive rather than silent.
 
 ## Still to verify
 

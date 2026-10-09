@@ -45,22 +45,45 @@ public final class ChatEventSocket: @unchecked Sendable {
             kind = payload["type"]?.stringValue ?? payload.keys.sorted().first ?? "unknown"
         }
 
-        /// The OpenAI-shaped chunk inside `data.data`. The server relays the
-        /// upstream provider's chunks almost verbatim, so content lives at
-        /// `choices[0].delta.content` — the same shape as the REST SSE stream,
-        /// which is what the app's decoder should be built on.
-        public var chunk: [String: JSONValue]? { data["data"]?.objectValue }
+        /// The inner payload, `data.data`. It is one of two shapes and both
+        /// occur inside a single completion, so the decoder has to handle both:
+        ///
+        /// * an OpenAI chunk (`choices`, `object`) — seen as the opening frame
+        ///   announcing the role and as the closing frame carrying
+        ///   `finish_reason`
+        /// * a Responses-API event (`type`, `delta`, `item_id`, `output_index`)
+        ///   — every actual content token
+        ///
+        /// Reading only the second shape loses the terminal frame; reading only
+        /// the first loses the whole answer. Both mistakes have now been made
+        /// once, against live traffic.
+        public var inner: [String: JSONValue]? { data["data"]?.objectValue }
 
-        private var choice: [String: JSONValue]? { chunk?["choices"]?.firstArrayElement?.objectValue }
-        private var delta_: [String: JSONValue]? { choice?["delta"]?.objectValue }
+        /// The inner type tag: `response.output_text.delta`,
+        /// `response.reasoning_text.delta`, … Absent on OpenAI chunks.
+        public var innerType: String? { inner?["type"]?.stringValue }
 
-        public var delta: String? { delta_?["content"]?.stringValue }
+        private var choice: [String: JSONValue]? { inner?["choices"]?.firstArrayElement?.objectValue }
+        private var openAIDelta: [String: JSONValue]? { choice?["delta"]?.objectValue }
+        private var flatDelta: String? { inner?["delta"]?.stringValue }
 
-        /// Thinking tokens. Different providers spell this differently and the
-        /// app renders it in a disclosure rather than in the answer, so it must
-        /// not be merged into `delta`.
+        /// Thinking tokens, kept apart from the answer because the app renders
+        /// them in a disclosure. Matched on the suffix rather than the exact
+        /// string so `response.reasoning_summary_text.delta` and whatever comes
+        /// next still land here instead of in the answer.
         public var reasoningDelta: String? {
-            delta_?["reasoning_content"]?.stringValue ?? delta_?["reasoning"]?.stringValue
+            if let type = innerType {
+                return type.hasSuffix(".delta") && type.contains("reasoning") ? flatDelta : nil
+            }
+            return openAIDelta?["reasoning_content"]?.stringValue
+                ?? openAIDelta?["reasoning"]?.stringValue
+        }
+
+        public var delta: String? {
+            if let type = innerType {
+                return type.hasSuffix(".delta") && !type.contains("reasoning") ? flatDelta : nil
+            }
+            return openAIDelta?["content"]?.stringValue
         }
 
         public var finishReason: String? {
@@ -68,7 +91,7 @@ public final class ChatEventSocket: @unchecked Sendable {
         }
 
         public var usage: TokenUsage? {
-            guard let value = chunk?["usage"],
+            guard let value = inner?["usage"] ?? choice?["usage"],
                   let encoded = try? JSONEncoder().encode(value),
                   let decoded = try? JSONDecoder().decode(TokenUsage.self, from: encoded)
             else { return nil }
@@ -77,19 +100,24 @@ public final class ChatEventSocket: @unchecked Sendable {
 
         /// An error the model run reported mid-stream, if any.
         public var errorText: String? {
-            data["error"]?.stringValue ?? chunk?["error"]?.stringValue
+            data["error"]?.stringValue ?? inner?["error"]?.stringValue
         }
 
-        /// The terminal frame. `done` can sit on the envelope or on the chunk
-        /// depending on which code path emitted it.
+        /// A frame some servers end with. Not observed on 0.11.4 — the terminal
+        /// frame there is `chat:completion` carrying `finish_reason` — so
+        /// nothing may rely on this alone.
         public var isDone: Bool {
-            data["done"]?.boolValue == true || chunk?["done"]?.boolValue == true
+            data["done"]?.boolValue == true || inner?["done"]?.boolValue == true
         }
 
         /// Marks the end of the model's output. Not the same as `isDone`: the
         /// server still writes the transcript and emits a terminal frame after
         /// it, so a client that stops here loses the tail.
         public var isFinish: Bool { finishReason != nil }
+
+        /// What the app should treat as the end. On 0.11.4 this is reached via
+        /// `isFinish`; `isDone` is kept because other paths emit it.
+        public var isTerminal: Bool { isDone || isFinish }
     }
 
     private let manager: SocketManager
