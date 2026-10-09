@@ -122,6 +122,35 @@ Two consequences, both of which bit the probe before they were understood:
   forever when nothing arrives. The probe hung exactly that way; the deadline is
   now a watchdog that ends the stream from the side.
 
+## Round 6 — the socket is at `/ws/socket.io`, websocket-only
+
+`GET /socket.io/?EIO=4&transport=polling` returns the **SPA's index.html** with
+200. The socket.io ASGI app is mounted elsewhere:
+
+```python
+app.mount('/ws', socket_app)                      # main.py
+app = socketio.ASGIApp(sio, socketio_path='/ws/socket.io')   # socket_main.py
+```
+
+and the server is built with `transports=['websocket']`, so polling is refused
+with `400 "Invalid transport"`. Verified by hand:
+
+```
+GET /socket.io/?EIO=4&transport=polling      → 200 text/html   (the SPA, not the socket)
+GET /ws/socket.io/?EIO=4&transport=polling   → 400 Invalid transport
+WS   /ws/socket.io/?EIO=4&transport=websocket → 101 Switching Protocols
+```
+
+So: path `/ws/socket.io`, `forceWebsockets(true)`, no polling fallback. The
+`/api/config` flag `enable_websocket` says *whether*, never *where* — the path is
+a constant on both sides, which is the kind of thing that fails silently, because
+a 200 with HTML looks like success to a naive client.
+
+Auth rides in the socket.io CONNECT packet (`connect(withPayload: ["token": …])`),
+which is where the server's `connect(sid, environ, auth)` reads `auth['token']`.
+The library re-sends that payload once the engine opens, so starting the connect
+before the websocket is up does not lose it.
+
 ## Still to verify
 
 * [ ] **assumption 2, re-run after the `id` fix** — after the stream,

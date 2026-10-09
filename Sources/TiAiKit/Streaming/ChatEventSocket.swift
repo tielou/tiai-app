@@ -61,12 +61,25 @@ public final class ChatEventSocket: @unchecked Sendable {
     private let handlers = SendableBox<[(Frame) -> Void]>([])
     private let token: String
 
+    /// Where Open WebUI mounts its socket.io ASGI app:
+    /// `app.mount('/ws', socket_app)` with `socketio_path = '/ws/socket.io'`.
+    /// Not `/socket.io` — that path falls through to the SPA and hands back
+    /// index.html, which is a confusingly silent failure.
+    public static let socketPath = "/ws/socket.io"
+
+    /// Open WebUI creates its AsyncServer with `transports=['websocket']` when
+    /// websocket support is on, so polling is refused with "Invalid transport".
+    /// There is no polling fallback to configure; skipping it is not an
+    /// optimisation, it is the only working option.
+    public static let websocketOnly = true
+
     public init(server: Server) {
         token = server.token
         manager = SocketManager(
             socketURL: server.baseURL,
             config: [
-                .path("/socket.io"),
+                .path(Self.socketPath),
+                .forceWebsockets(Self.websocketOnly),
                 .compress,
                 .log(false),
                 // A phone walks out of wifi constantly. Reconnecting forever is
