@@ -247,7 +247,7 @@ struct AddToChatSheet: View {
                     }
                 }
                 if !servers.isEmpty {
-                    Section("Servers") {
+                    Section {
                         ForEach(servers) { server in
                             Toggle(isOn: serverBinding(server)) {
                                 VStack(alignment: .leading, spacing: 2) {
@@ -260,6 +260,13 @@ struct AddToChatSheet: View {
                             }
                             .disabled(!server.reachable)
                         }
+                    } header: {
+                        Text("Servers")
+                    } footer: {
+                        // Says where they come from, because "why is Notion here"
+                        // and "why is Notion missing" are both answered by the
+                        // same fact: the instance decides, not the app.
+                        Text("Configured on your server. Off here means this chat does not offer them.")
                     }
                 }
 

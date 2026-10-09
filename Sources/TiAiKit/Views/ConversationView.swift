@@ -196,13 +196,17 @@ struct MessageRow: View {
                         .foregroundStyle(.secondary)
                         .font(.callout)
                 }
-                ForEach(Array(Markdown.blocks(TextSanitizer.clean(turn.text)).enumerated()), id: \.offset) { _, block in
-                    MarkdownBlockView(block: block, streaming: turn.streaming)
-                }
+                // The question and the answer the user gave come *before* the
+                // answer they unlocked. That is the order it happened in, it is
+                // how the Claude client reads, and it keeps the question visible
+                // without scrolling past the reply to remember what was asked.
                 ForEach(turn.calls) { call in
                     ToolCallCard(call: call) { action, answers in
                         onResolve?(call, action, answers)
                     }
+                }
+                ForEach(Array(Markdown.blocks(TextSanitizer.clean(turn.text)).enumerated()), id: \.offset) { _, block in
+                    MarkdownBlockView(block: block, streaming: turn.streaming)
                 }
                 if let error = turn.error {
                     Label(error, systemImage: "exclamationmark.octagon.fill")
@@ -339,10 +343,20 @@ struct ToolCallCard: View {
     let call: ToolCall
     var onResolve: (ToolCallAction, JSONValue?) -> Void
 
-    @State private var picked: Set<String> = []
-    @State private var typed = ""
+    /// Selections are stored **per question**. The single shared set this used to
+    /// have meant a second question's choice overwrote the first, so a two-part
+    /// ask came back with one answer and the model silently got the wrong one.
+    @State private var picked: [String: Set<String>] = [:]
+    @State private var typed: [String: String] = [:]
+    @State private var index = 0
 
     private var prompt: AskUserPrompt? { AskUserPrompt(arguments: call.arguments) }
+
+    private var question: AskUserPrompt.Question? {
+        guard let prompt else { return nil }
+        guard prompt.questions.indices.contains(index) else { return prompt.questions.first }
+        return prompt.questions[index]
+    }
 
     /// Used when the arguments did not parse into a recognisable question.
     private var questionFallback: String {
@@ -354,81 +368,62 @@ struct ToolCallCard: View {
         Group {
             if call.isAwaitingUser { waiting } else { settled }
         }
-        .padding(12)
+        .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.background.secondary, in: .rect(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.separator))
+        .background(.background.secondary, in: .rect(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(.separator))
     }
 
     @ViewBuilder private var waiting: some View {
-        if call.isAskUser, let prompt {
-            VStack(alignment: .leading, spacing: 10) {
-                if let title = prompt.title {
-                    Text(title).font(.headline)
+        if call.isAskUser, let prompt, let question {
+            VStack(alignment: .leading, spacing: 14) {
+                pager(prompt)
+                if let header = question.header {
+                    Text(header).font(.caption).foregroundStyle(.secondary)
                 }
-                ForEach(prompt.questions) { question in
-                    if let header = question.header {
-                        Text(header).font(.caption).foregroundStyle(.secondary)
-                    }
-                    Text(question.text).font(.body)
-                    ForEach(question.options) { option in
-                        Button {
-                            toggle(option.value, multi: question.multiSelect)
-                        } label: {
-                            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                Image(
-                                    systemName: picked.contains(option.label)
-                                        ? (question.multiSelect ? "checkmark.square.fill" : "largecircle.fill.circle")
-                                        : (question.multiSelect ? "square" : "circle"))
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(option.label)
-                                    if let detail = option.detail {
-                                        Text(detail).font(.caption).foregroundStyle(.secondary)
-                                    }
-                                }
-                                Spacer(minLength: 0)
-                                // The model's own hint, kept as a badge rather
-                                // than folded into the text: it is a tie-breaker
-                                // the reader should notice, not more prose.
-                                if option.recommended {
-                                    Text("Recommended")
-                                        .font(.caption2)
-                                        .padding(.horizontal, 6).padding(.vertical, 2)
-                                        .background(.quaternary, in: .capsule)
-                                }
-                            }
-                            .contentShape(.rect)
+                Text(question.text).font(.title3.weight(.semibold))
+
+                if question.options.isEmpty {
+                    field(question)
+                } else {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(question.options.enumerated()), id: \.offset) { position, option in
+                            if position > 0 { Divider() }
+                            optionRow(option, question: question)
                         }
-                        .buttonStyle(.plain)
+                        if prompt.allowsOther {
+                            Divider()
+                            field(question)
+                        }
                     }
                 }
-                // Offered when the tool accepts free text — which it says it
-                // does, rather than the app assuming it.
-                if prompt.allowsOther {
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text("Other").font(.callout).foregroundStyle(.secondary)
-                        TextField("Type your answer", text: $typed, axis: .vertical)
-                            .textFieldStyle(.plain)
-                    }
-                }
+
                 HStack {
-                    Button("Send") { send(prompt) }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(picked.isEmpty && typed.trimmingCharacters(in: .whitespaces).isEmpty)
                     Button("Skip") { onResolve(.reject, nil) }
                         .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        advance(prompt, question)
+                    } label: {
+                        HStack(spacing: 5) {
+                            Text(isLast(prompt) ? "Submit answers" : "Next")
+                            if !isLast(prompt) { Image(systemName: "arrow.right") }
+                        }
+                        .padding(.horizontal, 6).padding(.vertical, 3)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!answered(question))
                 }
-                .font(.body)
             }
         } else if call.isAskUser {
             // The schema was not recognised. Showing the raw question beats
             // showing nothing: the user can still answer by typing.
             VStack(alignment: .leading, spacing: 8) {
                 Text(questionFallback)
-                TextField("Type an answer", text: $typed, axis: .vertical).textFieldStyle(.plain)
-                Button("Send") { onResolve(.answer, .object(["answer": .string(typed)])) }
+                TextField("Type your answer", text: typed0, axis: .vertical).textFieldStyle(.plain)
+                Button("Send") { onResolve(.answer, .object(["answer": .string(typed0.wrappedValue)])) }
                     .buttonStyle(.borderedProminent)
-                    .disabled(typed.isEmpty)
+                    .disabled(typed0.wrappedValue.isEmpty)
             }
         } else {
             VStack(alignment: .leading, spacing: 8) {
@@ -448,6 +443,130 @@ struct ToolCallCard: View {
                 }
             }
         }
+    }
+
+    /// "‹ 2 of 3 ›" — the count is the point. A stack of questions with no
+    /// indication of how many are left reads as one question that keeps
+    /// repeating itself.
+    @ViewBuilder private func pager(_ prompt: AskUserPrompt) -> some View {
+        HStack(spacing: 4) {
+            if prompt.questions.count > 1 {
+                Button {
+                    if index > 0 { index -= 1 }
+                } label: { Image(systemName: "chevron.left") }
+                    .disabled(index == 0)
+                Text("\(index + 1) of \(prompt.questions.count)")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .monospacedDigit()
+                Button {
+                    if prompt.questions.indices.contains(index + 1) { index += 1 }
+                } label: { Image(systemName: "chevron.right") }
+                    .disabled(!prompt.questions.indices.contains(index + 1))
+            } else if let title = prompt.title {
+                Text(title).font(.callout).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button { onResolve(.reject, nil) } label: {
+                Image(systemName: "xmark").font(.body)
+            }
+            .foregroundStyle(.secondary)
+            .accessibilityLabel("Skip the question")
+        }
+        .buttonStyle(.plain)
+        .font(.callout)
+    }
+
+    private func optionRow(_ option: AskUserPrompt.Option, question: AskUserPrompt.Question) -> some View {
+        Button {
+            toggle(option.value, question: question)
+        } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(option.label)
+                    Spacer(minLength: 0)
+                    // The model's own hint, kept as a badge rather than folded
+                    // into the text: a tie-breaker the reader should notice, not
+                    // more prose.
+                    if option.recommended {
+                        Text("Recommended")
+                            .font(.caption2)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(.quaternary, in: .capsule)
+                    }
+                    if picked[question.value]?.contains(option.value) == true {
+                        Image(systemName: "checkmark").foregroundStyle(.tint)
+                    }
+                }
+                if let detail = option.detail {
+                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .multilineTextAlignment(.leading)
+            .padding(.vertical, 10)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func field(_ question: AskUserPrompt.Question) -> some View {
+        TextField("Type your answer…", text: typedBinding(question), axis: .vertical)
+            .textFieldStyle(.plain)
+            .foregroundStyle(.primary)
+            .padding(.vertical, 10)
+    }
+
+    private var typed0: Binding<String> {
+        Binding(get: { typed[""] ?? "" }, set: { typed[""] = $0 })
+    }
+
+    private func typedBinding(_ question: AskUserPrompt.Question) -> Binding<String> {
+        Binding(
+            get: { typed[question.value] ?? "" },
+            set: { value in
+                typed[question.value] = value
+                // Typing your own answer replaces a tapped one; both at once is
+                // an answer the tool has no way to read.
+                if !value.isEmpty { picked[question.value] = [] }
+            })
+    }
+
+    private func toggle(_ value: String, question: AskUserPrompt.Question) {
+        var current = picked[question.value] ?? []
+        if question.multiSelect {
+            if current.contains(value) { current.remove(value) } else { current.insert(value) }
+        } else {
+            current = [value]
+        }
+        picked[question.value] = current
+        typed[question.value] = ""
+    }
+
+    private func answered(_ question: AskUserPrompt.Question) -> Bool {
+        !(picked[question.value] ?? []).isEmpty
+            || !(typed[question.value] ?? "").trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    private func isLast(_ prompt: AskUserPrompt) -> Bool {
+        index >= prompt.questions.count - 1
+    }
+
+    private func advance(_ prompt: AskUserPrompt, _ question: AskUserPrompt.Question) {
+        guard isLast(prompt) else { index += 1; return }
+        submit(prompt)
+    }
+
+    private func submit(_ prompt: AskUserPrompt) {
+        // Keyed by question id, valued by option id: the tool minted both, so
+        // matching on human-readable text would break the moment the model
+        // rephrases a label.
+        var selections: [String: [String]] = [:]
+        for question in prompt.questions {
+            let values = Array(picked[question.value] ?? [])
+            let free = (typed[question.value] ?? "").trimmingCharacters(in: .whitespaces)
+            if !values.isEmpty { selections[question.value] = values }
+            else if !free.isEmpty { selections[question.value] = [free] }
+        }
+        onResolve(.answer, prompt.answers(for: selections))
     }
 
     @ViewBuilder private var settled: some View {
@@ -475,26 +594,5 @@ struct ToolCallCard: View {
             return answer.count > 120 ? String(answer.prefix(120)) + "…" : answer
         }
         return call.status == .rejected ? "\(call.name) rejected" : call.name
-    }
-
-    private func toggle(_ label: String, multi: Bool) {
-        if multi {
-            if picked.contains(label) { picked.remove(label) } else { picked.insert(label) }
-        } else {
-            picked = [label]
-            typed = ""
-        }
-    }
-
-    private func send(_ prompt: AskUserPrompt) {
-        // Keyed by question id, valued by option id: the tool minted both, so
-        // matching on the human-readable text would break the moment the model
-        // rephrases a label.
-        var selections: [String: [String]] = [:]
-        for question in prompt.questions {
-            if !picked.isEmpty { selections[question.value] = Array(picked) }
-            else { selections[question.value] = [typed] }
-        }
-        onResolve(.answer, prompt.answers(for: selections))
     }
 }

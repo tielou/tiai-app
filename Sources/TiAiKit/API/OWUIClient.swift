@@ -317,6 +317,7 @@ public struct OWUIClient: Sendable {
         let items =
             json.arrayValue
             ?? json["data"]?.arrayValue
+            ?? json["tool_servers"]?.arrayValue
             ?? json["toolServers"]?.arrayValue
             ?? json["servers"]?.arrayValue
             ?? []
