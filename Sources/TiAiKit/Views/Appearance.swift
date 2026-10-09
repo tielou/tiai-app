@@ -82,7 +82,11 @@ public struct AppearancePicker: View {
                 }
             }
         } label: {
-            Label("Appearance", systemImage: store.mode.systemImage)
+            // Icon only: in a toolbar a `Label` renders its title too, and
+            // "Appearance" in words next to a half-moon icon is one control
+            // wearing two labels.
+            Image(systemName: store.mode.systemImage)
         }
+        .accessibilityLabel("Appearance: \(store.mode.title)")
     }
 }

@@ -399,8 +399,6 @@ struct ToolCallCard: View {
                 }
 
                 HStack {
-                    Button("Skip") { onResolve(.reject, nil) }
-                        .foregroundStyle(.secondary)
                     Spacer()
                     Button {
                         advance(prompt, question)
