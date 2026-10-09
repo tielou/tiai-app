@@ -10,6 +10,12 @@ import Foundation
 ///
 /// Stripping them is safe because they carry no readable content: what is left is
 /// exactly what the user sees in the browser.
+///
+/// Worth knowing before chasing a box as a bug: a box can also mean the font
+/// cannot draw a character that *is* real content. This simulator renders every
+/// emoji as a hollow box — Safari in the same simulator does it too, and so does
+/// a plain text field, which is the fastest way to tell the two cases apart.
+/// Nothing in this file can fix that, and nothing needs to.
 public enum TextSanitizer {
     /// Codepoints that render as a missing-glyph box or as nothing at all.
     ///

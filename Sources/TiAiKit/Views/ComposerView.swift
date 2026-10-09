@@ -311,9 +311,12 @@ struct ModelPickerSheet: View {
                             HStack(alignment: .firstTextBaseline) {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(model.name.isEmpty ? model.id : model.name)
-                                    Text(model.description?.isEmpty == false ? model.description! : model.id)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                    // Only when the server actually described the
+                                    // model. Repeating the id underneath its own
+                                    // name is noise that looks like a bug.
+                                    if let description = model.description, !description.isEmpty {
+                                        Text(description).font(.caption).foregroundStyle(.secondary)
+                                    }
                                     Badges(model: model)
                                 }
                                 Spacer()

@@ -11,11 +11,18 @@ import SwiftUI
 /// * The composer stays usable while a run is in flight — the send button
 ///   becomes Stop, and the draft is not thrown away.
 public struct ConversationView: View {
+    private let session: SessionStore
     @State private var conversation: ConversationModel
     @State private var atBottom = true
     @Environment(\.scenePhase) private var scenePhase
+    /// Kept for the composer and the model sheet: the conversation only needs the
+    /// id to seed itself, but the UI needs the whole record to show what each
+    /// model can do. Dropping this is how the model sheet renders empty.
+    @State private var models: [ChatModel]
 
     public init(session: SessionStore, chatID: String?, title: String = "New Chat", models: [ChatModel] = []) {
+        self.session = session
+        self._models = State(initialValue: models)
         _conversation = State(
             initialValue: ConversationModel(
                 chatID: chatID,
@@ -38,13 +45,17 @@ public struct ConversationView: View {
                     .padding(.vertical, 6)
                     .background(.red.opacity(0.08))
             }
-            ComposerView(conversation: conversation)
+            ComposerView(conversation: conversation, models: models)
         }
         .inlineTitle(conversation.title)
         .toolbar { toolbar }
         .task {
             await conversation.connect()
             await conversation.load()
+            // The list may not have finished loading models before someone taps
+            // a chat; a conversation with no model to name cannot send anything.
+            if models.isEmpty { models = (try? await session.client.models()) ?? [] }
+            conversation.setModels(models)
         }
         .onChange(of: scenePhase) { _, phase in
             // iOS kills the socket on background anyway; saying so locally beats
@@ -69,6 +80,13 @@ public struct ConversationView: View {
                 .padding(.horizontal)
                 .padding(.top, 12)
             }
+            // The platform's own "stick to the bottom as content grows" behaviour.
+            // Scrolling to the bottom by hand is always a frame late: the delta
+            // arrives, the view scrolls to where the bottom *was*, and the line
+            // that just rendered lands below the fold. On the last token of a
+            // message that is permanent, which is how answers were ending up
+            // hidden behind the composer.
+            .defaultScrollAnchor(.bottom)
             .onScrollGeometryChange(for: Bool.self) { geometry in
                 let edge = geometry.contentOffset.y + geometry.containerSize.height
                 return geometry.contentSize.height - edge < 120
@@ -77,11 +95,24 @@ public struct ConversationView: View {
             }
             .onChange(of: conversation.turns.last?.text) { _, _ in
                 guard atBottom else { return }
+                // After layout, not during it — see defaultScrollAnchor above.
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(BottomAnchor.id, anchor: .bottom) }
             }
             .onChange(of: conversation.turns.count) { _, _ in
                 atBottom = true
                 proxy.scrollTo(BottomAnchor.id, anchor: .bottom)
+            }
+            .onChange(of: conversation.phase.isBusy) { _, busy in
+                // The last token is also the one most likely to land below the
+                // fold: there is no following delta to trigger the next scroll.
+                // When the run ends, settle once more after layout has finished.
+                // (Observed as a Bool: `onChange(of: conversation.phase)` inside
+                // a ScrollView resolves to a scroll-phase overload and fails.)
+                guard !busy, atBottom else { return }
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(150))
+                    proxy.scrollTo(BottomAnchor.id, anchor: .bottom)
+                }
             }
         }
     }
