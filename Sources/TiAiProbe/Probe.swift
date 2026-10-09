@@ -94,9 +94,17 @@ struct Probe {
             exit(1)
         }
 
-        // ---- 4. the completion handshake -----------------------------------
-        // Create the chat first, then stream into it. See OWUIClient.createChat
-        // for why the app does not let the server mint the id.
+        // ---- 4. the socket side channel ------------------------------------
+        // Round 3 of the probe established that a completion carrying a message
+        // id returns an EMPTY REST body: the server writes the reply to the chat
+        // and emits the content here instead. So this is the streaming path, and
+        // the first run of this section doubles as a capture of the server's real
+        // event vocabulary.
+        let socket = ChatEventSocket(server: server)
+        await report.check("socket.io connects with the bearer token") {
+            try await socket.connect()
+        }
+
         var chatID: String?
         await report.check("create chat (POST /chats/new)") {
             chatID = try await client.createChat(title: "tiAi probe — safe to delete").id
@@ -106,13 +114,14 @@ struct Probe {
             exit(1)
         }
 
+        let (frames, continuation) = AsyncStream<ChatEventSocket.Frame>.makeStream()
+        socket.onFrame { frame in
+            if frame.chatID == newChat { continuation.yield(frame) }
+        }
+
         let userMessageID = UUID().uuidString
         let assistantMessageID = UUID().uuidString
         let prompt = "Reply with exactly this text and nothing else: TIAI-PROBE-OK"
-
-        var firstToken: Duration?
-        var received = ""
-        var usage: TokenUsage?
 
         let request = CompletionRequest(
             model: model,
@@ -125,68 +134,85 @@ struct Probe {
             features: [:],
             stream: true)
 
+        var firstToken: Duration?
+        var received = ""
+        var usage: TokenUsage?
+        var sawDone = false
+        var kinds: [String: Int] = [:]
+        var samples: [String: String] = [:]
+
         let started = ContinuousClock.now
-        await report.check("completion streams over REST SSE (POST /chat/completions)") {
-            for try await event in try await client.stream(request) {
-                switch event {
-                case let .delta(text), let .reasoning(text):
-                    if firstToken == nil { firstToken = started.duration(to: .now) }
-                    received += text
-                case let .usage(value): usage = value
-                case let .failed(message): throw ProbeError.failure(message)
-                default: break
+        await report.check("completion arrives over the socket (POST returns empty by design)") {
+            // The REST call returns as soon as the server has taken the job.
+            for try await _ in try await client.stream(request) {}
+
+            let deadline = ContinuousClock.now + .seconds(90)
+            for await frame in frames {
+                if ContinuousClock.now > deadline { break }
+                kinds[frame.kind, default: 0] += 1
+                if samples[frame.kind] == nil {
+                    samples[frame.kind] = String(frame.raw.prefix(200))
                 }
+                if frame.delta != nil || frame.kind.contains("delta") {
+                    if firstToken == nil { firstToken = started.duration(to: .now) }
+                    received += frame.delta ?? ""
+                }
+                if let encoded = try? JSONEncoder().encode(frame.data),
+                   let decoded = try? JSONDecoder().decode(UsageEnvelope.self, from: encoded)
+                { usage = decoded.usage ?? usage }
+                if frame.isDone { sawDone = true; break }
             }
-            guard !received.isEmpty else { throw ProbeError.failure("stream produced no text") }
+            for kind in kinds.keys.sorted() {
+                report.note("event \(kind)", "x\(kinds[kind] ?? 0)  \(samples[kind] ?? "")")
+            }
             report.note("time to first token", Self.string(firstToken ?? .zero))
             report.note("text", String(received.prefix(120)).replacingOccurrences(of: "\n", with: " "))
-            report.note(
-                "usage",
-                usage.map { "\($0.promptTokens ?? 0) in / \($0.completionTokens ?? 0) out" } ?? "none reported")
+            report.note("usage", usage.map { "\($0.promptTokens ?? 0) in / \($0.completionTokens ?? 0) out" } ?? "none reported")
+            report.note("terminal done event", sawDone ? "yes" : "no (timed out or ended early)")
+            guard !received.isEmpty else {
+                throw ProbeError.failure("nothing arrived over the socket")
+            }
         }
 
         // ---- 5. the transcript is actually on the server -------------------
         await report.check("server persisted the exchange (GET /chats/{id})") {
-            // The assistant message is written by the event emitter, which can
-            // trail the last SSE frame by a moment.
             try await Task.sleep(for: .seconds(2))
             let thread = try await client.chat(id: newChat).thread
             report.note("persisted turns", thread.map(\.role).joined(separator: " → "))
             guard thread.contains(where: { $0.isUser && $0.content.text.contains("TIAI-PROBE-OK") }) else {
                 throw ProbeError.failure("the user turn is missing from the transcript")
             }
-            guard thread.contains(where: { $0.isAssistant && !$0.content.text.isEmpty }) else {
-                throw ProbeError.failure(
-                    "the assistant turn is empty — the REST-only reconciliation fallback will not work")
-            }
             let assistant = thread.last { $0.isAssistant }
-            report.note("assistant done flag", assistant.map { $0.done ? "true" : "false" } ?? "?")
-            report.note("status trail", "\(assistant?.statusHistory.count ?? 0) entries")
-            report.note("sources", "\(assistant?.sources?.count ?? 0) entries")
+            guard let assistant, !assistant.content.text.isEmpty else {
+                throw ProbeError.failure("the assistant turn is empty")
+            }
+            report.note("assistant text", String(assistant.content.text.prefix(80)))
+            report.note("assistant done flag", assistant.done ? "true" : "false")
+            report.note("status trail", "\(assistant.statusHistory.count) entries")
+            report.note("sources", "\(assistant.sources?.count ?? 0) entries")
         }
 
         // ---- 6. stop a generation for real ---------------------------------
-        await report.check("stop a running generation (POST /tasks/chat/{id}/stop)") {
+        await report.check("stop a running generation (POST /api/tasks/chat/{id}/stop)") {
             let id = UUID().uuidString
+            let longPrompt = "Count slowly from 1 to 500, one number per line, with a short comment on each."
             let request = CompletionRequest(
                 model: model,
                 messages: [
-                    CompletionRequest.WireMessage(
-                        id: id, role: "user",
-                        content: .text("Count slowly from 1 to 500, one number per line, with a short comment on each."))
+                    CompletionRequest.WireMessage(id: id, role: "user", content: .text(longPrompt))
                 ],
                 chatID: newChat,
                 parentID: .message(assistantMessageID),
                 userMessage: CompletionRequest.WireMessage(
-                    id: id, role: "user",
-                    content: .text("Count slowly from 1 to 500, one number per line, with a short comment on each."),
+                    id: id, role: "user", content: .text(longPrompt),
                     parentID: assistantMessageID, model: model),
                 messageID: UUID().uuidString,
                 stream: true)
 
             var deltas = 0
-            for try await event in try await client.stream(request) {
-                if case .delta = event {
+            try await client.stream(request)
+            for await frame in frames {
+                if frame.delta != nil {
                     deltas += 1
                     if deltas > 5 {
                         try await client.stop(chatID: newChat)
@@ -196,7 +222,12 @@ struct Probe {
             }
             guard deltas > 0 else { throw ProbeError.failure("nothing arrived to stop") }
             report.note("deltas before stop", "\(deltas)")
+            try await Task.sleep(for: .seconds(2))
+            let after = try await client.chat(id: newChat).thread.last { $0.isAssistant }
+            report.note("stopped message length", "\(after?.content.text.count ?? 0) chars")
         }
+
+        socket.disconnect()
 
         // ---- 7. the screens that are not chat ------------------------------
         await report.check("memories (GET /memories/)") {
@@ -223,6 +254,9 @@ struct Probe {
         return String(format: "%.1fs", Double(components.seconds) + Double(components.attoseconds) / 1e18)
     }
 }
+
+/// Usage arrives as its own socket event, not on the stream.
+private struct UsageEnvelope: Decodable { let usage: TokenUsage? }
 
 enum ProbeError: Error {
     case failure(String)

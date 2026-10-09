@@ -23,8 +23,23 @@ let package = Package(
         .library(name: "TiAiKit", targets: ["TiAiKit"]),
         .executable(name: "tiaiprobe", targets: ["TiAiProbe"]),
     ],
+    dependencies: [
+        // The one dependency, and it is load-bearing rather than convenient:
+        // when a completion carries a message id, the server writes the reply
+        // to the chat and emits the content over socket.io, and the REST body
+        // comes back empty. There is no way to get both over REST. See
+        // docs/M0-FINDINGS.md -- this was assumed to be an M4 nicety until the
+        // probe proved it is the only streaming path.
+        .package(url: "https://github.com/socketio/socket.io-client-swift", from: "16.1.1"),
+    ],
+
     targets: [
-        .target(name: "TiAiKit"),
+        .target(
+            name: "TiAiKit",
+            dependencies: [
+                .product(name: "SocketIO", package: "socket.io-client-swift")
+            ]
+        ),
         // The M0 spike: a command-line client that exercises the Open WebUI
         // contract end to end against a real server. Kept in the package so
         // `swift run tiaiprobe` works on any machine with the CLT.
