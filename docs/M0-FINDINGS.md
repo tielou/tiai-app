@@ -105,6 +105,23 @@ not a guarantee — the UI must not assume they arrive.
 
 Memories: 6. Prompts: 0. Chats: 140.
 
+## Round 5 — the POST is not a handoff
+
+Reading the server again after the socket work: `streaming_chat_response_handler`
+ends with `return await response_handler(response, events)`, and `response_handler`
+has no `return` — it consumes the entire upstream stream inside the request and
+yields `None`. So the completion POST **does not answer until the model has
+finished**, and then answers with an empty body.
+
+Two consequences, both of which bit the probe before they were understood:
+
+* The app cannot POST and then start listening. The request must be started in a
+  concurrent task and the socket read in parallel — which is also why Stop has to
+  be a separate request fired while the completion POST is still in flight.
+* A collection loop whose deadline is only checked when a frame arrives hangs
+  forever when nothing arrives. The probe hung exactly that way; the deadline is
+  now a watchdog that ends the stream from the side.
+
 ## Still to verify
 
 * [ ] **assumption 2, re-run after the `id` fix** — after the stream,
