@@ -148,7 +148,7 @@ struct MessageRow: View {
                         .foregroundStyle(.secondary)
                         .font(.callout)
                 }
-                ForEach(Array(Markdown.blocks(turn.text).enumerated()), id: \.offset) { _, block in
+                ForEach(Array(Markdown.blocks(TextSanitizer.clean(turn.text)).enumerated()), id: \.offset) { _, block in
                     MarkdownBlockView(block: block, streaming: turn.streaming)
                 }
                 if let error = turn.error {
@@ -166,7 +166,7 @@ struct MessageRow: View {
     /// It is also the only sign that a slow model is working rather than stuck.
     @ViewBuilder private var reasoning: some View {
         DisclosureGroup {
-            Text(turn.reasoning)
+            Text(TextSanitizer.clean(turn.reasoning))
                 .font(.callout.monospaced())
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)

@@ -129,16 +129,62 @@ public final class ConversationModel {
 
     // MARK: - sending
 
+    /// A file chosen in the composer and uploaded, waiting to be sent with the
+    /// next message.
+    public struct PendingAttachment: Identifiable, Equatable, Sendable {
+        /// The server's file id — this is what goes in the completion's `files`.
+        public let id: String
+        public let name: String
+        public let mimeType: String
+        public var isImage: Bool { mimeType.hasPrefix("image/") }
+    }
+
+    public private(set) var attachments: [PendingAttachment] = []
+    public private(set) var uploading = false
+
+    /// Uploads a file so it can be attached to the next message.
+    ///
+    /// Upload happens when the file is picked, not when the message is sent: the
+    /// server processes documents in the background after upload, so starting
+    /// early is the difference between an instant send and a spinner after the
+    /// user has already pressed go.
+    public func attach(data: Data, name: String, mimeType: String) {
+        guard !name.isEmpty else { return }
+        uploading = true
+        error = nil
+        Task {
+            defer { uploading = false }
+            do {
+                let file = try await client.uploadFile(data: data, filename: name, mimeType: mimeType)
+                attachments.append(
+                    PendingAttachment(id: file.id, name: file.filename, mimeType: mimeType))
+            } catch {
+                self.error = "Could not attach \(name): \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// A file the picker handed over and the app could not read.
+    public func attachmentFailed(_ name: String) {
+        error = "Could not read \(name)."
+    }
+
+    public func detach(_ attachment: PendingAttachment) {
+        attachments.removeAll { $0.id == attachment.id }
+    }
+
     public func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !phase.isBusy else { return }
+        let files = attachments
+        attachments = []
         draft = ""
         error = nil
         // Set here rather than inside the task: the button's feedback should not
         // wait for a scheduling hop, and a caller that then awaits something
         // conditioned on the phase would otherwise race the run it just started.
         phase = .waiting
-        run = Task { await self.exchange(text: text, regenerating: nil) }
+        run = Task { await self.exchange(text: text, regenerating: nil, files: files) }
     }
 
     /// Re-runs the last user message. That message's id is reused, so the server
@@ -152,7 +198,7 @@ public final class ConversationModel {
         turns.removeSubrange(turns.index(after: index)..<turns.endIndex)
         leafID = last.id
         phase = .waiting
-        run = Task { await self.exchange(text: last.text, regenerating: last.id) }
+        run = Task { await self.exchange(text: last.text, regenerating: last.id, files: []) }
     }
 
     /// Asks the server to halt the run in flight.
@@ -187,7 +233,7 @@ public final class ConversationModel {
         var index: Int
     }
 
-    private func exchange(text: String, regenerating: String?) async {
+    private func exchange(text: String, regenerating: String?, files: [PendingAttachment]) async {
         guard !model.isEmpty else {
             error = "No model selected."
             return
@@ -225,7 +271,8 @@ public final class ConversationModel {
                 id: userMessageID, role: "user", content: .text(text),
                 parentID: parentID, model: model),
             messageID: assistantID,
-            features: features)
+            features: features,
+            files: files.isEmpty ? nil : files.map(\.id))
 
         // Blocks for the whole generation and yields no body; what is left for it
         // to do is fail loudly (401, 429) and to close. The task inherits this

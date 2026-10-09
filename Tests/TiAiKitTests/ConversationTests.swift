@@ -237,6 +237,7 @@ extension Dictionary where Key == String {
 final class ScriptedTransport: APITransport, @unchecked Sendable {
     private(set) var paths: [String] = []
     private(set) var completionBodies: [Data] = []
+    private(set) var uploads: [Data] = []
     var completionBody: Data? { completionBodies.last }
 
     var chatDetail: Data {
@@ -251,6 +252,11 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
         let path = request.url?.path ?? ""
         paths.append(path)
         if path.hasSuffix("/chats/new") { return (chatDetail, response(for: request, 200)) }
+        if path.hasSuffix("/files") || path.hasSuffix("/files/") {
+            uploads.append(request.httpBody ?? Data())
+            return (Data(#"{"id":"file-1","filename":"notes.txt","type":"text/plain","updated_at":1}"#.utf8),
+                    response(for: request, 200))
+        }
         return (Data("{}".utf8), response(for: request, 200))
     }
 
@@ -341,4 +347,35 @@ extension ChatModel {
         let data = try! JSONSerialization.data(withJSONObject: object)
         return try! JSONDecoder().decode(ChatModel.self, from: data)
     }
+}
+
+
+@Test @MainActor func attachmentsAreUploadedAndNamedOnTheCompletion() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub)
+
+    conversation.attach(data: Data("hi".utf8), name: "notes.txt", mimeType: "text/plain")
+    try await waitUntil { conversation.attachments.count == 1 }
+    #expect(transport.uploads.count == 1)
+    // The multipart body has to name the file and declare its type, or the
+    // server stores an extensionless blob it cannot route to a parser.
+    let body = String(decoding: transport.uploads[0], as: UTF8.self)
+    #expect(body.contains("filename=\"notes.txt\""))
+    #expect(body.contains("Content-Type: text/plain"))
+
+    conversation.draft = "read this"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let raw = try #require(transport.completionBody)
+    let json = try #require(JSONSerialization.jsonObject(with: raw) as? [String: Any])
+    #expect(json["files"] as? [String] == ["file-1"])
+    // Attached to the message it was added for, then cleared - a chip that
+    // lingered would silently re-send the same file on every later message.
+    #expect(conversation.attachments.isEmpty)
 }

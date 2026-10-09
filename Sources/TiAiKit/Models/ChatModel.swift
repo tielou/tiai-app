@@ -117,6 +117,17 @@ public enum ChatFeature: String, CaseIterable, Codable, Sendable {
     case codeInterpreter = "code_interpreter"
     case imageGeneration = "image_generation"
 
+    /// The chip-sized label, for the composer where "Web search" is too wide.
+    public var shortTitle: String {
+        switch self {
+        case .webSearch: "search"
+        case .memory: "memory"
+        case .thinking: "thinking"
+        case .codeInterpreter: "code"
+        case .imageGeneration: "images"
+        }
+    }
+
     public var title: String {
         switch self {
         case .webSearch: "Web search"

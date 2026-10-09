@@ -1,108 +1,422 @@
+import PhotosUI
 import SwiftUI
+#if os(iOS)
+import UIKit
+#endif
 
-/// The composer: what you type, which model answers, and which features are on.
+/// The composer, shaped like the Claude app's: one card holding the text, and a
+/// row underneath with a `+` for everything that is not typing, a chip naming
+/// the model, and send.
 ///
-/// The send button turns into Stop while a run is in flight rather than the
-/// screen going modal. The draft is held by the conversation model, so a run in
-/// progress does not lock the keyboard and a half-typed follow-up is not lost.
+/// The shape is the point. A chip keeps "which model is answering me" on screen
+/// at all times instead of hidden in a toolbar, and putting attachments and
+/// toggles behind `+` stops the keyboard from pushing a wall of controls around.
+///
+/// Every picker lives here rather than in the `+` sheet: a sheet cannot reliably
+/// present a second sheet, so the sheet only says which one it wants and closes.
 struct ComposerView: View {
     @Bindable var conversation: ConversationModel
     var models: [ChatModel] = []
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            controls
-            HStack(alignment: .bottom, spacing: 8) {
-                TextField("Message", text: $conversation.draft, axis: .vertical)
-                    .lineLimit(1...8)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 18))
-                    .onSubmit { conversation.send() }
+    @State private var sheet: Sheet?
+    @State private var pending: Pending?
+    @State private var photoItems: [PhotosPickerItem] = []
+    @State private var showingFiles = false
+    @State private var cameraRequest = false
 
-                Button {
-                    if conversation.phase.isBusy { conversation.stop() } else { conversation.send() }
-                } label: {
-                    Image(systemName: conversation.phase.isBusy ? "stop.circle.fill" : "arrow.up.circle.fill")
-                        .font(.system(size: 28))
+    private enum Sheet: Identifiable {
+        case add, models
+        var id: Int { hashValue }
+    }
+
+    /// A picker the `+` sheet asked for, held until this sheet is gone.
+    private enum Pending { case camera, photos, files }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !conversation.attachments.isEmpty { attachmentStrip }
+
+            TextField("Message", text: $conversation.draft, axis: .vertical)
+                .lineLimit(1...8)
+                .onSubmit { conversation.send() }
+
+            HStack(spacing: 8) {
+                Button { sheet = .add } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 17, weight: .medium))
+                        .frame(width: 34, height: 34)
+                        .background(.quaternary.opacity(0.7), in: .circle)
                 }
-                .buttonStyle(.borderless)
-                .disabled(!conversation.phase.isBusy && !conversation.canSend)
-                .accessibilityLabel(conversation.phase.isBusy ? "Stop" : "Send")
+                .buttonStyle(.plain)
+                .accessibilityLabel("Add to chat")
+
+                modelChip
+                Spacer(minLength: 4)
+                if conversation.uploading { ProgressView().controlSize(.small) }
+                sendButton
             }
         }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(.quaternary.opacity(0.45), in: .rect(cornerRadius: 22))
+        .overlay(RoundedRectangle(cornerRadius: 22).stroke(.quaternary))
         .padding(.horizontal)
         .padding(.bottom, 8)
-        .overlay(alignment: .top) { Divider() }
-    }
-
-    @ViewBuilder private var controls: some View {
-        HStack(spacing: 12) {
-            modelPicker
-            featurePicker
-            Spacer()
-            if let phase = phaseLabel {
-                Text(phase).font(.caption).foregroundStyle(.secondary)
+        .sheet(item: $sheet) { which in
+            switch which {
+            case .add:
+                AddToChatSheet(
+                    conversation: conversation, models: models,
+                    onCamera: { hand(.camera) }, onPhotos: { hand(.photos) },
+                    onFiles: { hand(.files) })
+            case .models:
+                ModelPickerSheet(conversation: conversation, models: models)
             }
         }
-        .font(.caption)
+        #if os(iOS)
+        .photosPicker(isPresented: Binding(get: { pending == .photos }, set: { if !$0 { pending = nil } }), selection: $photoItems, matching: .images)
+        .sheet(isPresented: $cameraRequest) {
+            CameraPicker { data, name, mime in conversation.attach(data: data, name: name, mimeType: mime) }
+        }
+        .onChange(of: photoItems) { _, items in
+            Task {
+                for item in items {
+                    guard let data = try? await item.loadTransferable(type: Data.self) else { continue }
+                    conversation.attach(
+                        data: data,
+                        name: (item.itemIdentifier ?? "photo").replacingOccurrences(of: "/", with: "-") + ".jpg",
+                        mimeType: "image/jpeg")
+                }
+                photoItems = []
+            }
+        }
+        #endif
+        .fileImporter(
+            isPresented: $showingFiles,
+            allowedContentTypes: [.data, .content, .image, .pdf, .text, .plainText, .commaSeparatedText],
+            allowsMultipleSelection: true
+        ) { result in
+            if case let .success(urls) = result { urls.forEach(importFile) }
+        }
     }
 
-    private var modelPicker: some View {
-        Menu {
-            ForEach(conversation.modelIDs, id: \.self) { id in
-                Button {
-                    conversation.select(model: id, from: models)
-                } label: {
-                    if id == conversation.model {
-                        Label(id, systemImage: "checkmark")
-                    } else {
-                        Text(id)
+    /// Opens a picker after the `+` sheet has finished closing. Presenting during
+    /// the dismiss animation is silently ignored, which looks like a dead button.
+    private func hand(_ which: Pending) {
+        pending = which
+        Task {
+            try? await Task.sleep(for: .milliseconds(400))
+            switch which {
+            case .camera: cameraRequest = true
+            case .photos, .files: showingFiles = which == .files; pending = nil
+            }
+        }
+    }
+
+    private var sendButton: some View {
+        Button {
+            if conversation.phase.isBusy { conversation.stop() } else { conversation.send() }
+        } label: {
+            Image(systemName: conversation.phase.isBusy ? "stop.fill" : "arrow.up")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(conversation.phase.isBusy || conversation.canSend ? .white : .secondary)
+                .frame(width: 34, height: 34)
+                .background(
+                    conversation.phase.isBusy ? AnyShapeStyle(.red)
+                        : conversation.canSend ? AnyShapeStyle(.tint) : AnyShapeStyle(.quaternary),
+                    in: .circle)
+        }
+        .buttonStyle(.plain)
+        .disabled(!conversation.phase.isBusy && !conversation.canSend)
+        .accessibilityLabel(conversation.phase.isBusy ? "Stop" : "Send")
+    }
+
+    /// The model, always visible, and the way into the model sheet.
+    private var modelChip: some View {
+        Button { sheet = .models } label: {
+            HStack(spacing: 5) {
+                Text(models.first(where: { $0.id == conversation.model })?.name.nonEmpty ?? conversation.model)
+                    .font(.footnote.weight(.medium))
+                    .lineLimit(1)
+                if let hint = chipHint {
+                    Text(hint).font(.footnote).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(.quaternary.opacity(0.7), in: .capsule)
+        }
+        .buttonStyle(.plain)
+        .disabled(conversation.phase.isBusy)
+        .accessibilityLabel("Model \(conversation.model)")
+    }
+
+    /// What is on for this message, in the chip's secondary slot — the same slot
+    /// Claude uses for "Medium".
+    private var chipHint: String? {
+        let on = ChatFeature.allCases.filter { conversation.features[$0.rawValue] ?? false }
+        return on.isEmpty ? nil : on.map(\.shortTitle).joined(separator: " · ")
+    }
+
+    private var attachmentStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(conversation.attachments) { attachment in
+                    AttachmentChip(attachment: attachment) { conversation.detach(attachment) }
+                }
+            }
+        }
+    }
+
+    private func importFile(_ url: URL) {
+        // Not optional for a security-scoped URL: without the call the read
+        // returns nothing and the user sees a file that silently never attached.
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        guard let data = try? Data(contentsOf: url) else {
+            conversation.attachmentFailed(url.lastPathComponent)
+            return
+        }
+        conversation.attach(
+            data: data, name: url.lastPathComponent, mimeType: MIME.type(forPath: url.pathExtension))
+    }
+}
+
+private extension String {
+    var nonEmpty: String? { isEmpty ? nil : self }
+}
+
+struct AttachmentChip: View {
+    let attachment: ConversationModel.PendingAttachment
+    var onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: attachment.isImage ? "photo" : "doc.text")
+                .font(.caption)
+            Text(attachment.name).font(.caption).lineLimit(1)
+            Button(action: onRemove) {
+                Image(systemName: "xmark.circle.fill").font(.caption).foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Remove \(attachment.name)")
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(.quaternary.opacity(0.7), in: .capsule)
+    }
+}
+
+/// The `+` sheet: a picture, a file, then the switches that change how the model
+/// answers.
+struct AddToChatSheet: View {
+    @Bindable var conversation: ConversationModel
+    var models: [ChatModel]
+    var onCamera: () -> Void
+    var onPhotos: () -> Void
+    var onFiles: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    HStack(spacing: 12) {
+                        #if os(iOS)
+                        Tile(title: "Camera", systemImage: "camera", action: send(onCamera))
+                        #endif
+                        Tile(title: "Photos", systemImage: "photo.on.rectangle", action: send(onPhotos))
+                        Tile(title: "Files", systemImage: "folder", action: send(onFiles))
+                        Spacer()
+                    }
+                    .frame(height: 78)
+                }
+
+                Section("Tools") {
+                    ForEach(ChatFeature.allCases, id: \.self) { feature in
+                        Toggle(isOn: binding(for: feature)) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(feature.title)
+                                if let model = currentModel, !model.supports(feature) {
+                                    Text("Not offered by \(conversation.model)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .disabled(currentModel.map { !$0.supports(feature) } ?? false)
                     }
                 }
             }
-        } label: {
-            Label(conversation.model.isEmpty ? "Model" : conversation.model, systemImage: "cpu")
-                .lineLimit(1)
-        }
-        .disabled(conversation.phase.isBusy)
-    }
-
-    /// Only the toggles this model says it has. An empty capability map means "no
-    /// metadata" rather than "no features", so the model with no capabilities still
-    /// gets the full list — hiding web search there would be a feature removal
-    /// invented by a missing dict on the server.
-    private var featurePicker: some View {
-        Menu {
-            ForEach(ChatFeature.allCases, id: \.self) { feature in
-                Toggle(isOn: binding(for: feature)) {
-                    Text(feature.title)
+            .inlineTitle("Add to Chat")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button { dismiss() } label: { Image(systemName: "xmark") }
                 }
-                .disabled(!available(feature))
             }
-        } label: {
-            Label("Features", systemImage: "switch.2")
         }
-        .disabled(conversation.phase.isBusy)
+        .presentationDetents([.medium, .large])
     }
 
-    private func available(_ feature: ChatFeature) -> Bool {
-        models.first(where: { $0.id == conversation.model })?.supports(feature) ?? true
+    /// Closes this sheet before handing off, because the composer cannot present
+    /// a picker while this one is still on screen.
+    private func send(_ action: @escaping () -> Void) -> () -> Void {
+        { dismiss(); action() }
     }
+
+    private var currentModel: ChatModel? { models.first { $0.id == conversation.model } }
 
     private func binding(for feature: ChatFeature) -> Binding<Bool> {
         Binding(
             get: { conversation.features[feature.rawValue] ?? false },
             set: { conversation.features[feature.rawValue] = $0 })
     }
+}
 
-    private var phaseLabel: String? {
-        switch conversation.phase {
-        case .waiting: "waiting…"
-        case .streaming: "streaming…"
-        case .stopping: "stopping…"
-        case .loading: "loading…"
-        case .ready: nil
+private struct Tile: View {
+    let title: String
+    let systemImage: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 8) {
+                Image(systemName: systemImage).font(.title3)
+                Text(title).font(.caption)
+            }
+            .frame(width: 78, height: 78)
+            .background(.quaternary.opacity(0.6), in: .rect(cornerRadius: 16))
+            .foregroundStyle(.primary)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// The model sheet: name, what it is for, what it can do, a tick on the one in
+/// use.
+struct ModelPickerSheet: View {
+    @Bindable var conversation: ConversationModel
+    var models: [ChatModel]
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(models, id: \.id) { model in
+                        Button {
+                            conversation.select(model: model.id, from: models)
+                            dismiss()
+                        } label: {
+                            HStack(alignment: .firstTextBaseline) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(model.name.isEmpty ? model.id : model.name)
+                                    Text(model.description?.isEmpty == false ? model.description! : model.id)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Badges(model: model)
+                                }
+                                Spacer()
+                                if model.id == conversation.model {
+                                    Image(systemName: "checkmark").foregroundStyle(.tint)
+                                }
+                            }
+                            .contentShape(.rect)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } footer: {
+                    Text("Capabilities are what the server reports. A model that reports none is not limited — it just did not say.")
+                }
+            }
+            .inlineTitle("Select model")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button { dismiss() } label: { Image(systemName: "xmark") }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+}
+
+private struct Badges: View {
+    let model: ChatModel
+    // Only what a user would notice. `file_upload` and `memory` are plumbing;
+    // vision, tools and search change what they can ask for.
+    var body: some View {
+        HStack(spacing: 5) {
+            ForEach(names, id: \.self) { name in
+                Text(name)
+                    .font(.caption2)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(.quaternary.opacity(0.7), in: .capsule)
+            }
+        }
+    }
+
+    private var names: [String] {
+        [("vision", model.supportsVision), ("tools", model.supportsTools),
+         ("search", model.supportsWebSearch), ("code", model.supportsCodeInterpreter)]
+            .filter(\.1).map(\.0)
+    }
+}
+
+#if os(iOS)
+/// Camera capture bridged to SwiftUI. Absent on a Mac, and on the simulator the
+/// source is unavailable — the button is there so the flow is testable on device.
+struct CameraPicker: UIViewControllerRepresentable {
+    var onCapture: (Data, String, String) -> Void
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        if UIImagePickerController.isSourceTypeAvailable(.camera) { picker.sourceType = .camera }
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ picker: UIImagePickerController, context: Context) {}
+    func makeCoordinator() -> Coordinator { Coordinator(onCapture) }
+
+    final class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+        private let onCapture: (Data, String, String) -> Void
+        init(_ onCapture: @escaping (Data, String, String) -> Void) { self.onCapture = onCapture }
+
+        func imagePickerController(
+            _ picker: UIImagePickerController,
+            didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
+        ) {
+            if let image = info[.originalImage] as? UIImage,
+               let data = image.jpegData(compressionQuality: 0.85)
+            {
+                onCapture(data, "camera-\(Int(Date.now.timeIntervalSince1970)).jpg", "image/jpeg")
+            }
+            picker.dismiss(animated: true)
+        }
+
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            picker.dismiss(animated: true)
+        }
+    }
+}
+#endif
+
+/// MIME types the server needs and the picker does not always supply.
+enum MIME {
+    static func type(forPath ext: String) -> String {
+        switch ext.lowercased() {
+        case "jpg", "jpeg": "image/jpeg"
+        case "png": "image/png"
+        case "gif": "image/gif"
+        case "webp": "image/webp"
+        case "heic": "image/heic"
+        case "pdf": "application/pdf"
+        case "txt", "md": "text/plain"
+        case "csv": "text/csv"
+        case "json": "application/json"
+        case "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        case "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        default: "application/octet-stream"
         }
     }
 }
