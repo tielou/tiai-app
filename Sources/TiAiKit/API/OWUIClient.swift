@@ -309,11 +309,39 @@ public struct OWUIClient: Sendable {
     /// not to the API contract, so it is decoded tolerantly and unreadable
     /// entries are dropped rather than failing the whole list.
     public func toolServers() async throws -> [ToolServer] {
-        // The shape of this response belongs to the admin UI rather than to a
-        // published contract, and it has been seen both bare and wrapped. Betting
-        // on one form means the section silently never appears — which is what
-        // the first attempt did — so every form that arrives is accepted.
-        let json: JSONValue = try await request("GET", "/configs/tool_servers")
+        // Two places, because there are two. `/configs/tool_servers` is the
+        // admin's registry; the servers a user has actually connected live in
+        // their own settings under `toolServers`, and that is the list the web
+        // client matches a tool call against (`settings.toolServers.find(s =>
+        // s.url === …)`). Reading only the admin registry showed nothing on an
+        // instance where Sonos and Notion were plainly in the composer.
+        //
+        // Neither endpoint has a published shape, so both are decoded tolerantly
+        // and a failure of one is not allowed to hide the other.
+        var found: [String: ToolServer] = [:]
+        var order: [String] = []
+        var adminError: Error?
+        var userError: Error?
+        var admin: [ToolServer] = []
+        var user: [ToolServer] = []
+        do { admin = try await adminToolServers() } catch { adminError = error }
+        do { user = try await userToolServers() } catch { userError = error }
+        // Both empty with a failure behind it is a bug or a permission problem,
+        // not an instance with no servers — and the two are indistinguishable on
+        // screen unless something says so.
+        if admin.isEmpty, user.isEmpty {
+            if let adminError { throw adminError }
+            if let userError { throw userError }
+        }
+        for server in admin + user {
+            if found[server.id] == nil { order.append(server.id) }
+            found[server.id] = server
+        }
+        return order.compactMap { found[$0] }
+    }
+
+    /// Pulls the candidate arrays out of a response whose key is not known.
+    private static func candidates(_ json: JSONValue) -> [ToolServer] {
         let items =
             json.arrayValue
             ?? json["data"]?.arrayValue
@@ -322,6 +350,16 @@ public struct OWUIClient: Sendable {
             ?? json["servers"]?.arrayValue
             ?? []
         return items.compactMap(ToolServer.init)
+    }
+
+    private func adminToolServers() async throws -> [ToolServer] {
+        let json: JSONValue = try await request("GET", "/configs/tool_servers")
+        return Self.candidates(json)
+    }
+
+    private func userToolServers() async throws -> [ToolServer] {
+        let json: JSONValue = try await request("GET", "/users/user/settings")
+        return Self.candidates(json["toolServers"] ?? json)
     }
 
     /// Answers a tool call and lets the parked run continue.
