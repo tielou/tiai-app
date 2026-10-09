@@ -336,9 +336,9 @@ enum Frames {
 }
 
 extension ChatModel {
-    static func stub(_ id: String, defaults: [String] = []) -> ChatModel {
+    static func stub(_ id: String, defaults: [String] = [], caps: [String: Bool]? = nil) -> ChatModel {
         let meta: [String: Any] = [
-            "capabilities": ["web_search": true],
+            "capabilities": caps ?? ["web_search": true],
             "defaultFeatureIds": defaults,
         ]
         let object: [String: Any] = [
@@ -378,4 +378,33 @@ extension ChatModel {
     // Attached to the message it was added for, then cleared - a chip that
     // lingered would silently re-send the same file on every later message.
     #expect(conversation.attachments.isEmpty)
+}
+
+@Test @MainActor func memoryIsOnByDefaultWhereTheModelHasIt() {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let client = OWUIClient(server: server, transport: ScriptedTransport())
+
+    let remembering = ChatModel.stub(
+        "local-personal", defaults: ["web_search"],
+        caps: ["web_search": true, "memory": true])
+    let conversation = ConversationModel(
+        chatID: nil, models: [remembering], client: client, hub: hub)
+
+    // The server's default plus memory, which the server leaves off unless the
+    // user enabled it globally.
+    #expect(conversation.features["web_search"] == true)
+    #expect(conversation.features["memory"] == true)
+
+    // A model that does not report the capability must not get a toggle that
+    // does nothing, and switching to it must drop the old model's choices.
+    let plain = ChatModel.stub("local-fast", caps: ["web_search": true])
+    conversation.select(model: "local-fast", from: [remembering, plain])
+    #expect(conversation.features["memory"] == nil)
+
+    // Filling in a model list that arrived late must not overwrite a choice the
+    // user already made in this chat.
+    conversation.features["web_search"] = false
+    conversation.setModels([remembering, plain])
+    #expect(conversation.features["web_search"] == false)
 }

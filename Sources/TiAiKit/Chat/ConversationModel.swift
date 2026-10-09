@@ -77,11 +77,23 @@ public final class ConversationModel {
         self.hub = hub
         modelIDs = models.map(\.id)
         model = models.first?.id ?? ""
-        // Seed the toggles from what the server says this model wants by
-        // default, so a model configured for web search starts with it on
-        // instead of making the user rediscover it in every chat.
-        features = Dictionary(
-            uniqueKeysWithValues: (models.first?.defaultFeatureIDs ?? []).map { ($0, true) })
+        features = Self.seedFeatures(for: models.first)
+    }
+
+    /// The toggles a model starts a chat with.
+    ///
+    /// The server's own defaults first, so a model configured for web search
+    /// starts with it on. Then memory, which the server leaves off unless the
+    /// user enabled it globally — and a chat that quietly forgets what you told
+    /// it is a worse surprise than one that remembers too much. Memory is only
+    /// offered where the model reports the capability, because a toggle that
+    /// does nothing is worse than no toggle.
+    static func seedFeatures(for model: ChatModel?) -> [String: Bool] {
+        guard let model else { return [:] }
+        var seeded = Dictionary(
+            uniqueKeysWithValues: (model.defaultFeatureIDs ?? []).map { ($0, true) })
+        if model.supports(.memory) { seeded[ChatFeature.memory.rawValue] = true }
+        return seeded
     }
 
     public var canSend: Bool {
@@ -91,14 +103,17 @@ public final class ConversationModel {
     public func setModels(_ models: [ChatModel]) {
         modelIDs = models.map(\.id)
         if model.isEmpty { model = models.first?.id ?? "" }
+        // A chat can open before the model list arrives, which leaves the
+        // toggles unseeded. Fill them in, but never over a choice the user has
+        // already made in this chat.
+        if features.isEmpty { features = Self.seedFeatures(for: models.first) }
     }
 
     /// Called when the model changes: the defaults belong to the model, so the
     /// toggles have to follow it rather than keep the previous model's settings.
     public func select(model id: String, from models: [ChatModel]) {
         model = id
-        features = Dictionary(
-            uniqueKeysWithValues: (models.first { $0.id == id }?.defaultFeatureIDs ?? []).map { ($0, true) })
+        features = Self.seedFeatures(for: models.first { $0.id == id })
     }
 
     /// Connects the shared socket. Failures are not fatal: the REST calls still
