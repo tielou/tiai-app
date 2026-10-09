@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Export options for the TestFlight pipeline (.github/workflows/testflight.yml).
+
+  A file rather than flags because `xcodebuild -exportArchive` takes its
+  distribution behaviour from this plist and nowhere else, and the interesting
+  keys have no command-line equivalent.
+
+  method app-store-connect
+      Cloud-managed distribution: Xcode resolves the App Store profile itself
+      using the App Store Connect API key passed on the command line.
+
+  destination upload
+      Upload to TestFlight as part of the export, so there is no separate
+      altool/Transporter step and no second set of credentials.
+
+  manageAppVersionAndBuildNumber false
+      We own the build number: CI passes CURRENT_PROJECT_VERSION=<run number>.
+      Left true, Xcode rewrites it from App Store Connect's last seen value,
+      which collides the moment two builds are in flight.
+
+  uploadSymbols true
+      Crash logs in App Store Connect are useless without the dSYM.
+-->
+<plist version="1.0">
+<dict>
+	<key>method</key>
+	<string>app-store-connect</string>
+	<key>destination</key>
+	<string>upload</string>
+	<key>signingStyle</key>
+	<string>automatic</string>
+	<key>manageAppVersionAndBuildNumber</key>
+	<false/>
+	<key>uploadSymbols</key>
+	<true/>
+	<key>stripSwiftSymbols</key>
+	<true/>
+	<key>compileBitcode</key>
+	<false/>
+</dict>
+</plist>

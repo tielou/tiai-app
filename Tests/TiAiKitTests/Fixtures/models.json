@@ -1,0 +1,53 @@
+{
+  "data": [
+    {
+      "id": "local-personal",
+      "name": "Local Personal",
+      "object": "model",
+      "created": 1760000000,
+      "owned_by": "openai",
+      "connection_type": "openai",
+      "preset": true,
+      "info": {
+        "id": "local-personal",
+        "user_id": "7c1d3f2e-0000-4000-8000-000000000001",
+        "base_model_id": "qwen3.8-flash-next",
+        "name": "Local Personal",
+        "meta": {
+          "description": "The house model.",
+          "capabilities": {
+            "vision": true,
+            "thinking": true,
+            "tools": true,
+            "citation": false,
+            "usage": true,
+            "some_future_capability": true
+          },
+          "defaultFeatureIds": ["web_search"],
+          "tags": ["house"]
+        },
+        "is_active": true
+      },
+      "tags": ["house"]
+    },
+    {
+      "id": "local-fast",
+      "name": "Local Fast",
+      "object": "model",
+      "created": 1760000000,
+      "owned_by": "openai",
+      "preset": false,
+      "info": {
+        "base_model_id": "qwen3.8-flash-next",
+        "meta": {
+          "capabilities": { "thinking": false, "tools": true }
+        }
+      }
+    },
+    {
+      "id": "no-info-at-all",
+      "name": "No Info",
+      "owned_by": "ollama"
+    }
+  ]
+}

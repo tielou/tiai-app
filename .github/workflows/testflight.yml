@@ -1,0 +1,182 @@
+name: tiAi TestFlight
+
+# Build tiAi for the App Store and hand it to TestFlight.
+#
+# Manual only, on purpose: macOS runners bill at 10x the minute rate of the
+# Linux ones, and a homelab chat client does not need a new TestFlight build on
+# every commit. Push a build when you want one.
+#
+# One-time setup, all of it in Apple's and GitHub's web UIs:
+#   1. App Store Connect → Users and Access → Integrations → App Store Connect
+#      API → a key with the App Manager role. Note the Key ID and Issuer ID,
+#      download the .p8 (once only).
+#   2. App Store Connect → My Apps → + → new iOS app: name `tiAi`, bundle id
+#      `co.wobker.tiai`.
+#   3. Repo → Settings → Secrets and Actions: APPLE_TEAM_ID, ASC_KEY_ID,
+#      ASC_ISSUER_ID, ASC_API_KEY (the .p8 base64'd: `base64 -i AuthKey_X.p8`).
+#
+# Then: Actions → tiAi TestFlight → Run workflow. First build ~10 minutes,
+# TestFlight processing a few minutes more.
+
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: "What is in this build? (attached to the run summary)"
+        required: false
+        default: ""
+
+concurrency:
+  group: tiai-testflight
+  # An upload cancelled halfway is the one failure mode worth avoiding: the
+  # build can end up half-registered in App Store Connect and the next run then
+  # trips over its own build number.
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  testflight:
+    runs-on: macos-26
+    timeout-minutes: 40
+
+    env:
+      # Pinned so a runner image bump cannot change the SDK a TestFlight build
+      # was compiled against.
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      # Job-level, not step-level: a step's `if: env.X` reads the job's env, so
+      # a secret needed by a condition has to live here to be visible.
+      DISTR_P12: ${{ secrets.DISTR_P12 }}
+      DISTR_P12_PASSWORD: ${{ secrets.DISTR_P12_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_API_KEY: ${{ secrets.ASC_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check secrets are present
+        run: |
+          missing=0
+          for v in APPLE_TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_API_KEY; do
+            if [ -z "${!v}" ]; then echo "::error::missing secret $v"; missing=1; fi
+          done
+          exit $missing
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphonesimulator || true
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      # The same gate as everywhere else: the kit compiles, the app shell
+      # type-checks, the contract tests pass. Cheap insurance that a TestFlight
+      # build is never built from a tree that would fail `make check`.
+      - name: Verify gate
+        run: make check
+
+      - name: Stage App Store Connect API key
+        run: |
+          KEY="$RUNNER_TEMP/AuthKey_${ASC_KEY_ID}.p8"
+          printf '%s' "$ASC_API_KEY" | base64 --decode > "$KEY"
+          chmod 600 "$KEY"
+          echo "ASC_KEY_PATH=$KEY" >> "$GITHUB_ENV"
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_API_KEY: ${{ secrets.ASC_API_KEY }}
+
+      # Cloud-managed signing normally mints the distribution certificate
+      # itself. Some accounts refuse — typically when the API key lacks the role
+      # or the team is at its certificate limit — and the archive then dies with
+      # "no signing certificate Apple Distribution". Exporting a .p12 once and
+      # adding it as a secret makes that survivable rather than mysterious.
+      - name: Import distribution certificate (optional)
+        if: env.DISTR_P12 != ''
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          security create-keychain -p ci "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p ci "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          printf '%s' "$DISTR_P12" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security import "$RUNNER_TEMP/dist.p12" \
+            -k "$KEYCHAIN" -P "$DISTR_P12_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Generate Xcode project
+        run: make project
+        env:
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+
+      # Build number = run number, so uploads never collide and nobody has to
+      # bump a file. The API key has to be on the archive command as well as the
+      # export: automatic signing resolves the App Store profile *during*
+      # archive, and with no account in Xcode — there never is one on a runner —
+      # it fails with "No Accounts", which reads like a signing-identity problem
+      # and is really a missing-authentication one.
+      - name: Archive
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project TiAi.xcodeproj \
+            -scheme TiAi \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/TiAi.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            | tee "$RUNNER_TEMP/archive.log"
+
+      # `destination upload` in export-options.plist makes this the TestFlight
+      # upload too — no altool, no Transporter, no password.
+      - name: Export and upload to TestFlight
+        run: |
+          set -o pipefail
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/TiAi.xcarchive" \
+            -exportOptionsPlist export-options.plist \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            | tee "$RUNNER_TEMP/export.log"
+
+      # Kept even though the build is already uploaded: it is the artifact you
+      # reach for when TestFlight processing stalls.
+      - name: Save ipa
+        if: success() && hashFiles(format('{0}/export/*.ipa', runner.temp)) != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiAi-build-${{ github.run_number }}
+          path: ${{ runner.temp }}/export/*.ipa
+          retention-days: 14
+
+      - name: Record what this build is
+        if: success()
+        env:
+          NOTES: ${{ inputs.notes }}
+        run: |
+          {
+            echo "## tiAi build ${GITHUB_RUN_NUMBER}"
+            echo
+            echo "- commit \`${GITHUB_SHA::7}\` on \`${GITHUB_REF_NAME}\`"
+            echo "- TestFlight build number \`${GITHUB_RUN_NUMBER}\`"
+            if [ -n "$NOTES" ]; then echo "- notes: $NOTES"; fi
+            echo
+            echo "Processing takes a few minutes; the build then appears under"
+            echo "App Store Connect → TestFlight → iOS Apps."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove API key
+        if: always()
+        run: rm -f "$RUNNER_TEMP"/AuthKey_*.p8 "$RUNNER_TEMP"/dist.p12 2>/dev/null || true

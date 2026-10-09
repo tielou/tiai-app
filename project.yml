@@ -1,0 +1,80 @@
+# XcodeGen project definition -- the .xcodeproj is generated, not committed.
+#
+#   make project    # xcodegen -> TiAi.xcodeproj
+#
+# The app target is deliberately thin: it depends on the local SwiftPM package,
+# so opening the package or this project gives the same sources, and previews
+# and tests work from either.
+name: TiAi
+options:
+  bundleIdPrefix: co.wobker
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    ENABLE_USER_SCRIPT_SANDBOXING: true
+    # Empty on a fresh clone, which is what you want: the team is whoever's
+    # machine this is. Generate with `TEAM=XXXXXXXXXX make project` to bake one
+    # in for a specific phone.
+    DEVELOPMENT_TEAM: "${TEAM}"
+
+packages:
+  TiAiKit:
+    path: .
+
+targets:
+  TiAi:
+    type: application
+    platform: iOS
+    sources:
+      - App
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: tiAi
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        ITSAppUsesNonExemptEncryption: false
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSAllowsArbitraryLoads: false
+        NSLocalNetworkUsageDescription:
+          tiAi talks to your assistant on the local network when you point it at
+          a LAN address instead of a hostname.
+        NSMicrophoneUsageDescription:
+          Voice mode records on this device and sends audio to your own server,
+          if you turn it on.
+        NSSpeechRecognitionUsageDescription:
+          Dictation for the composer is transcribed on this device.
+    dependencies:
+      - package: TiAiKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: co.wobker.tiai
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+
+# Committed as part of the definition so `xcodebuild -scheme TiAi` works straight
+# after `make project`, in CI and on a fresh clone. No test action: the tests
+# live in the SwiftPM package and run via `make test`, which is also the gate
+# that works without Xcode.
+schemes:
+  TiAi:
+    build:
+      targets:
+        TiAi: all
+    run:
+      config: Debug
+    archive:
+      config: Release

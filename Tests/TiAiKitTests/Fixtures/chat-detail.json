@@ -1,0 +1,68 @@
+{
+  "id": "6f0f0c2f-1111-4aec-9b0e-0a1b2c3d4e5f",
+  "user_id": "7c1d3f2e-0000-4000-8000-000000000001",
+  "title": "Homelab question",
+  "chat": {
+    "models": ["local-personal"],
+    "tags": [],
+    "history": {
+      "currentId": "assistant-2",
+      "messages": {
+        "user-1": {
+          "id": "user-1",
+          "role": "user",
+          "content": "Why is tiai slow?",
+          "parentId": null,
+          "childrenIds": ["assistant-1", "assistant-2"],
+          "timestamp": 1760000000
+        },
+        "assistant-1": {
+          "id": "assistant-1",
+          "role": "assistant",
+          "content": "An earlier answer that was regenerated over.",
+          "parentId": "user-1",
+          "childrenIds": [],
+          "model": "local-personal",
+          "done": true,
+          "timestamp": 1760000001
+        },
+        "assistant-2": {
+          "id": "assistant-2",
+          "role": "assistant",
+          "content": [
+            { "type": "text", "text": "Because the KV pool was full." }
+          ],
+          "parentId": "user-1",
+          "childrenIds": [],
+          "model": "local-personal",
+          "done": true,
+          "timestamp": 1760000002,
+          "statusHistory": [
+            { "status": "thinking", "done": true, "created_at": 1760000001 },
+            { "status": "calling tool: homelab", "done": true }
+          ],
+          "sources": [
+            { "type": "web", "title": "KV cache", "url": "https://example.co/kv" }
+          ],
+          "usage": {
+            "prompt_tokens": 4210,
+            "completion_tokens": 88,
+            "total_tokens": 4298
+          },
+          "error": null
+        }
+      }
+    },
+    "timestamp": 1760000000000
+  },
+  "created_at": 1760000000,
+  "updated_at": 1760000100,
+  "archived": false,
+  "pinned": true,
+  "meta": {},
+  "variables": {},
+  "folder_id": null,
+  "summary": null,
+  "current_message_id": "assistant-2",
+  "context_usage": null
+}

@@ -1,0 +1,19 @@
+[
+  {
+    "id": "6f0f0c2f-1111-4aec-9b0e-0a1b2c3d4e5f",
+    "title": "Homelab question",
+    "updated_at": 1760000100,
+    "created_at": 1760000000,
+    "last_read_at": 1760000090,
+    "snippet": "Why is tiai slow?",
+    "pinned": true,
+    "archived": false,
+    "folder_id": null
+  },
+  {
+    "id": "another-chat",
+    "title": "Groceries",
+    "updated_at": 1759000000,
+    "created_at": 1759000000
+  }
+]
