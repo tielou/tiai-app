@@ -55,24 +55,39 @@ public struct ChatModel: Codable, Equatable, Sendable, Identifiable {
         }
     }
 
-    /// Capability names Open WebUI sets today. Unknown names are kept in
-    /// `capabilities` regardless — a new capability on the server should light
-    /// up a toggle, not fail to decode.
-    public var supportsVision: Bool { capabilities["vision"] ?? false }
-    public var supportsThinking: Bool { capabilities["thinking"] ?? false }
-    public var supportsTools: Bool { capabilities["tools"] ?? false }
-    public var supportsCitation: Bool { capabilities["citation"] ?? false }
-    public var supportsSearch: Bool { capabilities["search"] ?? false }
-    public var supportsUsage: Bool { capabilities["usage"] ?? false }
+    /// Capability names as the server spells them, observed on 0.11.4:
+    /// `builtin_tools`, `citations`, `code_interpreter`, `file_context`,
+    /// `file_upload`, `image_generation`, `memory`, `status_updates`,
+    /// `terminal`, `vision`, `web_search`. Note they are not the names the
+    /// feature toggles use, and there is no `thinking` at all — thinking is a
+    /// per-model route (local-personal vs local-fast), not a capability.
+    public func supports(_ capability: String) -> Bool { capabilities[capability] ?? false }
 
-    /// Whether the composer should offer a given feature toggle for this model.
-    public func supports(feature: ChatFeature) -> Bool {
-        switch feature {
-        case .webSearch: true  // gated by server config, not by model capability
-        case .memory: true
-        case .thinking: supportsThinking
-        case .codeInterpreter: capabilities["code_interpreter"] ?? true
-        case .imageGeneration: capabilities["image_generation"] ?? true
+    public var supportsVision: Bool { supports("vision") }
+    public var supportsTools: Bool { supports("builtin_tools") }
+    public var supportsCitation: Bool { supports("citations") }
+    public var supportsWebSearch: Bool { supports("web_search") }
+    public var supportsMemory: Bool { supports("memory") }
+    public var supportsCodeInterpreter: Bool { supports("code_interpreter") }
+    public var supportsImageGeneration: Bool { supports("image_generation") }
+    public var supportsFileUpload: Bool { supports("file_upload") }
+    /// Whether the server will emit status events for this model at all.
+    public var supportsStatusUpdates: Bool { supports("status_updates") }
+
+    /// Whether the composer should offer a feature toggle for this model.
+    ///
+    /// An empty capability map means "no metadata", not "no features" — the
+    /// fast and quick routes advertise nothing, and hiding web search there
+    /// would be a feature removal invented by a missing dict. When the server
+    /// does describe itself, its answer wins.
+    public func supports(_ feature: ChatFeature) -> Bool {
+        if capabilities.isEmpty { return true }
+        return switch feature {
+        case .webSearch: supportsWebSearch
+        case .memory: supportsMemory
+        case .thinking: supports("thinking")
+        case .codeInterpreter: supportsCodeInterpreter
+        case .imageGeneration: supportsImageGeneration
         }
     }
 

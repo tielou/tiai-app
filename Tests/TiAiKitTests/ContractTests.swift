@@ -156,12 +156,11 @@ struct ModelDecodingTests {
     @Test func modelListDecodes() throws {
         struct Envelope: Decodable { let data: [ChatModel] }
         let models = try Fixture.decode(Envelope.self, "models.json").data
-        #expect(models.count == 3)
+        #expect(models.count == 4)
 
         let personal = models[0]
         #expect(personal.id == "local-personal")
         #expect(personal.supportsVision)
-        #expect(personal.supportsThinking)
         #expect(personal.defaultFeatureIDs == ["web_search"])
         #expect(personal.baseModelID == "qwen3.8-flash-next")
         // An unknown capability is kept, not dropped: a capability added by a
@@ -169,12 +168,46 @@ struct ModelDecodingTests {
         #expect(personal.capabilities["some_future_capability"] == true)
     }
 
+    /// Capability names are the server's, not the app's: `citations` and
+    /// `builtin_tools`, not `citation` and `tools`. Getting this wrong hides
+    /// features the user has.
+    @Test func capabilitiesUseTheServersNames() throws {
+        struct Envelope: Decodable { let data: [ChatModel] }
+        let models = try Fixture.decode(Envelope.self, "models.json").data
+        let personal = models[0]
+        let deep = models[1]
+
+        #expect(personal.supportsCitation)
+        #expect(personal.supportsTools)
+        #expect(personal.supportsWebSearch)
+        #expect(personal.supportsMemory)
+        #expect(personal.supportsStatusUpdates)
+        #expect(!personal.supportsImageGeneration)
+        #expect(deep.supportsImageGeneration)
+        #expect(deep.supports(.codeInterpreter))
+        #expect(!personal.supports(.codeInterpreter))
+        // Thinking is a route (local-personal vs local-fast), not a capability.
+        #expect(!personal.supports(.thinking))
+    }
+
+    /// The fast and quick routes advertise nothing. "No metadata" must not
+    /// become "no features" — that would switch web search off on the models
+    /// where the operator uses it most.
+    @Test func emptyCapabilityMapOffersEverything() throws {
+        struct Envelope: Decodable { let data: [ChatModel] }
+        let models = try Fixture.decode(Envelope.self, "models.json").data
+        let fast = models[2]
+        #expect(fast.capabilities.isEmpty)
+        #expect(fast.supports(.webSearch))
+        #expect(fast.supports(.memory))
+    }
+
     /// A model with no `info` at all is a server that changed shape, and the
     /// picker must still list it.
     @Test func modelWithoutInfoStillDecodes() throws {
         struct Envelope: Decodable { let data: [ChatModel] }
         let models = try Fixture.decode(Envelope.self, "models.json").data
-        let bare = models[2]
+        let bare = models[3]
         #expect(bare.id == "no-info-at-all")
         #expect(bare.capabilities.isEmpty)
         #expect(bare.baseModelID == nil)
@@ -281,6 +314,93 @@ struct CompletionRequestTests {
         guard case let .object(features)? = encoded["features"] else { Issue.record("features missing"); return }
         #expect(features["web_search"] == .bool(true))
         #expect(features["memory"] == .bool(false))
+    }
+}
+
+// MARK: - requests
+
+/// Captures what went out and answers with a canned body, so a test can assert
+/// on the request the client built. The alternative — a fixture of the response
+/// alone — is exactly how the `POST /chats/new` body bug survived: the decode
+/// side was tested and the encode side was not.
+final class RecordingTransport: APITransport, @unchecked Sendable {
+    private(set) var lastRequest: URLRequest?
+    var status = 200
+    var body = Data("{}".utf8)
+
+    func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        lastRequest = request
+        let http = HTTPURLResponse(
+            url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!
+        return (body, http)
+    }
+
+    func bytes(_ request: URLRequest) async throws -> (ByteStream, HTTPURLResponse) {
+        lastRequest = request
+        let http = HTTPURLResponse(
+            url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!
+        let payload = body
+        return (ByteStream { AsyncThrowingStream { $0.yield(payload); $0.finish() } }, http)
+    }
+}
+
+struct RequestTests {
+    private func client(_ transport: RecordingTransport) -> OWUIClient {
+        OWUIClient(
+            server: Server(baseURL: URL(string: "https://chat.example.co")!, token: "tok"),
+            transport: transport)
+    }
+
+    /// The bug the probe caught: the router takes the whole chat document, so a
+    /// bare `{"title": …}` is a 422 `body.chat Field required`.
+    @Test func createChatSendsTheChatDocument() async throws {
+        let transport = RecordingTransport()
+        transport.body = Fixture.data("chat-detail.json")
+        _ = try await client(transport).createChat(title: "Hello")
+
+        let body = try #require(transport.lastRequest?.httpBody)
+        let sent = try JSONDecoder().decode([String: JSONValue].self, from: body)
+        #expect(sent["chat"]?.objectValue?["title"]?.stringValue == "Hello")
+        #expect(sent["chat"]?.objectValue?["history"] != nil)
+        #expect(sent["title"] == nil)
+    }
+
+    @Test func bearerTokenGoesOnEveryCall() async throws {
+        let transport = RecordingTransport()
+        transport.body = Fixture.data("chats-list.json")
+        _ = try await client(transport).chatList()
+        #expect(transport.lastRequest?.value(forHTTPHeaderField: "Authorization") == "Bearer tok")
+    }
+
+    /// A 401 must arrive as `unauthorized` and not as a decoding failure: this
+    /// is the difference between a login screen and a mysterious error card.
+    @Test func unauthorizedBecomesUnauthorized() async {
+        let transport = RecordingTransport()
+        transport.status = 401
+        transport.body = Data("{\"detail\":\"Not authenticated\"}".utf8)
+        do {
+            _ = try await client(transport).chatList()
+            Issue.record("expected a throw")
+        } catch let error as APIError {
+            #expect(error.isUnauthorized)
+        } catch {
+            Issue.record("expected APIError.unauthorized, got \(error)")
+        }
+    }
+
+    @Test func completionRequestIsPostedToTheRightPlace() async throws {
+        let transport = RecordingTransport()
+        transport.body = Data()
+        _ = try await client(transport).stream(
+            CompletionRequest(
+                model: "local-personal",
+                messages: [CompletionRequest.WireMessage(id: "1", role: "user", content: .text("hi"))],
+                chatID: "c1", parentID: .root))
+        #expect(transport.lastRequest?.url?.path == "/api/v1/chat/completions")
+        #expect(transport.lastRequest?.value(forHTTPHeaderField: "Accept") == "text/event-stream")
+        let sent = try JSONDecoder().decode([String: JSONValue].self, from: #require(transport.lastRequest?.httpBody))
+        #expect(sent["parent_id"] == .null)
+        #expect(sent["chat_id"] == .string("c1"))
     }
 }
 

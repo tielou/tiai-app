@@ -179,26 +179,62 @@ public struct OWUIClient: Sendable {
 
     /// Creates an empty chat and returns it, id included.
     ///
-    /// The app creates chats here rather than letting the completion endpoint
-    /// mint one: when no `chat_id` is sent the server generates its own uuid
+    /// Two surprises packed in here, both found by running the probe rather
+    /// than by reading docs. The body is `{"chat": {...}}` — a bare
+    /// `{"title": ...}` is a 422 `"body.chat Field required"`, because the
+    /// router takes the whole chat document and reads the title out of it.
+    /// And the app creates chats here rather than letting the completion
+    /// endpoint mint one: with no `chat_id` the server generates its own uuid
     /// and reports it over the websocket, which a REST-only client never sees.
-    /// One extra round trip before the first message is the cheaper answer.
     public func createChat(title: String = "New Chat", folderID: String? = nil) async throws -> ChatDetail {
-        struct Form: Encodable { let title: String; var folder_id: String? }
-        return try await request("POST", "/chats/new", bodyData: try? JSONEncoder().encode(Form(title: title, folder_id: folderID)))
+        struct History: Encodable {
+            let currentId: String?
+            let messages: [String: JSONValue]
+        }
+        struct Skeleton: Encodable {
+            let title: String
+            let models: [String]
+            let messages: [JSONValue]
+            let tags: [String]
+            let timestamp: Int
+            let history: History
+        }
+        struct Form: Encodable {
+            let chat: Skeleton
+            let folder_id: String?
+        }
+        let form = Form(
+            chat: Skeleton(
+                title: title,
+                models: [],
+                messages: [],
+                tags: [],
+                timestamp: Int(Date().timeIntervalSince1970 * 1000),
+                history: History(currentId: nil, messages: [:])),
+            folder_id: folderID)
+        return try await request("POST", "/chats/new", bodyData: try? JSONEncoder().encode(form))
     }
 
+    /// Renames a chat. There is no `/title` route: the update endpoint patches
+    /// the chat document and the server copies `chat.title` onto the column.
     public func renameChat(id: String, title: String) async throws {
-        struct Form: Encodable { let title: String }
-        try await expectStatus("POST", "/chats/\(id)/title", bodyData: try? JSONEncoder().encode(Form(title: title)))
+        struct Patch: Encodable { let title: String }
+        struct Form: Encodable { let chat: Patch }
+        try await expectStatus(
+            "POST", "/chats/\(id)",
+            bodyData: try? JSONEncoder().encode(Form(chat: Patch(title: title))))
     }
 
-    public func setPinned(id: String, pinned: Bool) async throws {
-        try await expectStatus("POST", "/chats/\(id)/\(pinned ? "pin" : "unpin")")
+    /// Pin and archive are *toggles* server-side — there is no per-chat
+    /// unpin/unarchive — so these report the new state rather than asserting a
+    /// wanted one. Firing one blindly on appear would flicker the pin on every
+    /// refresh.
+    public func togglePinned(id: String) async throws -> ChatDetail {
+        try await request("POST", "/chats/\(id)/pin")
     }
 
-    public func setArchived(id: String, archived: Bool) async throws {
-        try await expectStatus("POST", "/chats/\(id)/\(archived ? "archive" : "unarchive")")
+    public func toggleArchived(id: String) async throws -> ChatDetail {
+        try await request("POST", "/chats/\(id)/archive")
     }
 
     public func deleteChat(id: String) async throws {

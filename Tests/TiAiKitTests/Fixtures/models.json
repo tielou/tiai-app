@@ -2,7 +2,7 @@
   "data": [
     {
       "id": "local-personal",
-      "name": "Local Personal",
+      "name": "local-personal",
       "object": "model",
       "created": 1760000000,
       "owned_by": "openai",
@@ -12,15 +12,18 @@
         "id": "local-personal",
         "user_id": "7c1d3f2e-0000-4000-8000-000000000001",
         "base_model_id": "qwen3.8-flash-next",
-        "name": "Local Personal",
+        "name": "local-personal",
         "meta": {
           "description": "The house model.",
           "capabilities": {
+            "builtin_tools": true,
+            "citations": true,
+            "file_context": true,
+            "file_upload": true,
+            "memory": true,
+            "status_updates": true,
             "vision": true,
-            "thinking": true,
-            "tools": true,
-            "citation": false,
-            "usage": true,
+            "web_search": true,
             "some_future_capability": true
           },
           "defaultFeatureIds": ["web_search"],
@@ -31,17 +34,41 @@
       "tags": ["house"]
     },
     {
-      "id": "local-fast",
-      "name": "Local Fast",
+      "id": "local-deep",
+      "name": "local-deep",
       "object": "model",
       "created": 1760000000,
       "owned_by": "openai",
-      "preset": false,
+      "preset": true,
       "info": {
         "base_model_id": "qwen3.8-flash-next",
         "meta": {
-          "capabilities": { "thinking": false, "tools": true }
+          "capabilities": {
+            "builtin_tools": true,
+            "citations": true,
+            "code_interpreter": true,
+            "file_context": true,
+            "file_upload": true,
+            "image_generation": true,
+            "memory": true,
+            "status_updates": true,
+            "terminal": true,
+            "vision": true,
+            "web_search": true
+          },
+          "defaultFeatureIds": ["web_search"]
         }
+      }
+    },
+    {
+      "id": "local-fast",
+      "name": "local-fast",
+      "object": "model",
+      "owned_by": "openai",
+      "preset": true,
+      "info": {
+        "base_model_id": "qwen3.8-flash-next",
+        "meta": { "capabilities": {} }
       }
     },
     {
