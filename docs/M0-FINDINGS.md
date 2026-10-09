@@ -206,6 +206,18 @@ OpenAI shape (found the terminal frame, lost the entire answer while 50 content
 frames sat in the same output). The replay test is what makes a third attempt
 expensive rather than silent.
 
+## The stop endpoint is not self-reporting
+
+`POST /api/tasks/chat/{id}/stop` returns 200 whether or not the generation
+haltingly actually halts. One run fired it at the sixth delta and the stored
+answer came back 10829 characters long, which is either a fast model or a stop
+that did nothing — indistinguishable from the response alone.
+
+The probe now checks the only thing that matters: the stored answer stops
+growing. Sample, wait 4 s, sample again, and it also reports whether the REST
+stream closed after the stop or was still open 45 s later. Until that prints a
+pass, the Stop button is unverified, not verified.
+
 ## Still to verify
 
 * [ ] **assumption 2, re-run after the `id` fix** — after the stream,

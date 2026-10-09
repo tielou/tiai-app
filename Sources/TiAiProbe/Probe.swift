@@ -191,6 +191,7 @@ struct Probe {
             let stopFeed = FrameFeed(socket: socket, chatID: newChat)
             let post = Task { try await client.stream(request).drain() }
             var deltas = 0
+            var stoppedAt: ContinuousClock.Instant?
             let deadline = Task {
                 try? await Task.sleep(for: .seconds(60))
                 stopFeed.finish()
@@ -198,18 +199,50 @@ struct Probe {
             for await frame in stopFeed.frames {
                 if frame.delta != nil { deltas += 1 }
                 if deltas > 5 {
-                    try? await client.stop(chatID: newChat)
+                    try await client.stop(chatID: newChat)
+                    stoppedAt = .now
                     break
                 }
             }
             deadline.cancel()
-            _ = await post.result
+            // Did the in-flight completion actually end? The POST stays open for
+            // the whole generation, so closing is the signal - and if it never
+            // closes, the probe must not wait for a model to finish counting to
+            // 500 just to find out.
+            let ended = await withTaskGroup(of: String.self) { group in
+                group.addTask {
+                    _ = try? await post.value
+                    return "REST stream closed"
+                }
+                group.addTask {
+                    try? await Task.sleep(for: .seconds(45))
+                    return "REST stream still open 45s after stop"
+                }
+                let first = await group.next() ?? "unknown"
+                group.cancelAll()
+                return first
+            }
+            report.note("after stop", ended)
             report.note("deltas before stop", deltas)
             guard deltas > 0 else { throw ProbeError.failure("nothing arrived to stop") }
+            if let at = stoppedAt {
+                report.note("stop call returned after", Probe.string(at.duration(to: .now)))
+            }
 
-            try await Task.sleep(for: .seconds(2))
-            let after = try await client.chat(id: newChat).thread.last(where: \.isAssistant)
-            report.note("stopped message length", "\(after?.content.text.count ?? 0) chars")
+            // A 200 from the stop endpoint is not evidence that anything
+            // stopped — the last run reported 10829 chars stored after a stop
+            // fired at the sixth delta, which is either a long generation or no
+            // generation stop at all. The only honest check is that the stored
+            // answer stops growing: sample, wait, sample again, compare.
+            try await Task.sleep(for: .seconds(3))
+            let before = try await storedLength(client, newChat)
+            try await Task.sleep(for: .seconds(4))
+            let after = try await storedLength(client, newChat)
+            report.note("stored answer", "\(before) chars, then \(after) chars 4s later")
+            guard after == before else {
+                throw ProbeError.failure("the answer kept growing after stop (\(before) -> \(after))")
+            }
+            guard before > 0 else { throw ProbeError.failure("nothing was stored") }
         }
 
         socket.disconnect()
@@ -225,6 +258,11 @@ struct Probe {
         report.dump()
         exit(report.failed == 0 ? 0 : 1)
     }
+}
+
+/// The length of the last assistant turn, as the server currently has it.
+func storedLength(_ client: OWUIClient, _ chatID: String) async throws -> Int {
+    try await client.chat(id: chatID).thread.last(where: \.isAssistant)?.content.text.count ?? 0
 }
 
 extension ChatEventStream {
