@@ -101,7 +101,9 @@ struct Probe {
         }
         guard let newChat = chatID else { report.dump(); exit(1) }
 
-        let feed = FrameFeed(socket: socket, chatID: newChat)
+        // Leave the bytes on disk; the decoder gets written against these, not
+        // against a 200-character console sample.
+        let feed = FrameFeed(socket: socket, chatID: newChat, dumpTo: env["TIAI_FRAMES"] ?? "tiai-frames.jsonl")
 
         let prompt = "Reply with exactly this text and nothing else: TIAI-PROBE-OK"
         let userMessageID = UUID().uuidString
@@ -131,10 +133,16 @@ struct Probe {
 
             guard !outcome.text.isEmpty else {
                 throw ProbeError.failure(
-                    "no text over the socket"
+                    "\(outcome.total) frames arrived but none carried content — the delta path is wrong"
                     + (outcome.otherChats > 0
-                        ? " (\(outcome.otherChats) frames arrived for other chats — the chat filter is wrong)"
-                        : " (no frames arrived at all — the socket is not in the room)"))
+                        ? " (\(outcome.otherChats) frames were for other chats)"
+                        : ""))
+            }
+            guard outcome.text.contains("TIAI-PROBE-OK") else {
+                throw ProbeError.failure("streamed text does not match what was asked for")
+            }
+            guard outcome.sawDone || outcome.sawFinish else {
+                throw ProbeError.failure("no terminal frame (neither done nor finish_reason)")
             }
         }
 
@@ -171,13 +179,16 @@ struct Probe {
 
             // Stop has to happen while the POST is still in flight, which is
             // exactly what the app's Stop button has to do too.
+            // A second feed: the first one's stream was ended by its watchdog,
+            // and reusing it is how this step reported "nothing arrived".
+            let stopFeed = FrameFeed(socket: socket, chatID: newChat)
             let post = Task { try await client.stream(request).drain() }
             var deltas = 0
             let deadline = Task {
                 try? await Task.sleep(for: .seconds(60))
-                feed.finish()
+                stopFeed.finish()
             }
-            for await frame in feed.frames {
+            for await frame in stopFeed.frames {
                 if frame.delta != nil { deltas += 1 }
                 if deltas > 5 {
                     try? await client.stop(chatID: newChat)
@@ -244,6 +255,9 @@ final class FrameFeed {
     let frames: AsyncStream<ChatEventSocket.Frame>
     private let continuation: AsyncStream<ChatEventSocket.Frame>.Continuation
     private let dropped = Counter()
+    /// Appends every frame to a file so the decoder can be written against real
+    /// traffic instead of a truncated console sample.
+    private let dump: ((String) -> Void)?
 
     struct Outcome {
         var text = ""
@@ -252,15 +266,18 @@ final class FrameFeed {
         var kinds: [String: Int] = [:]
         var samples: [String: String] = [:]
         var sawDone = false
+        var sawFinish = false
+        var errors: [String] = []
         var timedOut = false
         var otherChats = 0
         var total = 0
     }
 
-    init(socket: ChatEventSocket, chatID: String) {
+    init(socket: ChatEventSocket, chatID: String, dumpTo: String? = nil) {
         let (stream, cont) = AsyncStream.makeStream(of: ChatEventSocket.Frame.self, bufferingPolicy: .unbounded)
         frames = stream
         continuation = cont
+        if let dumpTo { dump = FrameFeed.appending(to: dumpTo) } else { dump = nil }
         let dropped = self.dropped
         // Frames for other chats are counted, not dropped silently: "no frames
         // arrived" and "frames arrived for a chat id we did not expect" are
@@ -274,28 +291,53 @@ final class FrameFeed {
     /// Ends the feed. Used by the stop check, which only needs the first frames.
     func finish() { continuation.finish() }
 
+    /// Line-oriented append, opened once. Cheap, and it means the probe run
+    /// leaves behind the exact bytes the server sent.
+    private static func appending(to path: String) -> ((String) -> Void)? {
+        if !FileManager.default.fileExists(atPath: path) {
+            FileManager.default.createFile(atPath: path, contents: Data())
+        }
+        guard let handle = FileHandle(forWritingAtPath: path) else { return nil }
+        return { line in
+            handle.seekToEndOfFile()
+            handle.write(Data(line.utf8))
+        }
+    }
+
     func collect(timeout: Duration) async -> Outcome {
         var outcome = Outcome()
         // The watchdog, not a check inside the loop: if nothing ever arrives the
         // loop body never runs, and a deadline read there is a deadline that
         // never happens.
         let continuation = self.continuation
-        let watchdog = Task {
+        var watchdog = Task {
             try? await Task.sleep(for: timeout)
             continuation.finish()
         }
         let started = ContinuousClock.now
         for await frame in frames {
+            dump?(frame.raw + "\n")
             outcome.total += 1
             outcome.kinds[frame.kind, default: 0] += 1
-            if outcome.samples[frame.kind] == nil { outcome.samples[frame.kind] = String(frame.raw.prefix(200)) }
-            if frame.delta != nil || frame.kind.contains("delta") {
+            if outcome.samples[frame.kind] == nil { outcome.samples[frame.kind] = String(frame.raw.prefix(400)) }
+            if let delta = frame.delta ?? frame.reasoningDelta {
                 if outcome.firstToken == nil { outcome.firstToken = started.duration(to: .now) }
-                outcome.text += frame.delta ?? ""
+                outcome.text += delta
             }
-            if let encoded = try? JSONEncoder().encode(frame.data),
-               let decoded = try? JSONDecoder().decode(UsageEnvelope.self, from: encoded)
-            { outcome.usage = decoded.usage ?? outcome.usage }
+            outcome.usage = frame.usage ?? outcome.usage
+            if let error = frame.errorText { outcome.errors.append(error) }
+            if frame.isFinish && !outcome.sawFinish {
+                outcome.sawFinish = true
+                // The model is done talking; the server still has to write the
+                // transcript and emit the terminal frame. Give it a moment
+                // rather than sitting on the 120 s watchdog for a frame that may
+                // never come.
+                watchdog.cancel()
+                watchdog = Task {
+                    try? await Task.sleep(for: .seconds(5))
+                    continuation.finish()
+                }
+            }
             if frame.isDone { outcome.sawDone = true; break }
         }
         watchdog.cancel()
@@ -309,6 +351,8 @@ final class FrameFeed {
             report.note("event \(kind)", "x\(outcome.kinds[kind] ?? 0)  \(outcome.samples[kind] ?? "")")
         }
         report.note("frames", "\(outcome.total) for this chat, \(outcome.otherChats) for others")
+        report.note("finish_reason seen", outcome.sawFinish ? "yes" : "no")
+        for error in outcome.errors.prefix(3) { report.note("stream error", String(error.prefix(160))) }
         report.note("time to first token", Probe.string(outcome.firstToken ?? .zero))
         report.note("text", String(outcome.text.prefix(120)).replacingOccurrences(of: "\n", with: " "))
         report.note(
@@ -317,9 +361,6 @@ final class FrameFeed {
         report.note("terminal done event", outcome.sawDone ? "yes" : "no (timed out or ended early)")
     }
 }
-
-/// Usage arrives as its own socket event, not on the stream.
-struct UsageEnvelope: Decodable { let usage: TokenUsage? }
 
 enum ProbeError: Error {
     case failure(String)

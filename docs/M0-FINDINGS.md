@@ -151,6 +151,30 @@ which is where the server's `connect(sid, environ, auth)` reads `auth['token']`.
 The library re-sends that payload once the engine opens, so starting the connect
 before the websocket is up does not lose it.
 
+## Round 7 — the event vocabulary, from live traffic
+
+The socket connects and the chat's frames arrive. On 0.11.4, one `events` frame
+per update, envelope `{chat_id, message_id, data:{type, data}}`:
+
+| `data.type` | what it carries |
+|---|---|
+| `response:completion` | the upstream OpenAI chunk, nearly verbatim — content at `data.data.choices[0].delta.content`, thinking at `delta.reasoning_content`, `finish_reason`, and `usage` when the provider reports it |
+| `chat:completion` | run-level updates (status, title) |
+| `chat:list` | chat-list mutations (id, folder_id, …) — the app can invalidate its list on these instead of polling |
+
+So the socket payload and the REST SSE payload are **the same OpenAI chunk
+shape**, one level deeper. The decoder is one path, not two.
+
+The first attempt at decoding this reported "no text over the socket" while 50
+content frames sat in the same run's output: it looked for `data.delta`, the
+Responses-API spelling, instead of `data.data.choices[0].delta.content`. The
+frames were arriving the whole time; the reader was wrong. Now covered by
+`SocketFrameTests` against captured JSON.
+
+`finish_reason` and `done` are different events — the model stops talking before
+the server finishes writing the transcript and emits its terminal frame, so a
+client that treats `finish_reason` as the end loses the tail.
+
 ## Still to verify
 
 * [ ] **assumption 2, re-run after the `id` fix** — after the stream,

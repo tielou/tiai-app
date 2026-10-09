@@ -26,34 +26,70 @@ public final class ChatEventSocket: @unchecked Sendable {
     public struct Frame: Sendable {
         public let chatID: String?
         public let messageID: String?
-        /// `data.type` when present, otherwise the key that carried the payload
-        /// (`usage`, `error`, `output`, …).
+        /// `data.type`, e.g. `response:completion`, `chat:completion`,
+        /// `chat:list`. Observed live on 0.11.4.
         public let kind: String
+        /// The envelope: `{"type": ..., "data": ...}`.
         public let data: [String: JSONValue]
         public let raw: String
 
-        /// The text delta, if this frame is one.
-        public var delta: String? { data["delta"]?.stringValue }
-
-        public var isDone: Bool { data["done"]?.boolValue == true }
-
         init?(_ dictionary: [String: Any]) {
-            guard let data = try? JSONSerialization.data(withJSONObject: dictionary),
-                  let decoded = try? JSONDecoder().decode([String: JSONValue].self, from: data)
+            guard let jsonData = try? JSONSerialization.data(withJSONObject: dictionary),
+                  let decoded = try? JSONDecoder().decode([String: JSONValue].self, from: jsonData)
             else { return nil }
-            raw = String(decoding: data, as: UTF8.self)
+            raw = String(decoding: jsonData, as: UTF8.self)
             chatID = decoded["chat_id"]?.stringValue
             messageID = decoded["message_id"]?.stringValue
             let payload = decoded["data"]?.objectValue ?? [:]
-            self.data = payload
-            if let type = payload["type"]?.stringValue {
-                kind = type
-            } else if let first = payload.keys.sorted().first {
-                kind = first
-            } else {
-                kind = "unknown"
-            }
+            data = payload
+            kind = payload["type"]?.stringValue ?? payload.keys.sorted().first ?? "unknown"
         }
+
+        /// The OpenAI-shaped chunk inside `data.data`. The server relays the
+        /// upstream provider's chunks almost verbatim, so content lives at
+        /// `choices[0].delta.content` — the same shape as the REST SSE stream,
+        /// which is what the app's decoder should be built on.
+        public var chunk: [String: JSONValue]? { data["data"]?.objectValue }
+
+        private var choice: [String: JSONValue]? { chunk?["choices"]?.firstArrayElement?.objectValue }
+        private var delta_: [String: JSONValue]? { choice?["delta"]?.objectValue }
+
+        public var delta: String? { delta_?["content"]?.stringValue }
+
+        /// Thinking tokens. Different providers spell this differently and the
+        /// app renders it in a disclosure rather than in the answer, so it must
+        /// not be merged into `delta`.
+        public var reasoningDelta: String? {
+            delta_?["reasoning_content"]?.stringValue ?? delta_?["reasoning"]?.stringValue
+        }
+
+        public var finishReason: String? {
+            choice?["finish_reason"]?.stringValue ?? choice?["finishReason"]?.stringValue
+        }
+
+        public var usage: TokenUsage? {
+            guard let value = chunk?["usage"],
+                  let encoded = try? JSONEncoder().encode(value),
+                  let decoded = try? JSONDecoder().decode(TokenUsage.self, from: encoded)
+            else { return nil }
+            return decoded
+        }
+
+        /// An error the model run reported mid-stream, if any.
+        public var errorText: String? {
+            data["error"]?.stringValue ?? chunk?["error"]?.stringValue
+        }
+
+        /// The terminal frame. `done` can sit on the envelope or on the chunk
+        /// depending on which code path emitted it.
+        public var isDone: Bool {
+            data["done"]?.boolValue == true || chunk?["done"]?.boolValue == true
+        }
+
+        /// Marks the end of the model's output. Not the same as `isDone`: the
+        /// server still writes the transcript and emits a terminal frame after
+        /// it, so a client that stops here loses the tail.
+        public var isFinish: Bool { finishReason != nil }
     }
 
     private let manager: SocketManager

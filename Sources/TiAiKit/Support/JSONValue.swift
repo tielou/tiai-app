@@ -18,6 +18,12 @@ public enum JSONValue: Hashable, Sendable {
     case array([JSONValue])
     case null
 
+    /// Object member lookup, so nested payloads read top to bottom instead of
+    /// turning into a chain of `?.objectValue?`.
+    public subscript(key: String) -> JSONValue? { objectValue?[key] }
+
+    public var firstArrayElement: JSONValue? { arrayValue?.first }
+
     public var stringValue: String? {
         switch self {
         case let .string(value): value
