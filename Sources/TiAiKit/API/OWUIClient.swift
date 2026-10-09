@@ -309,9 +309,18 @@ public struct OWUIClient: Sendable {
     /// not to the API contract, so it is decoded tolerantly and unreadable
     /// entries are dropped rather than failing the whole list.
     public func toolServers() async throws -> [ToolServer] {
-        struct Envelope: Decodable { let data: [JSONValue] }
-        let envelope: Envelope = try await request("GET", "/configs/tool_servers")
-        return envelope.data.compactMap(ToolServer.init)
+        // The shape of this response belongs to the admin UI rather than to a
+        // published contract, and it has been seen both bare and wrapped. Betting
+        // on one form means the section silently never appears — which is what
+        // the first attempt did — so every form that arrives is accepted.
+        let json: JSONValue = try await request("GET", "/configs/tool_servers")
+        let items =
+            json.arrayValue
+            ?? json["data"]?.arrayValue
+            ?? json["toolServers"]?.arrayValue
+            ?? json["servers"]?.arrayValue
+            ?? []
+        return items.compactMap(ToolServer.init)
     }
 
     /// Answers a tool call and lets the parked run continue.

@@ -18,6 +18,7 @@ public struct ConversationView: View {
     /// MCP servers offered by the instance. Loaded lazily and ignored if the
     /// deployment has none, so the `+` sheet simply has no Servers section.
     @State private var toolServers: [ToolServer] = []
+    @State private var toolServersError: String?
     /// Kept for the composer and the model sheet: the conversation only needs the
     /// id to seed itself, but the UI needs the whole record to show what each
     /// model can do. Dropping this is how the model sheet renders empty.
@@ -48,7 +49,9 @@ public struct ConversationView: View {
                     .padding(.vertical, 6)
                     .background(.red.opacity(0.08))
             }
-            ComposerView(conversation: conversation, models: models, toolServers: toolServers)
+            ComposerView(
+                conversation: conversation, models: models,
+                toolServers: toolServers, toolServersError: toolServersError)
         }
         .inlineTitle(conversation.title)
         .toolbar { toolbar }
@@ -59,7 +62,11 @@ public struct ConversationView: View {
             // a chat; a conversation with no model to name cannot send anything.
             if models.isEmpty { models = (try? await session.client.models()) ?? [] }
             conversation.setModels(models)
-            toolServers = (try? await session.client.toolServers()) ?? []
+            do { toolServers = try await session.client.toolServers() }
+            // Kept rather than swallowed: an absent Servers section is otherwise
+            // indistinguishable from an instance that has no servers, and the
+            // second one is normal while the first is a bug.
+            catch { toolServersError = error.localizedDescription }
         }
         .onChange(of: scenePhase) { _, phase in
             // iOS kills the socket on background anyway; saying so locally beats

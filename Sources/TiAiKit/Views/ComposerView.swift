@@ -19,6 +19,7 @@ struct ComposerView: View {
     var models: [ChatModel] = []
     /// MCP servers configured on the instance, passed through to the `+` sheet.
     var toolServers: [ToolServer] = []
+    var toolServersError: String? = nil
 
     @State private var sheet: Sheet?
     @State private var pending: Pending?
@@ -69,6 +70,7 @@ struct ComposerView: View {
             case .add:
                 AddToChatSheet(
                     conversation: conversation, models: models, servers: toolServers,
+                    toolServersError: toolServersError,
                     onCamera: { hand(.camera) }, onPhotos: { hand(.photos) },
                     onFiles: { hand(.files) })
             case .models:
@@ -217,6 +219,7 @@ struct AddToChatSheet: View {
     /// MCP servers configured on the instance. Empty hides the section entirely:
     /// a "Servers" heading with nothing under it reads as a bug, not as "none".
     var servers: [ToolServer] = []
+    var toolServersError: String? = nil
     var onCamera: () -> Void
     var onPhotos: () -> Void
     var onFiles: () -> Void
@@ -237,6 +240,12 @@ struct AddToChatSheet: View {
                     .frame(height: 78)
                 }
 
+                if servers.isEmpty, let toolServersError {
+                    Section("Servers") {
+                        Label(toolServersError, systemImage: "exclamationmark.triangle")
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
+                }
                 if !servers.isEmpty {
                     Section("Servers") {
                         ForEach(servers) { server in
