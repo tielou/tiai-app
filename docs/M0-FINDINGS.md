@@ -182,10 +182,19 @@ So `time to first token` has to ignore reasoning. Measured honestly on this run:
 first reasoning 0.2 s, first answer token later. A client that counts the first
 frame as a token reports 0 ms and shows nothing.
 
+The opening chunk carries `delta: {content: ""}` — non-nil, empty. A client that
+treats "a frame with a delta" as the first token reports the moment the job was
+accepted rather than the moment text appeared, and shows a spinner while tokens
+arrive. **First token = first non-empty delta.**
+
 **There is no `done` frame.** The only end-of-stream signal in a real run is the
 `chat:completion` frame carrying `finish_reason`. `Frame.isTerminal` is
 `isDone || isFinish` so the app has one thing to check and still works if a
 future version adds `done`.
+
+Ordering is not guaranteed and is not asserted. Reasoning led by 1.7 s on one
+model and arrived at the same instant as the opener on another; a client that
+requires an order will break on a model that interleaves them.
 
 No `usage`, `error`, `status`, `citations` or tool frames appeared for this model
 — the local engine reports none. Those decoders stay tolerant and unproven until

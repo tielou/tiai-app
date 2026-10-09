@@ -144,8 +144,12 @@ struct Probe {
             guard outcome.sawDone || outcome.sawFinish else {
                 throw ProbeError.failure("no terminal frame (neither done nor finish_reason)")
             }
-            guard outcome.reasoning.isEmpty || (outcome.firstReasoning ?? .zero) < outcome.firstToken! else {
-                throw ProbeError.failure("reasoning arrived after the answer - the two streams are crossed")
+            // Deliberately not an ordering assertion. Reasoning normally leads,
+            // but nothing promises it, and a client that requires an order will
+            // fail on a model that interleaves them. Both are captured; the app
+            // renders them in separate places.
+            if let thinking = outcome.firstReasoning, let token = outcome.firstToken, thinking > token {
+                report.note("note", "reasoning lagged the answer by \(Probe.string(thinking - token))")
             }
         }
 
@@ -326,7 +330,12 @@ final class FrameFeed {
             outcome.kinds[frame.kind, default: 0] += 1
             if outcome.samples[frame.kind] == nil { outcome.samples[frame.kind] = String(frame.raw.prefix(400)) }
             if let delta = frame.delta {
-                if outcome.firstToken == nil { outcome.firstToken = started.duration(to: .now) }
+                // The opening chunk carries an empty delta alongside the role.
+                // Counting it as the first token reports the moment the server
+                // accepted the job, not the moment text appeared.
+                if outcome.firstToken == nil && !delta.isEmpty {
+                    outcome.firstToken = started.duration(to: .now)
+                }
                 outcome.text += delta
             }
             if let thinking = frame.reasoningDelta {
