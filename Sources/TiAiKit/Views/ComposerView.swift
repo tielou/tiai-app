@@ -17,10 +17,9 @@ import UIKit
 struct ComposerView: View {
     @Bindable var conversation: ConversationModel
     var models: [ChatModel] = []
-    /// MCP servers configured on the instance, passed through to the `+` sheet.
-    var toolServers: [ToolServer] = []
-    var toolServersError: String? = nil
-    var workspaceTools: [ToolServer] = []
+    /// Tools offered by the instance, passed through to the `+` sheet.
+    var chatTools: [ChatTool] = []
+    var chatToolsError: String? = nil
 
     @State private var sheet: Sheet?
     @State private var pending: Pending?
@@ -70,8 +69,8 @@ struct ComposerView: View {
             switch which {
             case .add:
                 AddToChatSheet(
-                    conversation: conversation, models: models, servers: toolServers,
-                    toolServersError: toolServersError, workspaceTools: workspaceTools,
+                    conversation: conversation, models: models, tools: chatTools,
+                    toolsError: chatToolsError,
                     onCamera: { hand(.camera) }, onPhotos: { hand(.photos) },
                     onFiles: { hand(.files) })
             case .models:
@@ -217,13 +216,10 @@ struct AttachmentChip: View {
 struct AddToChatSheet: View {
     @Bindable var conversation: ConversationModel
     var models: [ChatModel]
-    /// MCP servers configured on the instance. Empty hides the section entirely:
-    /// a "Servers" heading with nothing under it reads as a bug, not as "none".
-    var servers: [ToolServer] = []
-    var toolServersError: String? = nil
-    /// Workspace tools, listed apart from the MCP servers because they are
-    /// selected into different fields and a merged list could not be sent.
-    var workspaceTools: [ToolServer] = []
+    /// Tools offered by the instance. Empty hides the section entirely: a
+    /// "Tools" heading with nothing under it reads as a bug, not as "none".
+    var tools: [ChatTool] = []
+    var toolsError: String? = nil
     var onCamera: () -> Void
     var onPhotos: () -> Void
     var onFiles: () -> Void
@@ -244,48 +240,41 @@ struct AddToChatSheet: View {
                     .frame(height: 78)
                 }
 
-                if servers.isEmpty, let toolServersError {
-                    Section("Servers") {
-                        Label(toolServersError, systemImage: "exclamationmark.triangle")
+                if tools.isEmpty, let toolsError {
+                    Section("Tools") {
+                        Label(toolsError, systemImage: "exclamationmark.triangle")
                             .font(.callout).foregroundStyle(.secondary)
                     }
                 }
-                if !servers.isEmpty {
+                if !tools.isEmpty {
                     Section {
-                        ForEach(servers) { server in
-                            Toggle(isOn: serverBinding(server)) {
+                        ForEach(tools) { tool in
+                            Toggle(isOn: toolBinding(tool)) {
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(server.name)
-                                    if server.url != nil {
-                                        Text(server.id).font(.caption).foregroundStyle(.secondary)
-                                            .lineLimit(1)
+                                    Text(tool.name)
+                                    // The id is noise for an MCP server ("server:mcp:1"),
+                                    // so it only appears when there is nothing better.
+                                    if let detail = tool.detail {
+                                        Text(detail).font(.caption).foregroundStyle(.secondary)
+                                            .lineLimit(2)
+                                    }
+                                    if tool.authenticated == false {
+                                        // Says it, because the alternative is a tool that
+                                        // is switched on and silently does nothing.
+                                        Label("Not signed in", systemImage: "lock")
+                                            .font(.caption).foregroundStyle(.orange)
                                     }
                                 }
                             }
-                            .disabled(!server.reachable)
-                        }
-                    } header: {
-                        Text("Servers")
-                    } footer: {
-                        // Says where they come from, because "why is Notion here"
-                        // and "why is Notion missing" are both answered by the
-                        // same fact: the instance decides, not the app.
-                        Text("Configured on your server. Off here means this chat does not offer them.")
-                    }
-                }
-
-                if !workspaceTools.isEmpty {
-                    Section {
-                        ForEach(workspaceTools) { tool in
-                            Toggle(isOn: toolBinding(tool)) { VStack(alignment: .leading, spacing: 2) {
-                                Text(tool.name)
-                                Text(tool.id).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                            } }
+                            .disabled(!tool.available)
                         }
                     } header: {
                         Text("Tools")
                     } footer: {
-                        Text("From your server's workspace. On here means this chat can use them.")
+                        // Says where they come from, because "why is Notion here"
+                        // and "why is Notion missing" are both answered by the
+                        // same fact: the instance decides, not the app.
+                        Text("From your server. Off here means this chat does not offer them.")
                     }
                 }
 
@@ -323,16 +312,7 @@ struct AddToChatSheet: View {
 
     private var currentModel: ChatModel? { models.first { $0.id == conversation.model } }
 
-    private func serverBinding(_ server: ToolServer) -> Binding<Bool> {
-        Binding(
-            get: { conversation.servers.contains(server.id) },
-            set: { on in
-                if on { conversation.servers.append(server.id) }
-                else { conversation.servers.removeAll { $0 == server.id } }
-            })
-    }
-
-    private func toolBinding(_ tool: ToolServer) -> Binding<Bool> {
+    private func toolBinding(_ tool: ChatTool) -> Binding<Bool> {
         Binding(
             get: { conversation.tools.contains(tool.id) },
             set: { on in

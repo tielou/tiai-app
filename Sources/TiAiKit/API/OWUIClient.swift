@@ -316,76 +316,23 @@ public struct OWUIClient: Sendable {
 
     // MARK: - tool calls
 
-    /// The MCP tool servers the operator has configured.
+    /// The tools this chat can be given: MCP servers and workspace tools alike.
     ///
-    /// Read from the instance rather than listed in the app, so a server added
-    /// in the admin UI shows up in the chat without an app release. The response
-    /// is an array of configuration blobs whose shape belongs to the admin UI,
-    /// not to the API contract, so it is decoded tolerantly and unreadable
-    /// entries are dropped rather than failing the whole list.
-    public func toolServers() async throws -> [ToolServer] {
-        // Two places, because there are two. `/configs/tool_servers` is the
-        // admin's registry; the servers a user has actually connected live in
-        // their own settings under `toolServers`, and that is the list the web
-        // client matches a tool call against (`settings.toolServers.find(s =>
-        // s.url === …)`). Reading only the admin registry showed nothing on an
-        // instance where Sonos and Notion were plainly in the composer.
-        //
-        // Neither endpoint has a published shape, so both are decoded tolerantly
-        // and a failure of one is not allowed to hide the other.
-        var found: [String: ToolServer] = [:]
-        var order: [String] = []
-        var adminError: Error?
-        var userError: Error?
-        var admin: [ToolServer] = []
-        var user: [ToolServer] = []
-        do { admin = try await adminToolServers() } catch { adminError = error }
-        do { user = try await userToolServers() } catch { userError = error }
-        // Both empty with a failure behind it is a bug or a permission problem,
-        // not an instance with no servers — and the two are indistinguishable on
-        // screen unless something says so.
-        if admin.isEmpty, user.isEmpty {
-            if let adminError { throw adminError }
-            if let userError { throw userError }
-        }
-        for server in admin + user {
-            if found[server.id] == nil { order.append(server.id) }
-            found[server.id] = server
-        }
-        return order.compactMap { found[$0] }
-    }
-
-    /// Pulls the candidate arrays out of a response whose key is not known.
-    private static func candidates(_ json: JSONValue) -> [ToolServer] {
-        let items =
-            json.arrayValue
-            ?? json["data"]?.arrayValue
-            ?? json["tool_servers"]?.arrayValue
-            ?? json["toolServers"]?.arrayValue
-            ?? json["servers"]?.arrayValue
-            ?? []
-        return items.compactMap(ToolServer.init)
-    }
-
-    /// Workspace tools the user may switch on for a chat.
+    /// One endpoint, and it is the one the web client's tool picker uses. Three
+    /// earlier guesses at this — the admin registry at `/configs/tool_servers`,
+    /// `settings.toolServers`, and a merged tolerant decode of both — were all
+    /// wrong, and all three are recorded in the commit history so nobody repeats
+    /// them. What settles it is the bytes: `/tools/` returns
+    /// `{"id": "server:mcp:1", "name": "Notion"}, {"id": "server:mcp:2", "name":
+    /// "Sonos"}`, while the admin registry returns `TOOL_SERVER_CONNECTIONS`
+    /// keyed by url with no names at all, and `settings.toolServers` does not
+    /// exist on this deployment.
     ///
-    /// A separate thing from an MCP server, and it is the other place Sonos or
-    /// Notion could plausibly live: workspace tools go out as `tool_ids`, servers
-    /// as `tool_servers`. Reading only one is how the section stayed empty while
-    /// the web composer plainly had them.
-    public func workspaceTools() async throws -> [ToolServer] {
+    /// Selected ids go out as `tool_ids`. Entries that cannot be read are dropped
+    /// rather than failing the list: one odd row should not cost the whole picker.
+    public func chatTools() async throws -> [ChatTool] {
         let json: JSONValue = try await request("GET", "/tools/")
-        return Self.candidates(json)
-    }
-
-    private func adminToolServers() async throws -> [ToolServer] {
-        let json: JSONValue = try await request("GET", "/configs/tool_servers")
-        return Self.candidates(json)
-    }
-
-    private func userToolServers() async throws -> [ToolServer] {
-        let json: JSONValue = try await request("GET", "/users/user/settings")
-        return Self.candidates(json["toolServers"] ?? json)
+        return (json.arrayValue ?? []).compactMap(ChatTool.init)
     }
 
     /// Answers a tool call and lets the parked run continue.

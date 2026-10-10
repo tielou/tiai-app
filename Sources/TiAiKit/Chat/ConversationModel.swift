@@ -48,9 +48,6 @@ public final class ConversationModel {
     /// Tool ids to offer this run. Empty means the server's own default set for
     /// the model, which is what almost every chat wants.
     public var tools: [String] = []
-    /// MCP tool servers selected for this chat, keyed by url — what the server
-    /// matches on. Empty means the instance's default set.
-    public var servers: [String] = []
     /// The chat's template variables, carried back untouched on every send.
     public var chatVariables: JSONValue?
     public var modelIDs: [String] = []
@@ -302,7 +299,12 @@ public final class ConversationModel {
             // right for a headless client and wrong for one in the hand.
             params: CompletionRequest.Params(toolApprovalMode: "ask"),
             toolIDs: tools.isEmpty ? nil : tools,
-            toolServerIDs: servers.isEmpty ? nil : servers,
+            // Left nil on purpose. `tool_servers` is for ad-hoc servers passed by
+            // url, which is not what the picker offers: connected MCP servers
+            // arrive from /tools/ as `server:mcp:N` and go in `tool_ids` like
+            // any other tool. The field stays on the request because the server
+            // accepts it, not because anything here sets it.
+            toolServerIDs: nil,
             chatVariables: chatVariables,
             sessionID: hub.sessionID)
 

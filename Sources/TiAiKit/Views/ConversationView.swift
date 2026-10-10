@@ -15,13 +15,11 @@ public struct ConversationView: View {
     @State private var conversation: ConversationModel
     @State private var atBottom = true
     @Environment(\.scenePhase) private var scenePhase
-    /// MCP servers offered by the instance. Loaded lazily and ignored if the
-    /// deployment has none, so the `+` sheet simply has no Servers section.
-    @State private var toolServers: [ToolServer] = []
-    @State private var toolServersError: String?
-    /// Workspace tools, which are a different thing from MCP servers and go on
-    /// the wire in a different field. Sonos or Notion can live in either place.
-    @State private var workspaceTools: [ToolServer] = []
+    /// Tools offered by the instance — MCP servers and workspace tools. Loaded
+    /// lazily and the section hidden if there are none, so an instance with no
+    /// tools simply has no Tools row.
+    @State private var chatTools: [ChatTool] = []
+    @State private var chatToolsError: String?
     /// Kept for the composer and the model sheet: the conversation only needs the
     /// id to seed itself, but the UI needs the whole record to show what each
     /// model can do. Dropping this is how the model sheet renders empty.
@@ -54,8 +52,7 @@ public struct ConversationView: View {
             }
             ComposerView(
                 conversation: conversation, models: models,
-                toolServers: toolServers, toolServersError: toolServersError,
-                workspaceTools: workspaceTools)
+                chatTools: chatTools, chatToolsError: chatToolsError)
         }
         .inlineTitle(conversation.title)
         .toolbar { toolbar }
@@ -66,12 +63,11 @@ public struct ConversationView: View {
             // a chat; a conversation with no model to name cannot send anything.
             if models.isEmpty { models = (try? await session.client.models()) ?? [] }
             conversation.setModels(models)
-            do { toolServers = try await session.client.toolServers() }
-            // Kept rather than swallowed: an absent Servers section is otherwise
-            // indistinguishable from an instance that has no servers, and the
+            do { chatTools = try await session.client.chatTools() }
+            // Kept rather than swallowed: an absent Tools section is otherwise
+            // indistinguishable from an instance that has no tools, and the
             // second one is normal while the first is a bug.
-            catch { toolServersError = error.localizedDescription }
-            workspaceTools = (try? await session.client.workspaceTools()) ?? []
+            catch { chatToolsError = error.localizedDescription }
         }
         .onChange(of: scenePhase) { _, phase in
             // iOS kills the socket on background anyway; saying so locally beats

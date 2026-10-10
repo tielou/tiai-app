@@ -650,18 +650,34 @@ enum AskUserFixture {
     #expect(call.answerSummary == "Pizza")
 }
 
-@Test func toolServersComeFromTheServerNotFromTheApp() throws {
+@Test func chatToolsComeFromTheServerNotFromTheApp() throws {
+    // Trimmed but otherwise verbatim from GET /api/v1/tools/ on the live
+    // instance. The previous version of this test asserted that ids were urls,
+    // which was a guess and was wrong: an MCP server arrives as `server:mcp:1`.
     let payload: [JSONValue] = [
-        .object(["url": .string("https://sonos.home.lan/mcp"), "name": .string("Sonos")]),
-        .object(["url": .string("https://mcp.notion.com/mcp"), "key": .string("notion")]),
+        .object([
+            "id": .string("server:mcp:1"), "name": .string("Notion"),
+            "user_id": .string("server:mcp:1"), "authenticated": .bool(false),
+            "meta": .object(["description": .string(""), "has_user_valves": .bool(false)]),
+        ]),
+        .object([
+            "id": .string("server:mcp:2"), "name": .string("Sonos"),
+            "authenticated": .bool(true),
+            "meta": .object(["description": .string("Control the speakers")]),
+        ]),
         // An entry with nothing to identify it is dropped, not shown blank.
         .object(["description": .string("mystery")]),
     ]
-    let servers = payload.compactMap(ToolServer.init)
-    #expect(servers.map(\.id) == ["https://sonos.home.lan/mcp", "https://mcp.notion.com/mcp"])
-    #expect(servers[0].name == "Sonos")
-    // No name falls back to the host rather than the whole URL.
-    #expect(servers[1].name == "mcp.notion.com")
-    // Unverified is not broken: only an explicit error disables a server.
-    #expect(servers[0].reachable)
+    let tools = payload.compactMap(ChatTool.init)
+    #expect(tools.map(\.id) == ["server:mcp:1", "server:mcp:2"])
+    #expect(tools.map(\.name) == ["Notion", "Sonos"])
+    // An empty description means none, not a blank line under the name.
+    #expect(tools[0].detail == nil)
+    #expect(tools[1].detail == "Control the speakers")
+    // An OAuth server the user has not signed into has to say so on the row;
+    // absent is not the same as false.
+    #expect(tools[0].authenticated == false)
+    #expect(tools[1].authenticated == true)
+    // Unverified is not broken: only an explicit error disables a tool.
+    #expect(tools[0].available)
 }
