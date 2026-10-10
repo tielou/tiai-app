@@ -76,6 +76,22 @@ struct Probe {
             exit(report.failed == 0 ? 0 : 1)
         }
 
+        // ---- 2b. where the MCP servers actually live ----------------------
+        // Dumped raw, not decoded: the app has guessed at this shape twice and
+        // got it wrong twice. The bytes settle it.
+        await report.check("tool server sources") {
+            for path in ["/configs/tool_servers", "/configs/tool_servers/"] {
+                do { report.note(path, Report.clip(try await client.rawJSON(path))) }
+                catch { report.note(path, "✗ \(error)") }
+            }
+            do {
+                let settings = try await client.rawJSON("/users/user/settings")
+                let servers = settings["toolServers"] ?? .null
+                report.note("settings.toolServers", Report.clip(servers))
+                report.note("settings keys", settings.objectValue?.keys.sorted().joined(separator: ", ") ?? "not an object")
+            } catch { report.note("/users/user/settings", "✗ \(error)") }
+        }
+
         // ---- 3. models -----------------------------------------------------
         var defaultModel: String?
         await report.check("model list (GET /models)") {
@@ -429,6 +445,11 @@ enum ProbeError: Error {
 final class Report {
     private var lines: [String] = []
     private(set) var failed = 0
+
+    static func clip(_ value: JSONValue, limit: Int = 700) -> String {
+        let text = value.jsonText ?? "null"
+        return text.count > limit ? String(text.prefix(limit)) + "…" : text
+    }
 
     func check(_ name: String, _ body: () async throws -> Void) async {
         print("  … \(name)")

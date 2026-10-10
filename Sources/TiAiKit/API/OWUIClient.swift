@@ -299,6 +299,21 @@ public struct OWUIClient: Sendable {
         }
     }
 
+    /// Raw JSON for diagnostics.
+    ///
+    /// Some endpoints have no published shape, and the only way to find out what
+    /// one actually returns is to look at it. Every wrong guess about
+    /// `tool_servers` so far was a guess because nobody had looked.
+    public func rawJSON(_ path: String) async throws -> JSONValue {
+        let (data, http) = try await perform("GET", server.api(path), bodyData: nil)
+        guard (200..<300).contains(http.statusCode) else {
+            throw APIError.http(
+                status: http.statusCode,
+                message: String(decoding: data.prefix(300), as: UTF8.self))
+        }
+        return (try? JSONDecoder().decode(JSONValue.self, from: data)) ?? .null
+    }
+
     // MARK: - tool calls
 
     /// The MCP tool servers the operator has configured.
