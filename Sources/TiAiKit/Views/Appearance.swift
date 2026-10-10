@@ -30,7 +30,7 @@ public enum AppearanceMode: String, CaseIterable, Identifiable, Sendable {
 
     public var systemImage: String {
         switch self {
-        case .system: "circle-half.circle"
+        case .system: "circle.lefthalf.filled"
         case .light: "sun.max"
         case .dark: "moon.stars"
         }
@@ -81,6 +81,10 @@ public struct AppearancePicker: View {
                     Label(mode.title, systemImage: mode.systemImage).tag(mode)
                 }
             }
+            // Without .inline a Picker in a Menu renders as a submenu with no
+            // mark on the current choice, so the row that *is* selected looks
+            // like one that has not been set.
+            .pickerStyle(.inline)
         } label: {
             // Icon only: in a toolbar a `Label` renders its title too, and
             // "Appearance" in words next to a half-moon icon is one control

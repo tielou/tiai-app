@@ -60,9 +60,30 @@ public struct OWUIClient: Sendable {
         _ method: String, _ path: String, query: [String: String] = [:],
         bodyData: Data? = nil, timeout: TimeInterval = 30
     ) async throws -> T {
-        let (data, http) = try await perform(
-            method, server.api(path, query: query), bodyData: bodyData, timeout: timeout)
-        return try Self.validate(data, http, as: T.self)
+        // GETs are idempotent, so a blip is absorbed silently: three tries with
+        // a short backoff covers a phone switching wifi or a home server
+        // restarting mid-poll.
+        //
+        // POSTs are never retried here. A second completion request is a second
+        // copy of the user's message, and a retry that duplicates what someone
+        // typed is worse than an error with a button on it.
+        let attempts = method == "GET" ? 3 : 1
+        var last: Error = APIError.unreachable("no attempt made")
+        for attempt in 0..<attempts {
+            do {
+                let (data, http) = try await perform(
+                    method, server.api(path, query: query), bodyData: bodyData, timeout: timeout)
+                return try Self.validate(data, http, as: T.self)
+            } catch {
+                last = error
+                let transient = (error as? APIError)?.isTransient ?? false
+                guard transient, attempt + 1 < attempts else { throw error }
+                // Small and exponential: long enough for a route to converge,
+                // short enough that a spinner never looks broken.
+                try? await Task.sleep(for: .milliseconds(250 * (1 << attempt)))
+            }
+        }
+        throw last
     }
 
     /// Same, for the few routes outside the versioned router.

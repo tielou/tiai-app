@@ -716,3 +716,34 @@ enum AskUserFixture {
     // Seeded picks are stable, so a run keeps one animation for its whole life.
     #expect(ThinkingAnimation.pick(seed: "abc").name == ThinkingAnimation.pick(seed: "abc").name)
 }
+
+@Test func onlySomeFailuresAreWorthRetrying() {
+    // A blip gets another attempt; a wrong request gets the same answer twice.
+    #expect(APIError.http(status: 503, message: "upstream").isTransient)
+    #expect(APIError.http(status: 429, message: "slow down").isTransient)
+    #expect(APIError.http(status: 408, message: "timeout").isTransient)
+    #expect(APIError.unreachable("network is down").isTransient)
+    #expect(!APIError.http(status: 404, message: "no such chat").isTransient)
+    #expect(!APIError.http(status: 401, message: "gone").isTransient)
+    #expect(!APIError.unauthorized.isTransient)
+    #expect(!APIError.cancelled.isTransient)
+    // Decoding is not transient either: the same bytes will not decode better.
+    #expect(!APIError.decoding("not json").isTransient)
+}
+
+@Test func settledToolCallsShareOneCardAndQuestionsStayAlone() {
+    func call(_ id: String, status: String) -> ToolCall {
+        ToolCall(.object([
+            "type": .string("function_call"), "call_id": .string(id),
+            "name": .string("ask_user"), "status": .string(status),
+        ]))!
+    }
+    let calls = [call("a", status: "completed"), call("b", status: "completed"),
+                 call("q", status: "pending"), call("c", status: "completed")]
+    let groups = ToolCall.grouped(calls)
+    // Two settled, then the question on its own, then one more settled run.
+    #expect(groups.count == 3)
+    if case .settled(let pair) = groups[0] { #expect(pair.map(\.id) == ["a", "b"]) }
+    if case .awaiting(let question) = groups[1] { #expect(question.id == "q") }
+    if case .settled(let last) = groups[2] { #expect(last.map(\.id) == ["c"]) }
+}

@@ -106,7 +106,11 @@ public final class ConversationModel {
     }
 
     public var canSend: Bool {
-        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !phase.isBusy
+        // A photo with no caption is a message. Requiring text made the send
+        // button sit there disabled after a picture was attached, which read as
+        // the upload having failed.
+        let hasText = !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return (hasText || !attachments.isEmpty) && !phase.isBusy
     }
 
     public func setModels(_ models: [ChatModel]) {
@@ -200,7 +204,7 @@ public final class ConversationModel {
 
     public func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !phase.isBusy else { return }
+        guard !(text.isEmpty && attachments.isEmpty), !phase.isBusy else { return }
         let files = attachments
         attachments = []
         draft = ""
@@ -334,7 +338,22 @@ public final class ConversationModel {
         if outcome.sawTerminal {
             leafID = assistantID
         } else if outcome.failure == nil {
-            outcome.failure = phase == .stopping ? "Stopped." : "The server sent nothing."
+            if phase == .stopping {
+                outcome.failure = "Stopped."
+            } else {
+                // The frame stream ended without ever saying it was finished.
+                // Most of the time that is a socket blip and not a failed run:
+                // the server has the whole answer, and leaving the chat and
+                // coming back shows it. So look there before calling it a
+                // failure — "the server sent nothing" while it sent everything
+                // is a claim the user can disprove by doing exactly that.
+                await refresh(messageID: assistantID)
+                if turns.first(where: { $0.id == assistantID })?.text.isEmpty ?? true {
+                    outcome.failure = "The server sent nothing."
+                } else {
+                    leafID = assistantID
+                }
+            }
         }
         if let failure = outcome.failure { error = failure }
         phase = .ready
@@ -480,8 +499,16 @@ public final class ConversationModel {
                 return
             }
             if outcome.sawTerminal { self.leafID = messageID }
-            else if outcome.failure == nil { outcome.failure = "The server sent nothing." }
-            await self.refresh(messageID: messageID)
+            else if outcome.failure == nil {
+                // Same reasoning as the first run: a resumed stream that ends
+                // quietly is usually a blip, and the answer is already stored.
+                await self.refresh(messageID: messageID)
+                if self.turns.first(where: { $0.id == messageID })?.text.isEmpty ?? true {
+                    outcome.failure = "The server sent nothing."
+                } else {
+                    self.leafID = messageID
+                }
+            }
             if let failure = outcome.failure { self.error = failure }
             self.phase = .ready
         }

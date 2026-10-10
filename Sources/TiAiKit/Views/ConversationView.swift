@@ -42,13 +42,24 @@ public struct ConversationView: View {
             Divider()
             transcript
             if let error = conversation.error {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.footnote)
-                    .foregroundStyle(.red)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal)
-                    .padding(.vertical, 6)
-                    .background(.red.opacity(0.08))
+                HStack(spacing: 10) {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                    Spacer(minLength: 8)
+                    // The one retry that can be offered honestly: the last
+                    // question is known, and re-running it is the same operation
+                    // the toolbar's regenerate already does. Not offered while
+                    // busy, because a second run would collide with the first.
+                    if !conversation.phase.isBusy,
+                        conversation.turns.contains(where: \.isUser) {
+                        Button("Retry") { conversation.regenerate() }
+                            .font(.footnote)
+                    }
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 6)
+                .background(.red.opacity(0.08))
             }
             ComposerView(
                 conversation: conversation, models: models,
@@ -206,9 +217,14 @@ struct MessageRow: View {
                 // answer they unlocked. That is the order it happened in, it is
                 // how the Claude client reads, and it keeps the question visible
                 // without scrolling past the reply to remember what was asked.
-                ForEach(turn.calls) { call in
-                    ToolCallCard(call: call) { action, answers in
-                        onResolve?(call, action, answers)
+                ForEach(ToolCall.grouped(turn.calls)) { group in
+                    switch group {
+                    case .awaiting(let call):
+                        ToolCallCard(call: call) { action, answers in
+                            onResolve?(call, action, answers)
+                        }
+                    case .settled(let calls):
+                        SettledCallsCard(calls: calls)
                     }
                 }
                 ForEach(Array(Markdown.blocks(TextSanitizer.clean(turn.text)).enumerated()), id: \.offset) { _, block in
@@ -574,16 +590,41 @@ struct ToolCallCard: View {
     }
 
     @ViewBuilder private var settled: some View {
-        HStack(spacing: 6) {
-            Image(systemName: icon)
-                .foregroundStyle(call.status == .rejected || call.status == .failed ? .red : .secondary)
-            Text(summary).font(.callout).foregroundStyle(.secondary)
-            Spacer(minLength: 0)
-        }
+        SettledCallsCard(calls: [call])
     }
+}
 
-    private var icon: String {
-        switch call.status {
+/// Settled tool calls, however many there were, in one card.
+///
+/// Three answered questions in three identical boxes reads like a form that is
+/// still waiting to be filled in. One quiet list of what already happened reads
+/// like a log, which is what it is.
+private struct SettledCallsCard: View {
+    let calls: [ToolCall]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            ForEach(calls) { call in
+                HStack(alignment: .firstTextBaseline, spacing: 7) {
+                    Image(systemName: call.settledIcon)
+                        .font(.caption2)
+                        .foregroundStyle(call.status == .completed ? Color.secondary : Color.red)
+                    Text(call.settledSummary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.background.secondary.opacity(0.55), in: .rect(cornerRadius: 10))
+    }
+}
+
+extension ToolCall {
+    var settledIcon: String {
+        switch status {
         case .rejected: "xmark.circle"
         case .failed: "exclamationmark.triangle"
         case .completed: "checkmark.circle"
@@ -591,12 +632,50 @@ struct ToolCallCard: View {
         }
     }
 
-    private var summary: String {
-        if call.isAskUser {
-            if call.status == .rejected { return "Skipped" }
-            guard let answer = call.answerSummary else { return "Answered" }
+    var settledSummary: String {
+        if isAskUser {
+            if status == .rejected { return "Skipped" }
+            guard let answer = answerSummary else { return "Answered" }
             return answer.count > 120 ? String(answer.prefix(120)) + "…" : answer
         }
-        return call.status == .rejected ? "\(call.name) rejected" : call.name
+        return status == .rejected ? "\(name) rejected" : name
+    }
+}
+
+/// How a turn's tool calls are laid out: a question still waiting for an answer
+/// gets a card to itself, everything already settled shares one.
+enum ToolCallGroup: Identifiable {
+    case awaiting(ToolCall)
+    case settled([ToolCall])
+
+    var id: String {
+        switch self {
+        case .awaiting(let call): "awaiting-\(call.id)"
+        case .settled(let calls): "settled-" + calls.map(\.id).joined(separator: ",")
+        }
+    }
+}
+
+extension ToolCall {
+    /// Groups consecutive settled calls, keeping an awaiting call on its own.
+    ///
+    /// Order is preserved, because the question and the answer it unlocked read
+    /// in the order they happened.
+    static func grouped(_ calls: [ToolCall]) -> [ToolCallGroup] {
+        var out: [ToolCallGroup] = []
+        var settled: [ToolCall] = []
+        func flush() {
+            if !settled.isEmpty { out.append(.settled(settled)); settled = [] }
+        }
+        for call in calls {
+            if call.isAwaitingUser {
+                flush()
+                out.append(.awaiting(call))
+            } else {
+                settled.append(call)
+            }
+        }
+        flush()
+        return out
     }
 }

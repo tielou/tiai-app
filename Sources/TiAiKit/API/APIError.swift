@@ -21,6 +21,19 @@ public enum APIError: Error, Equatable, LocalizedError {
 
     public var isUnauthorized: Bool { self == .unauthorized }
 
+    /// Worth another attempt, as opposed to the request being wrong.
+    ///
+    /// A 404 retried is a 404 twice; a home server that blinks on a flaky link
+    /// is the case the user cannot fix and should not have to notice. 429 is
+    /// included because a rate limit is a request to wait, not a rejection.
+    public var isTransient: Bool {
+        switch self {
+        case let .http(status, _): status == 408 || status == 429 || status >= 500
+        case .unreachable: true
+        case .notConfigured, .unauthorized, .decoding, .invalidURL, .cancelled: false
+        }
+    }
+
     public var errorDescription: String? {
         switch self {
         case .notConfigured: "No server configured."

@@ -111,8 +111,18 @@ struct ComposerView: View {
         Task {
             try? await Task.sleep(for: .milliseconds(400))
             switch which {
-            case .camera: cameraRequest = true
-            case .photos, .files: showingFiles = which == .files; pending = nil
+            case .camera:
+                cameraRequest = true
+                pending = nil
+            case .photos:
+                // Left alone on purpose. The picker's own binding clears
+                // `pending` when the user finishes; clearing it here opened the
+                // photo grid and shut it again in the same frame, so it flashed
+                // and vanished before a finger could land on a picture.
+                break
+            case .files:
+                showingFiles = true
+                pending = nil
             }
         }
     }
