@@ -241,6 +241,9 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     private(set) var resolveBodies: [Data] = []
     var completionBody: Data? { completionBodies.last }
 
+    /// Replaces what GET /chats/{id} returns, for tests that need a real tree.
+    var chatDetailOverride: Data?
+
     var chatDetail: Data {
         Data(
             """
@@ -252,7 +255,10 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
         let path = request.url?.path ?? ""
         paths.append(path)
-        if path.hasSuffix("/chats/new") { return (chatDetail, response(for: request, 200)) }
+        if path.hasSuffix("/chats/new") { return (chatDetailOverride ?? chatDetail, response(for: request, 200)) }
+        if request.httpMethod == "GET", path.hasPrefix("/api/v1/chats/") {
+            return (chatDetailOverride ?? chatDetail, response(for: request, 200))
+        }
         if path.hasSuffix("/resolve") {
             resolveBodies.append(request.httpBody ?? Data())
             return (Data(#"{"status":true}"#.utf8), response(for: request, 200))
@@ -746,4 +752,90 @@ enum AskUserFixture {
     if case .settled(let pair) = groups[0] { #expect(pair.map(\.id) == ["a", "b"]) }
     if case .awaiting(let question) = groups[1] { #expect(question.id == "q") }
     if case .settled(let last) = groups[2] { #expect(last.map(\.id) == ["c"]) }
+}
+
+@Test @MainActor func editingAMessageStoresItAndReRunsFromIt() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(
+            server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"), transport: transport),
+        hub: hub)
+    // The message being edited has to exist, so the conversation is loaded from
+    // a fixture that contains it.
+    transport.chatDetailOverride = Data(
+        """
+        {"id":"chat-1","title":"T","updated_at":1,"created_at":1,"chat":{"models":["local-personal"],
+         "history":{"currentId":"assistant-2","messages":{
+           "user-1":{"id":"user-1","role":"user","content":"hi","childrenIds":["assistant-1","assistant-2"]},
+           "assistant-2":{"id":"assistant-2","role":"assistant","content":"second","parentId":"user-1"}}}}}
+        """.utf8)
+    await conversation.load()
+
+    conversation.edit(messageID: "user-1", text: "Actually: Berlin, but colder")
+    try await transport.awaitCompletion()
+
+    // The text is stored on the server first; the run then reuses the same user
+    // message id, so the previous answer survives as a sibling rather than being
+    // overwritten.
+    #expect(transport.paths.contains("/api/v1/chats/chat-1/messages/user-1"))
+    #expect(transport.paths.last?.hasSuffix("/chat/completions") ?? false)
+    let body = try #require(transport.completionBody)
+    let json = try #require(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+    #expect((json["id"] as? String) != "assistant-2")
+    #expect(json["parent_id"] as? String == "user-1")
+    #expect(conversation.turns.first?.text == "Actually: Berlin, but colder")
+}
+
+@Test @MainActor func aThumbUpGoesToFeedback() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(
+            server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"), transport: transport),
+        hub: hub)
+    conversation.rate(messageID: "assistant-2", rating: 1)
+    try await Task.sleep(for: .milliseconds(150))
+    #expect(transport.paths.contains("/api/v1/feedback"))
+    #expect(conversation.ratings["assistant-2"] == 1)
+    // Tapping the same thumb again clears it locally without another request.
+    conversation.rate(messageID: "assistant-2", rating: 1)
+    #expect(conversation.ratings["assistant-2"] == nil)
+}
+
+@Test @MainActor func siblingAnswersCanBePagedThrough() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    // The fixture has one user message with two assistant answers and the second
+    // one current — the shape a regenerate leaves behind.
+    transport.chatDetailOverride = Data(
+        """
+        {"id":"chat-1","title":"T","updated_at":1,"created_at":1,"chat":{"models":["local-personal"],
+         "history":{"currentId":"assistant-2","messages":{
+           "user-1":{"id":"user-1","role":"user","content":"hi","childrenIds":["assistant-1","assistant-2"]},
+           "assistant-1":{"id":"assistant-1","role":"assistant","content":"first","parentId":"user-1"},
+           "assistant-2":{"id":"assistant-2","role":"assistant","content":"second","parentId":"user-1"}}}}}
+        """.utf8)
+    let conversation = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(
+            server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"), transport: transport),
+        hub: hub)
+    await conversation.load()
+
+    let page = try #require(conversation.siblingPage(of: "user-1"))
+    #expect(page.index == 2 && page.total == 2)
+    #expect(conversation.turns.last?.text == "second")
+
+    conversation.selectSibling(of: "user-1", direction: -1)
+    #expect(conversation.turns.last?.text == "first")
+    #expect(conversation.siblingPage(of: "user-1")?.index == 1)
+    // Past the end is a no-op rather than a crash or a blank transcript.
+    conversation.selectSibling(of: "user-1", direction: -1)
+    #expect(conversation.turns.last?.text == "first")
 }

@@ -396,6 +396,36 @@ public struct OWUIClient: Sendable {
         }
     }
 
+    // MARK: - editing and rating
+
+    /// Replaces a message's text.
+    ///
+    /// The server keeps the message id, so the siblings a previous regenerate
+    /// created stay where they are — which is what makes "edit and resend" a
+    /// branch rather than a rewrite of history.
+    public func updateMessage(chatID: String, messageID: String, content: String) async throws {
+        let data = (try? JSONEncoder().encode(["content": content])) ?? Data("{}".utf8)
+        let _: JSONValue = try await request(
+            "POST", "/chats/\(chatID)/messages/\(messageID)", bodyData: data)
+    }
+
+    /// Thumbs up or down on an assistant message.
+    ///
+    /// The body is read off the web client rather than documented: `type:
+    /// "rating"` with the score under `data`. A rating is the least important
+    /// thing happening in a chat, so a rejection should be shown and then
+    /// forgotten, never block a reply.
+    public func rate(chatID: String, messageID: String, rating: Int) async throws {
+        let body: [String: JSONValue] = [
+            "type": .string("rating"),
+            "data": .object(["rating": .number(Double(rating))]),
+            "chat_id": .string(chatID),
+            "message_id": .string(messageID),
+        ]
+        let data = (try? JSONEncoder().encode(body)) ?? Data("{}".utf8)
+        let _: JSONValue = try await request("POST", "/feedback", bodyData: data)
+    }
+
     // MARK: - memories
 
     public func memories() async throws -> [Memory] {
@@ -407,10 +437,6 @@ public struct OWUIClient: Sendable {
         return try await request("POST", "/memories/add", bodyData: try? JSONEncoder().encode(Form(content: content)))
     }
 
-    public func updateMemory(id: String, content: String) async throws -> Memory {
-        struct Form: Encodable { let content: String }
-        return try await request("POST", "/memories/\(id)/update", bodyData: try? JSONEncoder().encode(Form(content: content)))
-    }
 
     public func deleteMemory(id: String) async throws {
         try await expectStatus("DELETE", "/memories/\(id)")

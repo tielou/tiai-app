@@ -121,10 +121,20 @@ public struct ConversationView: View {
                 LazyVStack(alignment: .leading, spacing: 14) {
                     if conversation.turns.isEmpty { EmptyTranscript(model: conversation.model) }
                     ForEach(conversation.turns) { turn in
-                        MessageRow(turn: turn) { call, action, answers in
-                            conversation.resolve(
-                                messageID: turn.id, call: call, action: action, answers: answers)
-                        }
+                        MessageRow(
+                            turn: turn,
+                            onResolve: { call, action, answers in
+                                conversation.resolve(
+                                    messageID: turn.id, call: call, action: action, answers: answers)
+                            },
+                            onEdit: turn.isUser
+                                ? { conversation.edit(messageID: turn.id, text: $0) } : nil,
+                            onRate: turn.isAssistant && !turn.streaming
+                                ? { conversation.rate(messageID: turn.id, rating: $0) } : nil,
+                            rating: conversation.ratings[turn.id],
+                            sibling: conversation.siblingPage(of: turn.id),
+                            onSibling: { conversation.selectSibling(of: turn.id, direction: $0) }
+                        )
                             .id(turn.id)
                     }
                     // Reserves room so the last line is not hidden behind the
@@ -217,16 +227,43 @@ struct MessageRow: View {
     /// Answers a parked tool call. Nil on previews and on turns with nothing to
     /// answer, which is most of them.
     var onResolve: ((ToolCall, ToolCallAction, JSONValue?) -> Void)?
+    /// Re-sends this user message with new text.
+    var onEdit: ((String) -> Void)? = nil
+    /// Thumbs this answer up or down.
+    var onRate: ((Int) -> Void)? = nil
+    var rating: Int? = nil
+    /// Which sibling answer this branch is on, when there is more than one.
+    var sibling: (index: Int, total: Int)? = nil
+    var onSibling: ((Int) -> Void)? = nil
+
+    @State private var editing = false
+    @State private var draft = ""
 
     var body: some View {
         if turn.isUser {
-            HStack {
-                Spacer(minLength: 48)
-                Text(turn.text)
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
-                    .background(.tint.opacity(0.18), in: .rect(cornerRadius: 14))
+            VStack(alignment: .trailing, spacing: 5) {
+                if editing {
+                    editBox
+                } else {
+                    Text(turn.text)
+                        .textSelection(.enabled)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 9)
+                        .background(.tint.opacity(0.18), in: .rect(cornerRadius: 14))
+                        .contextMenu {
+                            // A menu rather than a tap: the bubble's text is
+                            // selectable, and a tap that both selected and
+                            // started editing would make the text impossible to
+                            // copy on a phone.
+                            if onEdit != nil {
+                                Button {
+                                    draft = turn.text
+                                    editing = true
+                                } label: { Label("Edit", systemImage: "pencil") }
+                            }
+                        }
+                }
+                if let sibling { siblingPager(sibling) }
             }
         } else {
             VStack(alignment: .leading, spacing: 8) {
@@ -282,6 +319,65 @@ struct MessageRow: View {
         .tint(.secondary)
     }
 
+    private var editBox: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            TextField("Edit your message", text: $draft, axis: .vertical)
+                .textFieldStyle(.plain)
+                .padding(10)
+                .background(.tint.opacity(0.12), in: .rect(cornerRadius: 12))
+            HStack(spacing: 16) {
+                Button("Cancel") { editing = false }.foregroundStyle(.secondary)
+                Button("Send again") {
+                    let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                    editing = false
+                    if !text.isEmpty { onEdit?(text) }
+                }
+                .fontWeight(.semibold)
+            }
+            .font(.callout)
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+
+    /// "2 of 3 ‹ ›" — the server keeps every regenerate as a sibling, and
+    /// without a way to step through them the app silently shows one branch of a
+    /// tree it created itself.
+    private func siblingPager(_ page: (index: Int, total: Int)) -> some View {
+        HStack(spacing: 8) {
+            Button { onSibling?(-1) } label: {
+                Image(systemName: "chevron.left").foregroundStyle(page.index > 1 ? Color.primary : Color.secondary)
+            }
+            .disabled(page.index <= 1)
+            Text("\(page.index) of \(page.total)")
+                .font(.caption).foregroundStyle(.secondary)
+                .monospacedDigit()
+            Button { onSibling?(1) } label: {
+                Image(systemName: "chevron.right")
+                    .foregroundStyle(page.index < page.total ? Color.primary : Color.secondary)
+            }
+            .disabled(page.index >= page.total)
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .contain)
+    }
+
+    /// Thumbs up and down. Quiet by design: the answer is the point, and a
+    /// permanent row of buttons competes with it.
+    private var ratingRow: some View {
+        HStack(spacing: 16) {
+            Button { onRate?(1) } label: {
+                Image(systemName: rating == 1 ? "hand.thumbsup.fill" : "hand.thumbsup")
+            }
+            Button { onRate?(-1) } label: {
+                Image(systemName: rating == -1 ? "hand.thumbsdown.fill" : "hand.thumbsdown")
+            }
+        }
+        .buttonStyle(.plain)
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .accessibilityLabel("Rate this answer")
+    }
+
     @ViewBuilder private var footer: some View {
         if !turn.streaming, turn.isUser == false {
             HStack(spacing: 8) {
@@ -292,6 +388,7 @@ struct MessageRow: View {
                     Text("\(total) tokens").font(.caption2).foregroundStyle(.tertiary)
                 }
                 Spacer()
+                if onRate != nil, !turn.text.isEmpty { ratingRow }
                 Button {
                     #if os(iOS)
                     UIPasteboard.general.string = turn.text

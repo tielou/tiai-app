@@ -152,6 +152,7 @@ public final class ConversationModel {
         phase = .loading
         do {
             let detail = try await client.chat(id: chatID)
+            self.detail = detail
             title = detail.title
             turns = detail.thread.map(Turn.init)
             leafID = turns.last?.id
@@ -222,6 +223,86 @@ public final class ConversationModel {
         // conditioned on the phase would otherwise race the run it just started.
         phase = .waiting
         run = Task { await self.exchange(text: text, regenerating: nil, files: files) }
+    }
+
+    /// The stored chat, kept so the message tree can be walked without another
+    /// round trip. Sibling navigation and edit-and-resend both need the tree, and
+    /// refetching on every chevron tap would make a one-tap action feel slow.
+    private var detail: ChatDetail?
+
+    /// Ratings given in this session, keyed by message id. The server has no
+    /// read-back that is worth a request per message, so the app remembers what
+    /// it sent rather than pretending the state is unknown.
+    public private(set) var ratings: [String: Int] = [:]
+
+    /// Edits a user message and re-runs from it.
+    ///
+    /// The text is stored first and the run started second, because the server
+    /// files the new answer as a sibling of the edited message: the old branch
+    /// survives, which is the whole point of editing rather than deleting.
+    public func edit(messageID: String, text: String) {
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, !phase.isBusy, let index = turns.firstIndex(where: { $0.id == messageID })
+        else { return }
+        error = nil
+        turns[index].text = clean
+        // Everything after the edited message belongs to the branch being
+        // replaced; leaving it on screen would show an answer to a question that
+        // no longer says that.
+        turns.removeSubrange(turns.index(after: index)..<turns.endIndex)
+        leafID = messageID
+        run = Task {
+            do { try await client.updateMessage(chatID: chatID ?? "", messageID: messageID, content: clean) }
+            catch { self.error = error.localizedDescription; return }
+            await self.exchange(text: clean, regenerating: messageID, files: [])
+        }
+    }
+
+    /// Thumbs a reply up or down. Tapping the same thumb again takes it back to
+    /// no rating locally; the server keeps the record either way.
+    public func rate(messageID: String, rating: Int) {
+        ratings[messageID] = ratings[messageID] == rating ? nil : rating
+        guard let chatID else { return }
+        Task {
+            do { try await client.rate(chatID: chatID, messageID: messageID, rating: rating) }
+            catch { self.error = "Could not record that: \(error.localizedDescription)" }
+        }
+    }
+
+    /// Which assistant sibling the current branch is on, 1-based, or nil when
+    /// there is nothing to page through.
+    public func siblingPage(of messageID: String) -> (index: Int, total: Int)? {
+        let kids = detail?.messages[messageID]?.childrenIDs ?? []
+        guard kids.count > 1, let current = branchChild(of: messageID),
+            let at = kids.firstIndex(of: current)
+        else { return nil }
+        return (at + 1, kids.count)
+    }
+
+    /// Moves to the previous or next sibling answer and rebuilds the transcript
+    /// along that branch.
+    public func selectSibling(of messageID: String, direction: Int) {
+        guard let detail,
+            let kids = detail.messages[messageID]?.childrenIDs,
+            let current = branchChild(of: messageID),
+            let at = kids.firstIndex(of: current)
+        else { return }
+        let next = kids.index(at, offsetBy: direction)
+        guard kids.indices.contains(next) else { return }
+        leafID = kids[next]
+        turns = ChatMessage.tree(from: detail.messages, currentID: kids[next]).map(Turn.init)
+    }
+
+    /// The child of `messageID` that leads to the message the branch ends on.
+    private func branchChild(of messageID: String) -> String? {
+        guard let detail, var id = leafID else { return nil }
+        var guardCount = 0
+        while guardCount < 500, let node = detail.messages[id], let parent = node.parentID {
+            if parent == messageID { return id }
+            id = parent
+            guardCount += 1
+        }
+        return nil
     }
 
     /// Re-runs the last user message. That message's id is reused, so the server
@@ -549,6 +630,7 @@ public final class ConversationModel {
               let message = detail.messages[messageID],
               let index = turns.firstIndex(where: { $0.id == messageID })
         else { return }
+        self.detail = detail
         let fresh = Turn(message)
         var turn = turns[index]
         if fresh.text.count > turn.text.count { turn.text = fresh.text }

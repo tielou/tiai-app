@@ -114,6 +114,7 @@ public struct ChatListView: View {
     @State private var models: [ChatModel] = []
     @State private var query = ""
     @State private var searchResults: [ChatSummary] = []
+    @State private var showingMemory = false
 
     public init(session: SessionStore) {
         self.session = session
@@ -179,6 +180,14 @@ public struct ChatListView: View {
                 ToolbarItem(placement: .navigation) {
                     AppearancePicker()
                 }
+                ToolbarItem(placement: .primaryAction) {
+                    Button { showingMemory = true } label: {
+                        Label("Memory", systemImage: "brain")
+                    }
+                }
+            }
+            .sheet(isPresented: $showingMemory) {
+                MemorySheet(client: session.client)
             }
             .overlay {
                 if chats.unauthorized {
