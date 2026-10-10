@@ -76,25 +76,23 @@ struct Probe {
             exit(report.failed == 0 ? 0 : 1)
         }
 
-        // ---- 2b. where the MCP servers actually live ----------------------
-        // Dumped raw, not decoded: the app has guessed at this shape twice and
-        // got it wrong twice. The bytes settle it.
-        await report.check("tool server sources") {
-            for path in ["/configs/tool_servers", "/configs/tool_servers/"] {
-                do { report.note(path, Report.clip(try await client.rawJSON(path))) }
-                catch { report.note(path, "✗ \(error)") }
-            }
-            for path in ["/tools/", "/functions/"] {
-                do { report.note(path, Report.clip(try await client.rawJSON(path))) }
-                catch { report.note(path, "✗ \(error)") }
-            }
-            do {
-                let settings = try await client.rawJSON("/users/user/settings")
-                let servers = settings["toolServers"] ?? .null
-                report.note("settings.toolServers", Report.clip(servers))
-                report.note("settings keys", settings.objectValue?.keys.sorted().joined(separator: ", ") ?? "not an object")
-            } catch { report.note("/users/user/settings", "✗ \(error)") }
+        // ---- 2b. where the tools and servers actually live --------------
+        // Printed straight to stdout with a marker, not buffered into the
+        // report: the point is to be greppable in one command, and the report
+        // dumps at the end so a range pattern over it matches nothing.
+        print("\n=== TOOL SOURCES ===")
+        for path in ["/configs/tool_servers", "/tools/", "/functions/", "/knowledge/"] {
+            print("  \(path)")
+            do { print("    \(Report.clip(try await client.rawJSON(path)))") }
+            catch { print("    ✗ \(error)") }
         }
+        do {
+            let settings = try await client.rawJSON("/users/user/settings")
+            print("  settings.toolServers")
+            print("    \(Report.clip(settings["toolServers"] ?? .null))")
+            print("  settings keys: \(settings.objectValue?.keys.sorted().joined(separator: ", ") ?? "not an object")")
+        } catch { print("  /users/user/settings\n    ✗ \(error)") }
+        print("=== END TOOL SOURCES ===\n")
 
         // ---- 3. models -----------------------------------------------------
         var defaultModel: String?
