@@ -245,23 +245,31 @@ struct MessageRow: View {
                 if editing {
                     editBox
                 } else {
-                    Text(turn.text)
-                        .textSelection(.enabled)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 9)
-                        .background(.tint.opacity(0.18), in: .rect(cornerRadius: 14))
-                        .contextMenu {
-                            // A menu rather than a tap: the bubble's text is
-                            // selectable, and a tap that both selected and
-                            // started editing would make the text impossible to
-                            // copy on a phone.
-                            if onEdit != nil {
-                                Button {
-                                    draft = turn.text
-                                    editing = true
-                                } label: { Label("Edit", systemImage: "pencil") }
+                    HStack(alignment: .bottom, spacing: 6) {
+                        Text(turn.text)
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 9)
+                            .background(.tint.opacity(0.18), in: .rect(cornerRadius: 14))
+                        if onEdit != nil {
+                            // A visible button rather than a long-press menu:
+                            // `.textSelection(.enabled)` owns the long-press on
+                            // this text, so a context menu here mostly did not
+                            // open — which is why "edit doesn't work".
+                            Button {
+                                draft = turn.text
+                                editing = true
+                            } label: {
+                                Image(systemName: "pencil.line")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                                    .padding(6)
+                                    .contentShape(Rectangle())
                             }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Edit message")
                         }
+                    }
                 }
                 if let sibling { siblingPager(sibling) }
             }
@@ -428,6 +436,31 @@ struct MarkdownBlockView: View {
                 .font(.body)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
+        case let .heading(level, text):
+            Text(Self.attributed(text))
+                .font(level <= 1 ? .title2.bold() : (level == 2 ? .title3.bold() : .headline))
+                .padding(.top, level <= 2 ? 8 : 4)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case let .bullet(text):
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("•").foregroundStyle(.secondary)
+                Text(Self.attributed(text))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        case let .numbered(index, text):
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("\(index).").foregroundStyle(.secondary).monospacedDigit()
+                Text(Self.attributed(text))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        case let .quote(text):
+            HStack(alignment: .top, spacing: 9) {
+                Rectangle().frame(width: 3).foregroundStyle(.quaternary)
+                Text(Self.attributed(text))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         case let .code(language, code):
             CodeBlockView(language: language, code: code, streaming: streaming)
         }

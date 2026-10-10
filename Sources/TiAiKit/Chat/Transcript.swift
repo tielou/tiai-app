@@ -91,6 +91,10 @@ public struct Turn: Identifiable, Equatable, Sendable {
 /// does, rather than flickering between prose and code as tokens arrive.
 public enum MarkdownBlock: Equatable, Sendable {
     case prose(String)
+    case heading(level: Int, text: String)
+    case bullet(text: String)
+    case numbered(index: Int, text: String)
+    case quote(text: String)
     case code(language: String?, code: String)
 }
 
@@ -107,8 +111,6 @@ public enum Markdown {
     }
 
     public static func blocks(_ source: String) -> [MarkdownBlock] {
-        guard source.contains("```") else { return source.isEmpty ? [] : [.prose(source)] }
-
         var blocks: [MarkdownBlock] = []
         var prose: [String] = []
         var code: [String] = []
@@ -146,9 +148,42 @@ public enum Markdown {
                 }
                 continue
             }
-            if inFence { code.append(line) } else { prose.append(line) }
+            if inFence { code.append(line) }
+            else if let block = classify(line) {
+                flushProse()
+                blocks.append(block)
+            } else { prose.append(line) }
         }
         if inFence { flushCode(terminated: false) } else { flushProse() }
         return blocks
+    }
+
+    /// A line that starts a block of its own, or nil when it is prose.
+    ///
+    /// The inline-only markdown parser Apple provides cannot do headings or
+    /// lists, and switching to the full parser reflows newlines — which shreds a
+    /// pasted stack trace. So block structure is recognised here, one line at a
+    /// time, and the inline parser still owns bold, italic and code within a line.
+    /// Before this, `## Key Facts` arrived on screen as `## Key Facts`.
+    public static func classify(_ line: String) -> MarkdownBlock? {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+
+        let hashes = trimmed.prefix(while: { $0 == "#" }).count
+        // The space is required: `#hashtag` is a hashtag, not a title.
+        if hashes > 0, hashes <= 6, trimmed.dropFirst(hashes).hasPrefix(" ") {
+            return .heading(level: hashes, text: String(trimmed.dropFirst(hashes + 1)))
+        }
+        if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || trimmed.hasPrefix("+ ") {
+            return .bullet(text: String(trimmed.dropFirst(2)))
+        }
+        if trimmed.hasPrefix("> ") { return .quote(text: String(trimmed.dropFirst(2))) }
+        // `12. deal with it` — digits, a dot, a space.
+        let digits = trimmed.prefix(while: { $0.isNumber })
+        if !digits.isEmpty, digits.count <= 3, trimmed.dropFirst(digits.count).hasPrefix(". ") {
+            return .numbered(
+                index: Int(digits) ?? 1, text: String(trimmed.dropFirst(digits.count + 2)))
+        }
+        return nil
     }
 }

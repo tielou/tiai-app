@@ -423,7 +423,10 @@ public struct OWUIClient: Sendable {
             "message_id": .string(messageID),
         ]
         let data = (try? JSONEncoder().encode(body)) ?? Data("{}".utf8)
-        let _: JSONValue = try await request("POST", "/feedback", bodyData: data)
+        // Under /evaluations, not at the API root: the feedback routes are
+        // mounted on the evaluations router (`/api/v1/evaluations/feedback`).
+        // Posting to /feedback returns 404 and the thumb silently does nothing.
+        let _: JSONValue = try await request("POST", "/evaluations/feedback", bodyData: data)
     }
 
     // MARK: - memories

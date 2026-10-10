@@ -800,7 +800,7 @@ enum AskUserFixture {
         hub: hub)
     conversation.rate(messageID: "assistant-2", rating: 1)
     try await Task.sleep(for: .milliseconds(150))
-    #expect(transport.paths.contains("/api/v1/feedback"))
+    #expect(transport.paths.contains("/api/v1/evaluations/feedback"))
     #expect(conversation.ratings["assistant-2"] == 1)
     // Tapping the same thumb again clears it locally without another request.
     conversation.rate(messageID: "assistant-2", rating: 1)
@@ -838,4 +838,32 @@ enum AskUserFixture {
     // Past the end is a no-op rather than a crash or a blank transcript.
     conversation.selectSibling(of: "user-1", direction: -1)
     #expect(conversation.turns.last?.text == "first")
+}
+
+@Test func blockLevelMarkdownIsRecognised() {
+    // The inline-only parser Apple gives us cannot do headings or lists, and the
+    // full one reflows newlines and shreds stack traces — so block structure is
+    // detected per line. Before this, `## Key Facts` rendered as `## Key Facts`.
+    #expect(Markdown.classify("## Key Facts") == .heading(level: 2, text: "Key Facts"))
+    #expect(Markdown.classify("# Title") == .heading(level: 1, text: "Title"))
+    #expect(Markdown.classify("- an item") == .bullet(text: "an item"))
+    #expect(Markdown.classify("* also an item") == .bullet(text: "also an item"))
+    #expect(Markdown.classify("3. third") == .numbered(index: 3, text: "third"))
+    #expect(Markdown.classify("> quoted") == .quote(text: "quoted"))
+    // Not headings: a hashtag, and hashes without the space.
+    #expect(Markdown.classify("#hashtag") == nil)
+    #expect(Markdown.classify("####### seven is not a heading") == nil)
+    // A date or a version number is not a list item either.
+    #expect(Markdown.classify("2024. was a year") == nil)
+    #expect(Markdown.classify("plain prose") == nil)
+
+    let blocks = Markdown.blocks("Before\n## Key Facts\n- one\n- two\nAfter")
+    #expect(blocks == [
+        .prose("Before"), .heading(level: 2, text: "Key Facts"),
+        .bullet(text: "one"), .bullet(text: "two"), .prose("After"),
+    ])
+    // Inside a fence nothing is a heading.
+    #expect(Markdown.blocks("```\n## not a heading\n```") == [
+        .code(language: nil, code: "## not a heading")
+    ])
 }

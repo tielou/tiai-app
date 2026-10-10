@@ -1,6 +1,9 @@
 import PhotosUI
 import SwiftUI
 #if os(iOS)
+import UniformTypeIdentifiers
+#endif
+#if os(iOS)
 import UIKit
 #endif
 
@@ -88,11 +91,16 @@ struct ComposerView: View {
         .onChange(of: photoItems) { _, items in
             Task {
                 for item in items {
-                    guard let data = try? await item.loadTransferable(type: Data.self) else { continue }
-                    conversation.attach(
-                        data: data,
-                        name: (item.itemIdentifier ?? "photo").replacingOccurrences(of: "/", with: "-") + ".jpg",
-                        mimeType: "image/jpeg")
+                    let name = (item.itemIdentifier ?? "photo")
+                        .replacingOccurrences(of: "/", with: "-") + ".jpg"
+                    if let data = await photoData(item) {
+                        conversation.attach(data: data, name: name, mimeType: "image/jpeg")
+                    } else {
+                        // Said out loud rather than skipped: a photo that
+                        // vanished with no explanation reads as the app being
+                        // broken, and the user cannot tell it from a network fault.
+                        conversation.attachmentFailed(name)
+                    }
                 }
                 photoItems = []
             }
@@ -106,6 +114,34 @@ struct ComposerView: View {
             if case let .success(urls) = result { urls.forEach(importFile) }
         }
     }
+
+#if os(iOS)
+    /// Bytes for a picked photo.
+    ///
+    /// Plain `Data` comes back nil for a lot of photos people actually take —
+    /// HEIC especially — so the item is re-encoded through UIImage as a second
+    /// attempt. Without that the picker closed, nothing was attached, and
+    /// nothing said why.
+    private func photoData(_ item: PhotosPickerItem) async -> Data? {
+        if let data = try? await item.loadTransferable(type: Data.self),
+            let jpeg = Self.jpeg(from: data) { return jpeg }
+        if let bytes = try? await item.loadTransferable(type: ImageBytes.self),
+            let jpeg = Self.jpeg(from: bytes.data) { return jpeg }
+        return nil
+    }
+
+    /// Decodes whatever container the photo is in and re-encodes it as JPEG.
+    ///
+    /// HEIC is the default on iPhones, and a gateway fronting a model is not
+    /// promised to read it. ImageIO decodes HEIC fine, so the app normalises on
+    /// the way out rather than hoping the server copes.
+    private static func jpeg(from data: Data) -> Data? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+            let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        return UIImage(cgImage: image).jpegData(compressionQuality: 0.9)
+    }
+
+#endif
 
     /// Opens a picker after the `+` sheet has finished closing. Presenting during
     /// the dismiss animation is silently ignored, which looks like a dead button.
@@ -334,12 +370,15 @@ struct AddToChatSheet: View {
                     conversation.tools.removeAll { $0 == tool.id }
                     return
                 }
+                // An unauthenticated server cannot serve anything, so switching
+                // it on starts the sign-in instead of pretending it is enabled.
+                // Before this the row went green while the tool was still dead,
+                // and the chat quietly had no tool at all.
+                if let url = tool.authorizeURL(base: conversation.serverURL) {
+                    onAuthorize(url)
+                    return
+                }
                 conversation.tools.append(tool.id)
-                // The same move the web client makes: an OAuth server that has
-                // not been signed into cannot serve anything. It happens in an
-                // in-app browser rather than Safari, because the authorize page
-                // needs Open WebUI's session and Safari on a phone rarely has it.
-                if let url = tool.authorizeURL(base: conversation.serverURL) { onAuthorize(url) }
             })
     }
 
@@ -500,3 +539,15 @@ enum MIME {
         }
     }
 }
+
+#if os(iOS)
+/// Gallery bytes read by content type rather than by file extension, so a HEIC
+/// photo is still accepted where a `.jpeg`-only representation would fail.
+private struct ImageBytes: Transferable {
+    let data: Data
+
+    static var transferRepresentation: some TransferRepresentation {
+        DataRepresentation(importedContentType: .image) { ImageBytes(data: $0) }
+    }
+}
+#endif

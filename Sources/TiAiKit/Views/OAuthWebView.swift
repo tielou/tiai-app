@@ -52,6 +52,7 @@ private struct SessionBrowser: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> WebController {
         let web = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
         web.navigationDelegate = context.coordinator
+        web.uiDelegate = context.coordinator
         let controller = WebController(web: web)
         let cookie = HTTPCookie(properties: [
             .domain: domain,
@@ -103,7 +104,7 @@ private struct SessionBrowser: UIViewControllerRepresentable {
         }
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         private let onCallback: () -> Void
         init(onCallback: @escaping () -> Void) { self.onCallback = onCallback }
 
@@ -112,6 +113,22 @@ private struct SessionBrowser: UIViewControllerRepresentable {
             // server exchange the code for a token. Cancelling the navigation to
             // close earlier would end the dance one step short of it working.
             if webView.url?.path.contains("/callback") == true { onCallback() }
+        }
+
+        /// Identity providers love opening their login in a new window. A
+        /// `WKWebView` with no UI delegate silently drops that request, which
+        /// looks exactly like a login button that does nothing — so the request
+        /// is loaded in the window the user can already see.
+        func webView(
+            _ webView: WKWebView,
+            createWebViewWith configuration: WKWebViewConfiguration,
+            for navigationAction: WKNavigationAction,
+            windowFeatures: WKWindowFeatures
+        ) -> WKWebView? {
+            if navigationAction.targetFrame?.isMainFrame != true {
+                webView.load(navigationAction.request)
+            }
+            return nil
         }
     }
 }
