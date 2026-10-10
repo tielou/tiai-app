@@ -289,8 +289,31 @@ public final class ConversationModel {
         else { return }
         let next = kids.index(at, offsetBy: direction)
         guard kids.indices.contains(next) else { return }
-        leafID = kids[next]
-        turns = ChatMessage.tree(from: detail.messages, currentID: kids[next]).map(Turn.init)
+        // Walk to the end of the branch, not just to the sibling itself.
+        //
+        // Stopping at the sibling dropped everything below it: paging back to an
+        // older answer made the rest of the conversation — including any picture
+        // attached after it — vanish, which looked like data loss rather than
+        // paging.
+        let target = leaf(below: kids[next])
+        leafID = target
+        turns = ChatMessage.tree(from: detail.messages, currentID: target).map(Turn.init)
+    }
+
+    /// The last message below `id`, following the newest child at each step.
+    ///
+    /// The server lists at least one message as its own child, so the walk
+    /// refuses to revisit anything it has already stood on.
+    private func leaf(below id: String) -> String {
+        guard let detail else { return id }
+        var cursor = id
+        var seen: Set<String> = [id]
+        while let node = detail.messages[cursor],
+            let next = node.childrenIDs.last(where: { !seen.contains($0) }) {
+            seen.insert(next)
+            cursor = next
+        }
+        return cursor
     }
 
     /// The child of `messageID` that leads to the message the branch ends on.
@@ -565,6 +588,11 @@ public final class ConversationModel {
             }
         }
         return outcome
+    }
+
+    /// Bytes of a file attached to a message, fetched with the app's token.
+    public func fileData(id: String) async -> Data? {
+        try? await client.fileContent(id: id)
     }
 
     // MARK: - tool calls

@@ -35,6 +35,8 @@ public struct Turn: Identifiable, Equatable, Sendable {
     public var calls: [ToolCall]
     /// What the answer cites, in the order the server listed them.
     public var sources: [MessageSource]
+    /// Files the user attached. Images are drawn inline; anything else is a chip.
+    public var attachments: [MessageAttachment]
     public var createdAt: Date
 
     public init(
@@ -48,6 +50,7 @@ public struct Turn: Identifiable, Equatable, Sendable {
         usage: TokenUsage? = nil,
         calls: [ToolCall] = [],
         sources: [MessageSource] = [],
+        attachments: [MessageAttachment] = [],
         createdAt: Date = .now
     ) {
         self.id = id
@@ -60,6 +63,7 @@ public struct Turn: Identifiable, Equatable, Sendable {
         self.usage = usage
         self.calls = calls
         self.sources = sources
+        self.attachments = attachments
         self.createdAt = createdAt
     }
 
@@ -89,6 +93,7 @@ public struct Turn: Identifiable, Equatable, Sendable {
         usage = message.usage
         calls = message.toolCalls
         sources = message.citedSources
+        attachments = message.messageAttachments
         createdAt = message.timestamp ?? .now
     }
 }

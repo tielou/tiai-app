@@ -53,8 +53,27 @@ public struct OWUIClient: Sendable {
         guard let http = response as? HTTPURLResponse else {
             throw APIError.unreachable("response was not HTTP")
         }
+        #if DEBUG
+        Self.dump(url: url, method: method, data: data)
+        #endif
         return (data, http)
     }
+
+    #if DEBUG
+    /// DEBUG-only: writes each response body to a directory so the real payload
+    /// can be read back without anyone pasting a token into a terminal.
+    ///
+    /// Set it with `xcrun simctl launch --setenv TIAI_DEBUG_DUMP=/tmp/tiai-dump`;
+    /// the path lands inside the device container, which is readable from the
+    /// Mac. This exists because guessing at a server's payload from a screenshot
+    /// is how wrong assumptions get shipped — see the notes on `sources`.
+    static func dump(url: URL, method: String, data: Data) {
+        guard let dir = ProcessInfo.processInfo.environment["TIAI_DEBUG_DUMP"] else { return }
+        let name = "\(method)_" + url.path.replacingOccurrences(of: "/", with: "_")
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try? data.write(to: URL(fileURLWithPath: dir).appendingPathComponent(name + ".json"))
+    }
+    #endif
 
     private func request<T: Decodable>(
         _ method: String, _ path: String, query: [String: String] = [:],
@@ -468,6 +487,22 @@ public struct OWUIClient: Sendable {
             "POST", server.api("/files/"),
             bodyData: body, contentType: "multipart/form-data; boundary=\(boundary)", timeout: 120)
         return try Self.validate(payload, http, as: FileRecord.self)
+    }
+
+    /// Raw bytes of an uploaded file.
+    ///
+    /// `AsyncImage` cannot be used here: the route is behind the bearer token,
+    /// and a plain URL handed to it comes back 401 — which is also why a picture
+    /// attached in the web UI never appeared in this app. The app fetches the
+    /// bytes itself and hands over an image.
+    public func fileContent(id: String) async throws -> Data {
+        let (data, http) = try await perform(
+            "GET", server.api("/files/\(id)/content"), bodyData: nil, timeout: 60)
+        switch http.statusCode {
+        case 200..<300: return data
+        case 401: throw APIError.unauthorized
+        default: throw APIError.http(status: http.statusCode, message: "\(http.statusCode)")
+        }
     }
 }
 

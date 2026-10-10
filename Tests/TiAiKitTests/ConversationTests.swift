@@ -892,3 +892,36 @@ enum AskUserFixture {
     #expect(sources[2].name == "notes.pdf")
     #expect(sources[2].url == nil)
 }
+
+@Test @MainActor func pagingToAnOlderAnswerKeepsEverythingBelowIt() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    // The older answer is not the end of the story: a follow-up message and its
+    // answer hang below it. Paging to that answer used to stop at the answer,
+    // so the rest of the branch — a pasted screenshot and its reply, say —
+    // disappeared, which reads as the app having deleted something.
+    transport.chatDetailOverride = Data(
+        """
+        {"id":"chat-1","title":"T","updated_at":1,"created_at":1,"chat":{"models":["local-personal"],
+         "history":{"currentId":"a2","messages":{
+           "u1":{"id":"u1","role":"user","content":"hi","childrenIds":["a1","a2"]},
+           "a1":{"id":"a1","role":"assistant","content":"first","parentId":"u1","childrenIds":["u2"]},
+           "u2":{"id":"u2","role":"user","content":"and this?","parentId":"a1","childrenIds":["a3"]},
+           "a3":{"id":"a3","role":"assistant","content":"third","parentId":"u2"},
+           "a2":{"id":"a2","role":"assistant","content":"second","parentId":"u1"}}}}}
+        """.utf8)
+    let conversation = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(
+            server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"),
+            transport: transport),
+        hub: hub)
+    await conversation.load()
+    #expect(conversation.turns.map(\.id) == ["u1", "a2"])
+
+    conversation.selectSibling(of: "u1", direction: -1)
+    #expect(conversation.turns.map(\.id) == ["u1", "a1", "u2", "a3"])
+    conversation.selectSibling(of: "u1", direction: 1)
+    #expect(conversation.turns.map(\.id) == ["u1", "a2"])
+}

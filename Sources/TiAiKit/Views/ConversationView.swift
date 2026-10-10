@@ -133,7 +133,8 @@ public struct ConversationView: View {
                                 ? { conversation.rate(messageID: turn.id, rating: $0) } : nil,
                             rating: conversation.ratings[turn.id],
                             sibling: conversation.siblingPage(of: turn.id),
-                            onSibling: { conversation.selectSibling(of: turn.id, direction: $0) }
+                            onSibling: { conversation.selectSibling(of: turn.id, direction: $0) },
+                            fileLoader: { await conversation.fileData(id: $0) }
                         )
                             .id(turn.id)
                     }
@@ -235,6 +236,9 @@ struct MessageRow: View {
     /// Which sibling answer this branch is on, when there is more than one.
     var sibling: (index: Int, total: Int)? = nil
     var onSibling: ((Int) -> Void)? = nil
+    /// Loads the bytes of an attached file. The file route needs the bearer
+    /// token, so this cannot be an `AsyncImage` with a URL.
+    var fileLoader: ((String) async -> Data?)? = nil
 
     @State private var editing = false
     @State private var draft = ""
@@ -242,16 +246,35 @@ struct MessageRow: View {
     var body: some View {
         if turn.isUser {
             VStack(alignment: .trailing, spacing: 5) {
+                if !turn.attachments.isEmpty {
+                    ForEach(turn.attachments) { attachment in
+                        if attachment.isImage, let fileLoader {
+                            RemoteImageView(id: attachment.id, load: fileLoader)
+                        } else {
+                            Label(attachment.name, systemImage: "paperclip")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 5)
+                                .background(.quaternary.opacity(0.5), in: .capsule)
+                        }
+                    }
+                }
                 if editing {
                     editBox
                 } else {
                     HStack(alignment: .bottom, spacing: 6) {
-                        Text(turn.text)
-                            .textSelection(.enabled)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 9)
-                            .background(.tint.opacity(0.18), in: .rect(cornerRadius: 14))
-                        if onEdit != nil {
+                        // A message can be nothing but a picture, and an empty
+                        // bubble with a pencil floating next to it looks like a
+                        // rendering bug rather than an attachment.
+                        if !turn.text.isEmpty {
+                            Text(turn.text)
+                                .textSelection(.enabled)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 9)
+                                .background(.tint.opacity(0.18), in: .rect(cornerRadius: 14))
+                        }
+                        if onEdit != nil, !turn.text.isEmpty {
                             // A visible button rather than a long-press menu:
                             // `.textSelection(.enabled)` owns the long-press on
                             // this text, so a context menu here mostly did not
@@ -304,6 +327,7 @@ struct MessageRow: View {
                         .font(.callout)
                         .foregroundStyle(.red)
                 }
+                if !turn.sources.isEmpty { sources }
                 footer
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -375,6 +399,44 @@ struct MessageRow: View {
         }
         .buttonStyle(.plain)
         .accessibilityElement(children: .contain)
+    }
+
+    /// What the answer cites, numbered to match the `[1]` markers in the text.
+    ///
+    /// Collapsed by default: a search that returned twelve pages produces a list
+    /// longer than the answer, and the people who want it are the ones looking
+    /// for it. Without this the citation markers point at nothing.
+    private var sources: some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(turn.sources.enumerated()), id: \.element.id) { number, source in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("\(number + 1).")
+                            .foregroundStyle(.tertiary)
+                            .monospacedDigit()
+                        if let string = source.url, let url = URL(string: string) {
+                            Link(destination: url) {
+                                Text(source.name)
+                                    .foregroundStyle(.tint)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        } else {
+                            Text(source.name)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+            }
+            .font(.footnote)
+            .padding(.top, 6)
+        } label: {
+            Label("Source\(turn.sources.count == 1 ? "" : "s") (\(turn.sources.count))",
+                  systemImage: "text.page")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .tint(.secondary)
     }
 
     /// Thumbs up and down. Quiet by design: the answer is the point, and a
@@ -839,5 +901,60 @@ extension ToolCall {
         }
         flush()
         return out
+    }
+}
+
+/// A picture attached to a message, fetched with the app's own token.
+///
+/// `AsyncImage` is not an option: `/files/{id}/content` is behind the bearer
+/// token, and handing it a bare URL produced a 401 and an empty gap — which is
+/// how a photo attached in the web UI ended up invisible on the phone.
+struct RemoteImageView: View {
+    let id: String
+    let load: (String) async -> Data?
+
+    #if os(iOS)
+    @State private var image: UIImage?
+    #endif
+    @State private var failed = false
+    @State private var loading = true
+
+    var body: some View {
+        ZStack {
+            if loading {
+                RoundedRectangle(cornerRadius: 12).fill(.quaternary.opacity(0.4))
+                ProgressView()
+            } else if failed {
+                RoundedRectangle(cornerRadius: 12).fill(.quaternary.opacity(0.4))
+                Label("Image unavailable", systemImage: "photo")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                #if os(iOS)
+                if let image {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(maxWidth: 220, maxHeight: 260)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                }
+                #endif
+            }
+        }
+        .frame(maxWidth: 220, maxHeight: 260, alignment: .trailing)
+        .task(id: id) {
+            #if os(iOS)
+            guard image == nil else { return }
+            guard let data = await load(id), let loaded = UIImage(data: data) else {
+                failed = true
+                loading = false
+                return
+            }
+            image = loaded
+            loading = false
+            #else
+            loading = false
+            #endif
+        }
     }
 }

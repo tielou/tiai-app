@@ -1,0 +1,152 @@
+{
+ "id": "e2280f7f-72f7-480e-93b6-c080a1530440",
+ "title": "Search the web: what is the top news hea",
+ "chat": {
+  "history": {
+   "currentId": "4A56A16A-03F7-4EAC-8E24-EC316FDB5E61",
+   "messages": {
+    "4A56A16A-03F7-4EAC-8E24-EC316FDB5E61": {
+     "id": "4A56A16A-03F7-4EAC-8E24-EC316FDB5E61",
+     "parentId": "767B32B0-F455-460C-8588-4CE1767702D3",
+     "childrenIds": [
+      "867b92bb-8e9a-412d-b8de-c911c272fb36"
+     ],
+     "role": "assistant",
+     "content": "Based on a live fetch of rbb24 (Berlin's regional public broadcaster), the top news headline in Berlin right now is:\n\n**\"Sondierung in Berlin: Brandenburger Parteien zwischen Ablehnung und Zuversicht\"** \u2014 Brandenburg's parties are reacting with a mix of rejection and optimism to the coalition exploratory talks (Sondierungen) in Berlin. The SPD and CDU in Brandenburg are watching the government formation skeptically, warning against Left Party participation over its stance on antisemitism, and also raising concerns about utility remunicipalization (Vergesellschaftung).\n\nThis ties into the bigger ongoing story: **Linke, Gr\u00fcne und SPD (rot-gr\u00fcn-rot) have agreed on a joint approach to antisemitism and are starting formal coalition exploratory talks** \u2014 though there's already internal criticism of that agreement from within the Left Party.\n\nOther top stories on rbb24 right now:\n- A woman was killed by a truck in Berlin-Wedding; the driver fled the scene\n- Several thousand people demonstrated against the energy reform law (EEG)\n- Shooting in Sch\u00f6neberg \u2014 two people injured\n- The western Ringbahn S-Bahn line is closed this weekend\n- The Eisb\u00e4ren Berlin became new DEL leaders after a 5:0 win over Wolfsburg\n\nNote: The rbb24 page itself (source 1 in my context) was fetched live, so these headlines reflect the current state of the site.",
+     "done": true,
+     "model": "local-personal",
+     "timestamp": 1791627450,
+     "sources": [
+      {
+       "source": {
+        "name": "https://www.rbb24.de/berlin/",
+        "id": "https://www.rbb24.de/berlin/"
+       },
+       "document": [
+        "\n\n\n\nBerlin Nachrichten \u2013 Aktuelle News und Themen von rbb24.de\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
+       ],
+       "metadata": [
+        {
+         "source": "https://www.rbb24.de/berlin/",
+         "name": "https://www.rbb24.de/berlin/",
+         "url": "https://www.rbb24.de/berlin/"
+        }
+       ]
+      }
+     ],
+     "output": [
+      {
+       "type": "reasoning",
+       "id": "r_b1809d9558104e31964f5f2e",
+       "status": "completed",
+       "start_tag": "<think>",
+       "end_tag": "</think>",
+       "attributes": {
+        "type": "reasoning_content"
+       },
+       "content": [
+        {
+         "type": "output_text",
+         "text": "I'll search for Berlin news."
+        }
+       ],
+       "summary": null,
+       "started_at": 1791627450.8494406
+      },
+      {
+       "type": "function_call",
+       "id": "call_bfdf70cba7654a4289f3102b",
+       "call_id": "call_bfdf70cba7654a4289f3102b",
+       "name": "search_web",
+       "arguments": "{\"query\": \"Berlin news top headline today\"}",
+       "status": "completed"
+      },
+      {
+       "type": "function_call_output",
+       "id": "fco_25a62dd6ac6843a6aa99c34b",
+       "call_id": "call_bfdf70cba7654a4289f3102b",
+       "output": [
+        {
+         "type": "input_text",
+         "text": "[{\"title\": \"Aktuelle News aus Berlin und Brandenburg - Tagesspiegel\", \"link\": \"https://www.tagesspiegel.de/berlin/\", \"snippet\": \"Berlin Nachrichten: Aktuelle News und Meldungen aus Berlin. Kommentare, Interviews und Hintergr\u00fcnde aus den Berliner Bezirken zu Politik und Wirtschaft.\"}, {\"title\": \"Berlin Nachrichten \u2013 Aktuelle News und Themen von rbb24.de\", \"link\": \"https://www.rbb24.de/berlin/\", \"snippet\": \"Icon Best of Best of \u00b7 Icon Video Video. Icon Suche Suche. rbb24 >. Berlin Nachrichten \u2013 Aktuelle News und Themen von rbb24.de. Start Berlin Brandenburg. Berlin\u00a0...\"}, {\"title\": \"Aktuelles aus Berlin\", \"link\": \"https://www.berlin.de/aktuelles/\", \"snippet\": \"Nachrichten, Lokalnachrichten und Meldungen aus Berlin, Polizeimeldungen und offizielle Pressemeldungen der Landespressestelle des Landes Berlin.\"}, {\"title\": \"Berliner Kurier\", \"link\": \"https://www.berliner-kurier.de/\", \"snippet\": \"Berliner Kurier \u2013 Berlins ehrliche Boulevard-Zeitung.\"}, {\"title\": \"Berliner Morgenpost: Aktuelle Nachrichten aus Berlin und der Welt\", \"link\": \"https://www.morgenpost.de/\", \"snippet\": \"Aktuelle Nachrichten und Hintergr\u00fcnde aus Politik, Wirtschaft und Sport aus Berlin, Deutschland und der Welt.\"}]"
+        }
+       ],
+       "status": "completed"
+      },
+      {
+       "type": "reasoning",
+       "id": "r_0e2b4669752547b785b7d2ab",
+       "status": "completed",
+       "start_tag": "<think>",
+       "end_tag": "</think>",
+       "attributes": {
+        "type": "reasoning_content"
+       },
+       "content": [
+        {
+         "type": "output_text",
+         "text": "I should check one of these sources to find the actual top headline."
+        }
+       ],
+       "summary": null,
+       "started_at": 1791627452.7754076
+      },
+      {
+       "type": "function_call",
+       "id": "call_df79ff5dd5184d95a7e4da6b",
+       "call_id": "call_df79ff5dd5184d95a7e4da6b",
+       "name": "fetch_url",
+       "arguments": "{\"url\": \"https://www.rbb24.de/berlin/\"}",
+       "status": "completed"
+      },
+      {
+       "type": "function_call_output",
+       "id": "fco_e1df8ee4c91d4945ba4332a5",
+       "call_id": "call_df79ff5dd5184d95a7e4da6b",
+       "output": [
+        {
+         "type": "input_text",
+         "text": "\n\n\n\nBerlin Nachrichten \u2013 Aktuelle News und Themen von rbb24.de\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n15\u00a0\u00b0C\n\n\n\n\n\n\n\n\n\n\n\nrbb24 Abendschau\n\n\nrbb24 Brandenburg aktuell\n\n\nrbb24 Inforadio\n\n\n15\u00a0\u00b0C\n\n\n\n\n                        Suche\n                    \n\n\n\nSuchbegriff\n\n\n\n\n\n\n\nWahl \n\n\nBerlin \n\n\nBrandenburg \n\n\nPolitik \n\n\nWirtschaft \n\n\nKultur \n\n\nSport \n\n\nPanorama \n\n\nVerkehr \n\n\n\n\n\nrbb24 Abendschau\n\n\nrbb24 Brandenburg aktuell\n\n\nrbb24 Inforadio\n\n\n\n\n\n\n\n\n\n\n\nThemen, die andere aktuell suchen\n\n\nAbendschau TV-Sendung\nBrandenburg Aktuell TV-Sendung\nSportergebnisse\n\n\n\nSuchbegriff\n\n\n\n\n\n\n\n\n\nStart\n\n\nLive\n\n\nBest of\n\n\nVideo\n\n\n\nSuche\n                            \n\n\n\n\n\n\n\n\n\n\n\n                                    rbb24\n>\nBerlin Nachrichten \u2013 Aktuelle News und Themen von rbb24.de\n\n\n\n\n\n\nStart\nBerlin\nBrandenburg\n\n\n\nBerlin\n\n\n\n\n\n\n\n\nSondierung in Berlin: Brandenburger Parteien zwischen Ablehnung und Zuversicht\n\n\n\n\nFrau wird in Berlin von Lkw angefahren und stirbt \u2013 Fahrer fl\u00fcchtet\n\n\n\n\nMehrere tausend Menschen demonstrieren gegen Energie-Reform \n\n\n\n\nBerliner S-Bahn: Westliche Ringbahn an diesem Wochenende gesperrt \n\n\n\n\nMehrere Menschen bei Auseinandersetzung in Berlin-Tiergarten verletzt\n\n\n\n\n5:0 gegen Wolfsburg: Eisb\u00e4ren Berlin neuer DEL-Spitzenreiter\n\n\n\n\nRegionalliga Nordost: Altglienicke verliert gegen den BFC\n\n\n\n\nSch\u00fcsse in Sch\u00f6neberg \u2013 zwei Personen verletzt\n\n\n\n\nSondierungen zur Regierungsbildung: Widerstand gegen rot-gr\u00fcn-rote Antisemitismus-Vereinbarung\n\n\n\n\nHertha vor F\u00fcrth: Wiesn-Sieger und ein offenes Rennen im Sturm\n\n\n\n\nAlle Schlagzeilen\n\n\n\n\n\nAlle Schlagzeilen\n\n\n\n\n\n\n\nAblehnung, Skepsis und Zuversicht\n\nSo schauen die Brandenburger Parteien auf die Sondierung in Berlin\n\n\n\n\n\n\n\n\n\n\n\n\nDie Brandenburger SPD und CDU beobachten die Koalitionsbildung in Berlin \u00e4u\u00dferst skeptisch. Sie warnen vor einer Regierungsbeteiligung der Linken wegen der aus ihrer Sicht unklaren Haltung beim Thema Antisemitismus. Und dann ist da noch die Vergesellschaftung.\n\n\n\nvon Christoph H\u00f6lscher\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nPolizeieinsatz\n\nSch\u00fcsse in Sch\u00f6neberg \u2013 zwei Personen verletzt\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nSondierungen zur Regierungsbildung \n\nWiderstand gegen rot-gr\u00fcn-rote Antisemitismus-Vereinbarung\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nHertha BSC vor dem Heimspiel gegen F\u00fcrth\n\nDie \"h\u00fcbscheste Mannschaft\" und ein offenes Rennen im Sturm\nDank einer entspannten L\u00e4nderspielpause geht Hertha BSC bester Laune in das Duell gegen Greuther F\u00fcrth. Im Sturm k\u00fcndigt sich ein offenes Rennen an, w\u00e4hrend Trainer Stefan Leitl ganz andere Dinge ins Schw\u00e4rmen bringen.\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBerlin-Wedding\n\nFrau wird von Lkw angefahren und stirbt \u2013 Fahrer fl\u00fcchtet\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nErneuerbare-Energien-Gesetz\n\nMehrere tausend Menschen demonstrieren gegen Energie-Reform \n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBerliner S-Bahn \n\nWestliche Ringbahn an diesem Wochenende gesperrt \n\n\n\n\n\n\n\n\n\n\nFu\u00dfball-Bundesliga\n\nUnion gegen Aufsteiger Elversberg unter Druck: \"Gro\u00dfer Wille\" nach \"guter Pause\"\n\n\n\n\n\n\n\n\n\n\n\n\nNach der L\u00e4nderspielpause trifft der 1. FC Union Berlin am Samstag in der Bundesliga auf die SV Elversberg. Die \"Eisernen\" sind historisch schwach in die Saison gestartet \u2013 und bekommen es nun mit einem formstarken Aufsteiger zu tun. Im Sturm droht der n\u00e4chste Ausfall.\n\n\n\n\n\n\n\nThemen\n\n\n\nBerlin-Wahl 2026\n\n\n\n\nBVG\n\n\n\n\nObdachlose\n\n\n\n\nSerie \"Am Sp\u00e4ti\"\n\n\n\n\nKita\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBerlin-Tiergarten\n\nMehrere Menschen bei Auseinandersetzung verletzt\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nEishockey\n\n5:0 gegen Wolfsburg: Eisb\u00e4ren Berlin neuer DEL-Spitzenreiter\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nInterview\nDeutsche Medaillenhoffnung\n\nVor Tischtennis-EM: Mittelham kritisiert Terminplanung des Weltverbands\nWenn am Sonntag in Slowenien die Tischtennis-Europameisterschaften beginnen, geht Nina Mittelham im Einzel, Doppel und Mixed an den Start. Im Interview spricht die deutsche Medaillenhoffnung vom ttc berlin eastside \u00fcber das Turnier und Kritik am Weltverband.\n\n\n\n\n\n\n\n\nVideos\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBerlin\n\"Festival of Lights\" beleuchtet Berliner Geb\u00e4ude\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nMadame Tussauds\nWeltweit erster Wachs-D\u00f6ner in Berlin\n\n\n\n\n\n\n\n\n\n\n\nBerlin-Westhafen\nSlackliner balancieren \u00fcber Berlin\n\n\n\n\n\n\n\n\n\n\n\nBerliner Sport-Senior\nTreppenlauf mit 93 Jahren\n\n\n\n\n\n\n\n\n\n\n\nBerlin\n\"Festival of Lights\" beleuchtet Berliner Geb\u00e4ude\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nInterview\nAndreas Dresen \u00fcber \"Alte Liebe\"\n\n\"Es lohnt sich, auch bei den \u00c4lteren hinzugucken\"\nAndreas Dresen erz\u00e4hlt in \"Alte Liebe\" von einem Paar, das seit vier Jahrzehnten zusammen ist. Im Interview spricht er \u00fcber Liebe im Alter, Ostbiografien und seine Lust auf Humor.\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nRegionalliga Nordost\n\nAltglienicke verliert gegen den BFC, Luckenwalde siegt bei Chemie\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nVerwaltungsgericht Berlin\n\n\"Europacity\"-Eigent\u00fcmer muss Sozialwohnungen anbieten\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBerlin-Rudow\n\nMehrere Sch\u00fcsse auf Einfamilienhaus abgegeben\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nGrabungen in Berlin\n\n\u00dcberreste der DDR-Grenz\u00fcbergangsstelle am Checkpoint Charlie entdeckt\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nrbb exklusiv\n\nCDU-Kreisvorsitzender in Friedrichshain-Kreuzberg tritt zur\u00fcck\n\n\nvon Sabine M\u00fcller\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nLichtinstallationen\n\nFestival of Lights startet in Berlin\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nWiederer\u00f6ffnung 2028 geplant\n\nSommerbad Spandau S\u00fcd wird ab Mitte Oktober saniert\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n40:32-Sieg in der Champions League\n\n\u00dcberragender F\u00fcchse-Star Mathias Gidsel feiert Torrekord gegen Porto\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nZweifel an Tragf\u00e4higkeit\n\nSpreeausgang am Bahnhof Jannowitzbr\u00fccke gesperrt\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nWachsfigurenkabinett\n\nMadame Tussauds stellt D\u00f6ner aus Wachs vor \n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nErmittlungen wegen schwerer Brandstiftung\n\nUnbekannte werfen Pyrotechnik in Neuk\u00f6llner Wohnung\n\n\n\n\n\n\n\n\n\n\nAusstellung\nChristoph Schlingensief im Gropius Bau\n\nNicht mehr sein Problem\n\n\n\n\n\n\n\n\n\n\n\n\nEine Partei gr\u00fcnden, eine Kirche bauen und Nazis Shakespeare inszenieren lassen? Bei Schlingensief war alles m\u00f6glich. 16 Jahre nach seinem Tod zeigt der Gropius Bau einige wichtige Installationen.\n\n\n\nvon Julia Sie-Yong Fischer\n\n\n\n\n\n\n\n\n\n\n\nStreitthema unter Fu\u00dfball-Fans\n\nHertha BSC verbietet kommerzielle Stadion-Vlogs im Olympiastadion\n\n\n\n\n\n\n\n\n\n\nGedenkort im Tiergarten\n\nVier Besch\u00e4digungen in f\u00fcnf Wochen - CSD-Bank als Schauplatz eines \"Kulturkampfes\" \n\n\nvon Hari Sas\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nAnalyse\nSondierungsgespr\u00e4che \n\nDie rot-gr\u00fcn-rote Theorie steht, jetzt kommt der Praxis-Test \nLinke, Gr\u00fcne und SPD in Berlin haben sich auf eine gemeinsame Linie im Umgang mit Antisemitismus verst\u00e4ndigt und starten Sondierungsgespr\u00e4che. Aus der Linkspartei kommt bereits Kritik an der Vereinbarung.\n\n\n\nvon Sabine M\u00fcller\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nAntisemitismus-Papier \n\nLinke, Gr\u00fcne und SPD einigen sich auf Sondierungsgespr\u00e4che\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nJahrestag des 7. Oktober in Berlin\n\nGedenken an Opfer der Hamas-Anschl\u00e4ge - Pal\u00e4stina-Demo aufgel\u00f6st\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nFahrplanwechsel im Dezember\n\nVBB schickt mehr Regios auf die Schiene - und reduziert bei der S-Bahn\nStundentakt, l\u00e4ngere Z\u00fcge, aber auch Einschr\u00e4nkungen: Zum Fahrplanwechsel \u00e4ndern sich auf vielen Regional- und S-Bahn-Linien die Verbindungen. Die wichtigsten Neuerungen im \u00dcberblick.\n\n\n\n\n\n\n\nWeitere Meldungen\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBeschluss der Netzagentur rechtswidrig\n\nBahn klagt erfolgreich gegen Vorgaben beim Wettbewerb im Fernverkehr\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nProvokant und einflussreich\n\nBringt der Bezirksverband Neuk\u00f6lln die Berliner Linke ins Stolpern?\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nTheater\n\"Stereophonic\" an der Schaub\u00fchne\n\nSex, Drugs, Gr\u00f6\u00dfenwahn\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nKonzert\nJ. Cole in der Uber Arena\n\nRap-Star mit Heimweh\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nStadion-Vlogger im Fu\u00dfball\n\nZwischen Kurve und Kommerz\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBausch\u00e4den\n\nA100: Rudolf-Wissell-Br\u00fccke muss nicht komplett gesperrt werden\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nRoute und Zeitplan\n\nSo plant die BVG ihre neue Stra\u00dfenbahn-Linie M20 in Berlin\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nHerausforderung f\u00fcr Buchhandel\n\nLiteraturnobelpreis entscheidet, wen wir sofort lesen wollen\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nRegierungsbildung in Berlin\n\nLinke, Gr\u00fcne und SPD beenden Vorgespr\u00e4che zu Sondierungen ohne Ergebnis\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nOlympiapark in Berlin\n\nRobbie Williams spielt 2027 auf dem Lollapalooza-Festival\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nHochschule HWR in Lichtenberg\n\nDurchsuchung bei Tatverd\u00e4chtigem nach Fund von Kameras auf Frauentoilette\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n16-j\u00e4hriger Berliner Arminius Rolle\n\nEin Box-Talent, das eigentlich nie boxen sollte\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nVerkehrseinschr\u00e4nkung\n\nTiergartentunnel wegen Personalmangels nur vormittags ge\u00f6ffnet\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nInterview\nHistoriker Gil Shohat zum 7. Oktober\n\n\"Ich sehe mit Schrecken, wie das die Polarisierung hier vorangetrieben hat\"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBerlin und Brandenburg\n\nGedenken an Opfer des Hamas-Angriffs - Polizei sichert Veranstaltungen\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBerlin-Neuk\u00f6lln\n\nSechsj\u00e4hriges M\u00e4dchen f\u00e4llt aus drittem Stock \u2013 Mann f\u00e4ngt es auf\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nSportlicher Erfolg im Alter\n\nHertha-Spieler gibt Nationalmannschafts-Deb\u00fct bei der \u00dc80-WM in Australien\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nSchul-AG gegen rechte Propaganda\n\nMit dem Schaber gegen rechtsextreme Sticker\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nAnalyse\nComeback des St\u00fcrmers\n\nWarum Andrej Ilic dem 1. FC Union so schmerzlich fehlt\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nSelbstst\u00e4ndige ohne Mutterschutz\n\nHochschwanger auf der Baustelle\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nTurm am Alexanderplatz\n\nNeuer Investor steigt bei Monarch-Hochhausprojekt in Berlin ein\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nStudie\n\nBrandenburg \u00fcberholt Berlin in Sachen Zukunftsf\u00e4higkeit\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nInterview\nInnenverteidiger Leopold Querfeld\n\n\"Jeder muss sich selbst ein bisschen in den Hintergrund stellen\"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nNach F\u00f6rdermittelaff\u00e4re\n\nSenat l\u00e4sst im Kampf gegen Antisemitismus erneut Millionen liegen\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nFAQ\nModus, Gegner, \u00dcbertragung\n\nAlba Berlin vor Champions League: \"Kein \u00dcberperformer in der Gruppe\"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nDurchsuchungen in Berlin\n\nEx-BND-Chef August Hanning wegen Spionage-Verdachts festgenommen\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nDeges zu A100-Br\u00fcckensanierungen\n\nRingbahn- und Westendbr\u00fccke sollen Sommer 2027 in Betrieb gehen\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nKonzert\nCourtney Barnett im Huxleys\n\nSo aufregend normal\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nSuche nach Stadtr\u00e4ten\n\nCDU in Marzahn-Hellersdorf schlie\u00dft Wahl von AfD-Kandidaten nicht aus\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nInterview\nBerliner Nobelpreistr\u00e4ger\n\n\"Nat\u00fcrlich hat niemand gedacht, dass die Alge es mal so weit bringen wird\"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nViel Verkehr, wenig B\u00e4ume\n\nDie chaotische Gegenwart \u2013 und graue Zukunft? \u2013 des Checkpoint Charlie\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nAuszeichnung\n\nDeutscher Buchpreis geht an Shida Bazyar\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nPeter Hegemann\n\nMedizin-Nobelpreis geht auch an Forscher der Humboldt-Universit\u00e4t Berlin\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nFu\u00dfball\n\nAnsichtssache Scherhant\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nInterview\nLara Schifferdecker von den Berlin Kobra Ladies\n\nWarum Nationalspielerinnen im Football sogar Geld bezahlen m\u00fcssen\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nMutma\u00dfliche Brandstiftung\n\nStaatsschutz ermittelt nach Feuer an Stromkabeln in Marzahn\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nInterview\nTag der Epilepsie\n\n\"Alle Menschen k\u00f6nnen theoretisch Epilepsie bekommen\"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nGeldstrafen und Arbeitsstunden\n\nAngeklagte nach Bauschaum-Attacken auf Autos verurteilt\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBauarbeiten\n\nNeue Verkehrsf\u00fchrung am Dreieck Funkturm bringt Staugefahr\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nArbeitsunfall\n\nMann st\u00fcrzt am Potsdamer Platz 15 Meter tief in Aufzugschacht\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nFu\u00dfball-Bundesliga\n\nSteuerwald trifft traumhaft: Union-Frauen holen in Stuttgart den n\u00e4chsten Sieg\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n4:0-Sieg beim VfB Stuttgart\n\n\"Turbulenteste Wochen meines Lebens\": Hausicke und Union gelingt Trendwende\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nRegierungsbildung in Berlin\n\nLinke, Gr\u00fcne und SPD wollen Vorsondierungen bis Mittwoch abschlie\u00dfen\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nKolumne\nWas war das denn?\n\nDie Zeit der H\u00f6hlenmenschen \n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nReportage\nTeil 2/3: Kulturgeschichte\n\nOrchideen sind Kult\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBerlin-Mitte\n\nDrei Verletzte bei Verkehrsunfall mit Diplomatenauto\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nInklusive Reservierung\n\nBahn will Familienticket dauerhaft f\u00fcr 100 Euro anbieten\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBasketball\n\nMit 102 Jahren: Anneliese Kupke h\u00e4lt Alba die Treue \n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\"Mononoke\" an der Volksb\u00fchne\n\n\"Willkommen in der Muschi!\"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nWirtschaftsboom in Polen\n\nWarum polnische Unternehmen nach Brandenburg expandieren\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nInterview\nEhemalige minderj\u00e4hrige Obdachlose\n\n\"Auf der Stra\u00dfe f\u00fchlt man sich ignoriert und wie Dreck\"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nSuche nach Immobilien\n\nBerliner K\u00e4ltehilfe fordert geringere H\u00fcrden f\u00fcr Obdachlosen-Schlafpl\u00e4tze\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nTag der Deutschen Einheit\n\nTausende protestieren am Brandenburger Tor gegen Krieg\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nFu\u00dfball\n\nSiebeneinhalb Gr\u00fcnde, warum Hertha einfach immer weiter siegt\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nInterview\nExperte Peter Czoch\n\nOst-Identit\u00e4t im Fu\u00dfball: \"Eine M\u00f6glichkeit, sich Stabilit\u00e4t zu verschaffen\"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nTag der Deutschen Einheit\n\n\"Was uns noch mehr einen k\u00f6nnte, w\u00e4re eine Gleichstellung von Ost und West\"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nWahl-Panne in Spandau\n\nF\u00fcnf Abgeordnete weniger: Berliner Abgeordnetenhaus wird kleiner\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nLinker Verein\n\nWas die Rote Hilfe ist und wieso sie vom Verfassungsschutz beobachtet wird\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nHandball\n\nF\u00fcchse zwischen Gidsel-Schock, \u00dcbergangssaison und Optimismus\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBerlin \n\nLinken-Politiker Kocak r\u00e4umt Fehler bei Umgang mit Remmo-Clan-Mitglied ein\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBerlin-Wahl\n\nKoalitionsrechner: Diese Parteien h\u00e4tten eine Mehrheit\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBerlin-Wahl 2026\n\nDiese Menschen wurden in das Abgeordnetenhaus gew\u00e4hlt\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nFeste, Weihnachtsm\u00e4rkte, Hertha\n\nIn Berlin gelten jetzt strengere Regeln f\u00fcr Mehrweg\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nAbgeordnetenhaus\n\nWie geht es nach der Wahl in Berlin weiter?\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nNachwuchsstar des 1. FC Union\n\nLinus G\u00fcther - Wunderkind im Wartestand\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nTheater\nSaisoner\u00f6ffnung an der Volksb\u00fchne\n\nMit allen Wassern gewaschen\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n83 Filialen\n\nGaleria stellt erneut Insolvenzantrag\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nSanierung f\u00fcr 14 Monate\n\nBahnfahrt Berlin-Hannover dauert jetzt 80 Minuten l\u00e4nger\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\"Butze\" in Berlin-Lichtenberg\n\nEin ganzes Haus f\u00fcr \"Stra\u00dfenkinder\"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nVorgespr\u00e4che zu m\u00f6glicher Sondierung\n\nBerliner Linke, Gr\u00fcne und SPD beenden erstes Treffen ohne Ergebnisse\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nInternet-Video\n\nBerliner Linke fordert Unterlassung von Brandenburgs Innenminister\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nEiskunstlaufpaar Hocke/Kunkel\n\nDie unendliche Geschichte einer Choreographie\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBerlin-Kreuzberg\n\nGericht: G\u00f6rlitzer Park bleibt nachts weiter ge\u00f6ffnet\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n94 Disqualifikationen\n\nDer Schummel-Check: Darum gilt Berlin als fairer Marathon\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBasketball\n\nWieso die Frauen von Alba Berlin f\u00fcr Europa ein Minusgesch\u00e4ft in Kauf nehmen\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nStudie zu \u00c4ngsten der Deutschen\n\nDarum sorgen sich Menschen in Berlin und Brandenburg\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBrandenburg \u00e4lter als Bundesschnitt\n\nBerlin ist das zweitj\u00fcngste Bundesland Deutschlands\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nFAQ\nCyberkriminalit\u00e4t\n\nDas ist wichtig nach einem Hackerangriff\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBerlin\n\nProtest gegen Wehrpflicht und Aufr\u00fcstung an zwei Tagen angek\u00fcndigt\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nTorh\u00fcter bei den Eisb\u00e4ren Berlin\n\nZwei Neue f\u00fcr die Schl\u00fcsselposition\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nVorwurf der N\u00e4he zu Organisierter Kriminalit\u00e4t\n\nLinke-Politiker Kocak gibt Sitz im Bundestags-Innenausschuss auf\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n66,80 Euro\n\nDeutschlandticket kostet ab Januar 3,80 Euro mehr\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBerlin\n\nGericht verbietet Schweinehaltung im vierten Stock\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nSchaden am U-Bahnhof Wittenbergplatz\n\nU1 und U2 sollen nach Brand ab Montag wieder regul\u00e4r fahren\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n                            rbb|24\n                            \n\n\n\n\nrbb24.de\n\n\nWetter\n\n\nVerkehr\n\n\nBerlin-Wahl 2026\n\n\nKommentarregeln\n\n\nRSS-Feeds\n\n\nCopyright und Datenschutz\n\n\nKontakt\n\n\n\n\n\n                            Weitere rbb-Angebote\n                            \n\n\n\n\nFernsehen\n\n\nRadio und Podcast\n\n\nMediathek\n\n\n\n\n\n                            Kontakt & Service\n                            \n\n\n\n\nDie rbb Service-Redaktion\n\n\nHilfe zu Audio/Video\n\n\nAktuelle Fernseh-Quoten\n\n\nFrequenzen - Fernsehen\n\n\nFrequenzen - Radio\n\n\nMitschnittservice\n\n\nKorrekturen\n\n\nrbb Shop\n\n\n\n\n\n                            Der rbb\n                            \n\n\n\n\nUnternehmen\n\n\nPresse\n\n\nRundfunkbeitrag\n\n\nJobs\n\n\nWegbeschreibung / Anfahrt\n\n\n\n\n\n\n\n\n\n\n\u00a9 RBB\n\n\n                                    Impressum |\n                                    Datenschutz\n\n\n\n\n\n\n\n\n\n"
+        }
+       ],
+       "status": "completed"
+      },
+      {
+       "type": "reasoning",
+       "id": "r_b62a75a1b8b44fef9763aa1d",
+       "status": "completed",
+       "start_tag": "<think>",
+       "end_tag": "</think>",
+       "attributes": {
+        "type": "reasoning_content"
+       },
+       "content": [
+        {
+         "type": "output_text",
+         "text": "The top headline appears to be about coalition exploratory talks (coalition negotiations). The first headline listed is \"Sondierung in Berlin: Brandenburger Parteien zwischen Ablehnung und Zuversicht (Berlin exploratory talks: Brandenburg parties between rejection and confidence)\". I'll respond in English (since the user's query is in English)."
+        }
+       ],
+       "summary": null,
+       "started_at": 1791627457.440432,
+       "ended_at": 1791627458.7541885,
+       "duration": 1
+      },
+      {
+       "type": "message",
+       "id": "msg_e381df03f79f463d891b5f50",
+       "status": "completed",
+       "role": "assistant",
+       "content": [
+        {
+         "type": "output_text",
+         "text": "Based on a live fetch of rbb24 (Berlin's regional public broadcaster), the top news headline in Berlin right now is:\n\n**\"Sondierung in Berlin: Brandenburger Parteien zwischen Ablehnung und Zuversicht\"** \u2014 Brandenburg's parties are reacting with a mix of rejection and optimism to the coalition exploratory talks (Sondierungen) in Berlin. The SPD and CDU in Brandenburg are watching the government formation skeptically, warning against Left Party participation over its stance on antisemitism, and also raising concerns about utility remunicipalization (Vergesellschaftung).\n\nThis ties into the bigger ongoing story: **Linke, Gr\u00fcne und SPD (rot-gr\u00fcn-rot) have agreed on a joint approach to antisemitism and are starting formal coalition exploratory talks** \u2014 though there's already internal criticism of that agreement from within the Left Party.\n\nOther top stories on rbb24 right now:\n- A woman was killed by a truck in Berlin-Wedding; the driver fled the scene\n- Several thousand people demonstrated against the energy reform law (EEG)\n- Shooting in Sch\u00f6neberg \u2014 two people injured\n- The western Ringbahn S-Bahn line is closed this weekend\n- The Eisb\u00e4ren Berlin became new DEL leaders after a 5:0 win over Wolfsburg\n\nNote: The rbb24 page itself (source 1 in my context) was fetched live, so these headlines reflect the current state of the site."
+        }
+       ]
+      }
+     ],
+     "document": null
+    }
+   }
+  }
+ }
+}

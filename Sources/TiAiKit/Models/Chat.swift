@@ -153,6 +153,26 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
     /// socket does not replay, so a question that arrived and was never answered
     /// exists only here. A client that reads deltas alone loses it and leaves the
     /// user staring at a half answer with no way to continue.
+    /// Files attached to this message, as the server stores them.
+    ///
+    /// A picture added in the web UI lands here, and the app showed nothing at
+    /// all — the bubble rendered `content` alone. The id is what the file
+    /// content route wants; `url` is the same id, not a resolvable link.
+    public var messageAttachments: [MessageAttachment] {
+        (files ?? []).compactMap { value in
+            let inner = value["file"] ?? value
+            let id = (inner["id"] ?? value["id"])?.stringValue
+            guard let id, !id.isEmpty else { return nil }
+            let name = (value["name"] ?? inner["filename"])?.stringValue ?? "attachment"
+            let mime = (inner["meta"]?["content_type"] ?? inner["type"])?.stringValue ?? ""
+            let looksLikeImage = mime.hasPrefix("image/")
+                || ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif"]
+                    .contains((name as NSString).pathExtension.lowercased())
+            return MessageAttachment(
+                id: id, name: name, isImage: looksLikeImage || mime.hasPrefix("image/"))
+        }
+    }
+
     /// What this message cites, flattened to a name and an optional url.
     ///
     /// The server stores sources as `{source: {name, url}, document, metadata}`
@@ -164,7 +184,13 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
             let source = object["source"] ?? value
             let name = source["name"]?.stringValue ?? source["title"]?.stringValue
             guard let name, !name.isEmpty else { return nil }
+            // A fetched page keeps its url on metadata[0].url and leaves
+            // `source` with just name and id, so reading only source.url turns a
+            // perfectly good citation into dead text.
+            let metadata = object["metadata"]?.firstArrayElement
             let url = source["url"]?.stringValue
+                ?? metadata?["url"]?.stringValue
+                ?? (name.hasPrefix("http") ? name : nil)
             return MessageSource(id: "\(name)|\(url ?? "")", name: name, url: url)
         }
     }
@@ -343,4 +369,11 @@ public struct TokenUsage: Codable, Equatable, Sendable {
         totalTokens = try? c.decode(Int.self, forKey: .totalTokens)
         completionTokensPerSecond = try? c.decode(Double.self, forKey: .completionTokensPerSecond)
     }
+}
+
+/// A file attached to a message.
+public struct MessageAttachment: Identifiable, Equatable, Sendable {
+    public var id: String
+    public var name: String
+    public var isImage: Bool
 }

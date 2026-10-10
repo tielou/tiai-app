@@ -473,3 +473,19 @@ struct ServerTests {
     let hostless = Server(baseURL: URL(string: "https://")!, token: "t")
     #expect(!hostless.isConfigured)
 }
+
+@Test func realServerPayloadCarriesItsCitations() throws {
+    // Straight from the server, from a chat where the model fetched rbb24.
+    // Recorded rather than hand-written because the assumption "the app would
+    // obviously have shown this" was wrong: the sources are stored, and the app
+    // was the thing dropping them.
+    let data = Fixture.data("chat-with-sources.json")
+    let detail = try JSONDecoder().decode(ChatDetail.self, from: data)
+    let message = try #require(detail.messages.values.first)
+    let sources = message.citedSources
+    #expect(sources.count == 1)
+    #expect(sources.first?.name == "https://www.rbb24.de/berlin/")
+    // The url is NOT on `source` for a fetched page — it is on metadata[0].url.
+    // Reading only source.url is why a citation rendered as dead text.
+    #expect(sources.first?.url == "https://www.rbb24.de/berlin/")
+}
