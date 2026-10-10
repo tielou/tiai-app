@@ -13,6 +13,8 @@ struct NotesView: View {
     @State private var loading = true
     @State private var error: String?
     @State private var query = ""
+    @State private var showingNew = false
+    @State private var opened: NoteRoute?
 
     private var visible: [Note] {
         guard !query.isEmpty else { return notes }
@@ -30,13 +32,17 @@ struct NotesView: View {
                     .foregroundStyle(.red)
             }
             ForEach(visible) { note in
-                NavigationLink {
-                    NoteDetailView(client: client, note: note) {
-                        await load()
-                    }
+                // A button that sets state, not a NavigationLink. The link forms
+                // — with a destination closure and with a value — did not
+                // navigate from this list, while the `isPresented` destination
+                // below did. Same mechanism as the New note button, so the whole
+                // screen opens rows one way instead of two.
+                Button {
+                    opened = NoteRoute(id: note.id)
                 } label: {
                     row(note)
                 }
+                .buttonStyle(.plain)
             }
             if visible.isEmpty, !loading {
                 ContentUnavailableView(
@@ -52,14 +58,26 @@ struct NotesView: View {
         .searchable(text: $query)
         .refreshable { await load() }
         .task { await load() }
+        // Pushed rather than inserted into the list: adding an empty row and
+        // hoping the user taps it is a two-step way to do a one-step thing.
+        .navigationDestination(item: $opened) { route in
+            NoteDetailView(
+                client: client,
+                note: notes.first { $0.id == route.id } ?? Note(id: route.id, title: "")) {
+                await load()
+            }
+        }
+        .navigationDestination(isPresented: $showingNew) {
+            NoteDetailView(client: client, note: Note(id: "", title: "", data: nil)) {
+                await load()
+            }
+        }
         .overlay {
             if loading && notes.isEmpty { ProgressView() }
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button {
-                    notes.insert(Note(id: "", title: "", data: nil), at: 0)
-                } label: {
+                Button { showingNew = true } label: {
                     Label("New note", systemImage: "square.and.pencil")
                 }
             }
@@ -241,4 +259,10 @@ struct NoteDetailView: View {
             saveError = "Could not save: \(error.localizedDescription)"
         }
     }
+}
+
+/// Navigation value for a note row, distinct from the chat-id values the chat
+/// list pushes onto the same stack.
+struct NoteRoute: Hashable {
+    let id: String
 }

@@ -99,3 +99,40 @@ a sheet. Tapping the X in a sheet is unreliable, and a sheet left open silently
 swallows every later tap — which makes subsequent taps look like they are hitting
 the wrong control when they are not reaching the screen at all. Always Escape and
 screenshot to confirm the screen is clear before the next tap.
+
+## Clicks need a move first
+
+`cliclick c:x,y` on its own frequently does nothing: the pointer is elsewhere, and
+the Simulator appears to need the cursor over the control before the click
+registers. Do it in two steps:
+
+    cliclick m:x,y && sleep 0.5 && cliclick c:x,y
+
+This cost a long detour — a Notes row appeared not to navigate, and the
+NavigationLink was rewritten before it turned out the click was simply never
+landing. Chat rows worked because the pointer happened to be near them.
+
+## Measure the row you are aiming at, every time
+
+Large-title screens shift their content down between builds, so a row that was at
+pt y 114 in one screenshot is at pt y 178 in the next. Find the row from pixels
+before tapping:
+
+    python3 - <<'PY'   # bright text rows, with the screen y already converted
+    for pt_y in range(150, 260, 4):
+        hits = [x for x in range(60, 900, 4) if min(px[x, pt_y*3]) > 200]
+        if len(hits) > 3: print(pt_y, round(178 + 0.951*pt_y), len(hits))
+
+## Reading the app's own authenticated traffic
+
+`TIAI_DEBUG_DUMP=/path` (DEBUG builds only) writes every response body to that
+directory. In the simulator:
+
+    C=$(xcrun simctl get_app_container <udid> co.wobker.tiai data)
+    SIMCTL_CHILD_TIAI_DEBUG_DUMP=$C/tmp-dump xcrun simctl launch --terminate-running-process <udid> co.wobker.tiai
+
+The container path changes when the app is reinstalled, so recompute it after
+`simctl install` rather than reusing a value from earlier in a session. This is
+how the notes timestamp unit and the citation shape were settled — by reading what
+the server actually sent, through the app's own session, instead of guessing or
+asking for a token.
