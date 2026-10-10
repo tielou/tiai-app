@@ -343,9 +343,15 @@ struct MessageRow: View {
     /// without a way to step through them the app silently shows one branch of a
     /// tree it created itself.
     private func siblingPager(_ page: (index: Int, total: Int)) -> some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 4) {
             Button { onSibling?(-1) } label: {
-                Image(systemName: "chevron.left").foregroundStyle(page.index > 1 ? Color.primary : Color.secondary)
+                Image(systemName: "chevron.left")
+                    .foregroundStyle(page.index > 1 ? Color.primary : Color.secondary)
+                    // A bare chevron glyph is a ~12pt target, which is a coin
+                    // flip on a phone. Padding plus a shape makes the whole
+                    // square tappable without changing how it looks.
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .contentShape(Rectangle())
             }
             .disabled(page.index <= 1)
             Text("\(page.index) of \(page.total)")
@@ -354,6 +360,8 @@ struct MessageRow: View {
             Button { onSibling?(1) } label: {
                 Image(systemName: "chevron.right")
                     .foregroundStyle(page.index < page.total ? Color.primary : Color.secondary)
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .contentShape(Rectangle())
             }
             .disabled(page.index >= page.total)
         }
