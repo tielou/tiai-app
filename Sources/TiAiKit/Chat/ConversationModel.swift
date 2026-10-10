@@ -624,6 +624,11 @@ public final class ConversationModel {
             answered.status = action == .reject ? .rejected : .completed
             return answered
         }
+        // The turn was flushed as final when the question arrived, so without
+        // this the resumed run has no "still working" state to render and the
+        // thinking animation never appears — the screen just sits there until
+        // the answer lands.
+        turns[index].streaming = true
 
         // Subscribe before the POST: the resumed run can emit before the
         // response comes back, and the socket does not replay.

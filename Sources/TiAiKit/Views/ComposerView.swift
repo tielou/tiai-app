@@ -38,8 +38,8 @@ struct ComposerView: View {
         var id: Int { hashValue }
     }
 
-    /// A picker the `+` sheet asked for, held until this sheet is gone.
-    private enum Pending { case camera, photos, files }
+    /// Something the `+` sheet asked for, held until this sheet is gone.
+    private enum Pending: Equatable { case camera, photos, files, authorize(URL) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -76,7 +76,8 @@ struct ComposerView: View {
             case .add:
                 AddToChatSheet(
                     conversation: conversation, models: models, tools: chatTools,
-                    toolsError: chatToolsError, onAuthorize: onAuthorize,
+                    toolsError: chatToolsError,
+                    onAuthorize: { hand(.authorize($0)) },
                     onCamera: { hand(.camera) }, onPhotos: { hand(.photos) },
                     onFiles: { hand(.files) })
             case .models:
@@ -161,6 +162,14 @@ struct ComposerView: View {
                 break
             case .files:
                 showingFiles = true
+                pending = nil
+            case let .authorize(url):
+                // Same reason as the pickers: the sign-in browser is presented by
+                // the conversation behind this sheet, and asking for it while the
+                // `+` sheet is still on screen means it waits until that sheet
+                // happens to close — which is what made the browser look like it
+                // only appeared after dismissing the menu by hand.
+                onAuthorize(url)
                 pending = nil
             }
         }
@@ -375,7 +384,7 @@ struct AddToChatSheet: View {
                 // Before this the row went green while the tool was still dead,
                 // and the chat quietly had no tool at all.
                 if let url = tool.authorizeURL(base: conversation.serverURL) {
-                    onAuthorize(url)
+                    send { onAuthorize(url) }()
                     return
                 }
                 conversation.tools.append(tool.id)

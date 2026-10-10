@@ -708,19 +708,14 @@ enum AskUserFixture {
     #expect(tool("my_workspace_tool", nil).authorizeURL(base: base) == nil)
 }
 
-@Test func thinkingFramesDoNotReflow() {
-    for set in ThinkingAnimation.sets {
-        #expect(set.frames.count > 1, "\(set.name) has nothing to animate")
-        #expect(set.interval > 0)
-        // A frame wider than the last moves the text after it, which reads as
-        // a stutter rather than an animation.
-        let widths = set.frames.map { frame in
-            frame.components(separatedBy: "\n").map { $0.count }.max() ?? 0
-        }
-        #expect(Set(widths).count == 1, "\(set.name) frames vary in width: \(widths)")
-    }
-    // Seeded picks are stable, so a run keeps one animation for its whole life.
-    #expect(ThinkingAnimation.pick(seed: "abc").name == ThinkingAnimation.pick(seed: "abc").name)
+@Test func thinkingPoseIsStablePerRunAndVariesBetweenRuns() {
+    // The animation is drawn, not a sprite sheet, so what matters is that one
+    // run keeps one pose for its whole life — a cat that changes species
+    // mid-generation is worse than no cat — and that runs do not all get the
+    // same one, or it stops being a signal.
+    #expect(ThinkingAnimation.poseIndex(for: "abc") == ThinkingAnimation.poseIndex(for: "abc"))
+    let spread = (1...24).map { ThinkingAnimation.poseIndex(for: "run-\($0)") }
+    #expect(Set(spread).count > 1, "every run gets the same animation")
 }
 
 @Test func onlySomeFailuresAreWorthRetrying() {
