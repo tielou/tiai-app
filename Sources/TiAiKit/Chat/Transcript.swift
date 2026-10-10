@@ -59,6 +59,10 @@ public struct Turn: Identifiable, Equatable, Sendable {
         isAssistant && streaming && text.isEmpty && error == nil
     }
 
+    /// A tool call is open, so the turn is not over however many finish frames
+    /// arrive. The answer the user actually wants comes after the tool returns.
+    public var awaitsTool: Bool { calls.contains { !$0.isSettled } }
+
     init(_ message: ChatMessage) {
         id = message.id
         role = message.role

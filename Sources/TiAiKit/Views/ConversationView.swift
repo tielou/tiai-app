@@ -20,6 +20,14 @@ public struct ConversationView: View {
     /// tools simply has no Tools row.
     @State private var chatTools: [ChatTool] = []
     @State private var chatToolsError: String?
+    /// A tool waiting on a sign-in. The browser lives here because the tool list
+    /// does, and the list has to be read again the moment the browser closes.
+    @State private var authorizing: AuthorizeRequest?
+
+    struct AuthorizeRequest: Identifiable, Hashable {
+        let url: URL
+        var id: String { url.absoluteString }
+    }
     /// Kept for the composer and the model sheet: the conversation only needs the
     /// id to seed itself, but the UI needs the whole record to show what each
     /// model can do. Dropping this is how the model sheet renders empty.
@@ -63,9 +71,25 @@ public struct ConversationView: View {
             }
             ComposerView(
                 conversation: conversation, models: models,
-                chatTools: chatTools, chatToolsError: chatToolsError)
+                chatTools: chatTools, chatToolsError: chatToolsError,
+                onAuthorize: { authorizing = AuthorizeRequest(url: $0) })
         }
         .inlineTitle(conversation.title)
+        #if os(iOS)
+        .sheet(item: $authorizing) { request in
+            OAuthWebView(
+                url: request.url, token: conversation.authToken,
+                domain: conversation.serverHost
+            ) {
+                // The point of signing in is that the row stops saying "not
+                // signed in", so the list is read again immediately rather than
+                // waiting for a foreground change that may never come.
+                Task {
+                    chatTools = (try? await session.client.chatTools()) ?? chatTools
+                }
+            }
+        }
+        #endif
         .toolbar { toolbar }
         .task {
             await conversation.connect()

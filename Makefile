@@ -14,6 +14,15 @@ test:
 app-check: build
 	xcrun swiftc -typecheck -parse-as-library App/TiAiApp.swift -I .build/debug/Modules
 
+## Compiles the app for a simulator. `swift build` compiles the kit for macOS,
+## which silently skips every `#if os(iOS)` block in the kit — and that is where
+## the camera, the photo picker and the OAuth browser live. An in-app browser
+## that did not compile (a WKWebView is a view, not a view controller) passed
+## `make check` and failed the archive. Needs Xcode, so it is not in `check`.
+ios:
+	xcodebuild -quiet -project TiAi.xcodeproj -scheme TiAi \
+	  -destination 'platform=iOS Simulator,name=iPhone 16e' build
+
 ## The gate. Everything that runs without Xcode, and therefore everything that
 ## runs on any machine, including the one you are on.
 check: build app-check test

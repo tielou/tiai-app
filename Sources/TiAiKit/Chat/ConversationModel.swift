@@ -57,6 +57,11 @@ public final class ConversationModel {
     /// page is a web page, and it lives at the site root rather than under
     /// `/api/v1`.
     public var serverURL: URL { client.server.baseURL }
+    /// The bearer token and host, for the one flow that is not an API call: an
+    /// MCP OAuth sign-in needs Open WebUI's session as a cookie, and this is the
+    /// session the app already has.
+    public var authToken: String { client.server.token }
+    public var serverHost: String { client.server.baseURL.host ?? "" }
     private let hub: ChatEventHub
     private var run: Task<Void, Never>?
     private var post: Task<Void, Never>?
@@ -68,7 +73,10 @@ public final class ConversationModel {
     /// How long to wait on a silent stream before calling it dead. Longer than
     /// the slowest cold prefill you have seen, shorter than someone's patience.
     static let silenceLimit: Duration = .seconds(180)
-    /// Deltas are coalesced before they reach observable state: a model emitting
+    /// How long a turn may sit between a `finish_reason` and the tool result that
+    /// follows it. Long enough for a slow MCP server, short enough that a tool
+    /// which died silently does not leave the composer spinning for three minutes.
+    static let handoffLimit: Duration = .seconds(60)    /// Deltas are coalesced before they reach observable state: a model emitting
     /// token by token would otherwise invalidate the transcript view per token,
     /// which is the difference between a smooth stream and a stuttering one.
     static let flushInterval: Duration = .milliseconds(60)
@@ -418,14 +426,23 @@ public final class ConversationModel {
             if let calls = frame.outputItems { pending?.calls = calls }
             if frame.isToolArgumentsDelta { sawToolArguments = true }
             if frame.isTerminal {
-                // `ask_user` streams its arguments, then finishes, and only then
-                // does the server stage the call and emit the pause frame with
-                // `output`. Breaking on the finish frame loses the question and
-                // leaves an empty turn — which is exactly what the first live
-                // test showed. Wait a moment for the pause instead.
-                if sawToolArguments && pending?.calls.isEmpty != false {
+                // A finish_reason is not always the end of the turn.
+                //
+                // Two cases where the server keeps going under the same
+                // assistant message id: a real tool is running (Sonos is off
+                // fetching something), and `ask_user` staging its question. In
+                // both, breaking here flips the composer back to "finished"
+                // while the answer the user asked for is still to come — and with
+                // several tool calls it happens several times in one turn.
+                //
+                // Bounded rather than infinite: if the tool never reports back,
+                // the stream really is over and the turn settles on what was
+                // stored. The silence watchdog stays as the outer limit.
+                if pending?.awaitsTool == true
+                    || (sawToolArguments && pending?.calls.isEmpty != false) {
+                    sawToolArguments = false
                     grace = Task { [hub] in
-                        try? await Task.sleep(for: .seconds(3))
+                        try? await Task.sleep(for: Self.handoffLimit)
                         if !Task.isCancelled { hub.expire(chatID: chatID ?? "") }
                     }
                     continue
@@ -433,6 +450,10 @@ public final class ConversationModel {
                 outcome.sawTerminal = true
                 break
             }
+            // Any frame past this point proves the run is still alive, so the
+            // handoff timer is stood down until the next finish frame re-arms it.
+            grace?.cancel()
+            grace = nil
             // Checked after the terminal test: a frame that both finishes and
             // asks would be a finished run with a question left on screen.
             if frame.isAwaitingUser { outcome.parked = true; break }

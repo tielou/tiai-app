@@ -20,6 +20,9 @@ struct ComposerView: View {
     /// Tools offered by the instance, passed through to the `+` sheet.
     var chatTools: [ChatTool] = []
     var chatToolsError: String? = nil
+    /// Opens a tool's sign-in page. Handed down from the conversation, which owns
+    /// the tool list and so is the place that can refresh it afterwards.
+    var onAuthorize: (URL) -> Void = { _ in }
 
     @State private var sheet: Sheet?
     @State private var pending: Pending?
@@ -70,7 +73,7 @@ struct ComposerView: View {
             case .add:
                 AddToChatSheet(
                     conversation: conversation, models: models, tools: chatTools,
-                    toolsError: chatToolsError,
+                    toolsError: chatToolsError, onAuthorize: onAuthorize,
                     onCamera: { hand(.camera) }, onPhotos: { hand(.photos) },
                     onFiles: { hand(.files) })
             case .models:
@@ -230,7 +233,7 @@ struct AddToChatSheet: View {
     /// "Tools" heading with nothing under it reads as a bug, not as "none".
     var tools: [ChatTool] = []
     var toolsError: String? = nil
-    @Environment(\.openURL) private var openURL
+    var onAuthorize: (URL) -> Void = { _ in }
     var onCamera: () -> Void
     var onPhotos: () -> Void
     var onFiles: () -> Void
@@ -333,10 +336,10 @@ struct AddToChatSheet: View {
                 }
                 conversation.tools.append(tool.id)
                 // The same move the web client makes: an OAuth server that has
-                // not been signed into cannot serve anything, and the sign-in is
-                // a web page. Opening it is the difference between a toggle that
-                // looks broken and one that tells you the next step.
-                if let url = tool.authorizeURL(base: conversation.serverURL) { openURL(url) }
+                // not been signed into cannot serve anything. It happens in an
+                // in-app browser rather than Safari, because the authorize page
+                // needs Open WebUI's session and Safari on a phone rarely has it.
+                if let url = tool.authorizeURL(base: conversation.serverURL) { onAuthorize(url) }
             })
     }
 

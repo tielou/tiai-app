@@ -54,6 +54,19 @@ public struct ToolCall: Equatable, Sendable, Identifiable {
         }
     }
 
+    /// Whether this call has reached an end state.
+    ///
+    /// A `finish_reason` that arrives while a call is still open is a handoff to
+    /// the tool, not the end of the turn — which is the difference between a
+    /// composer that waits for the real answer and one that says "finished"
+    /// while the tool is still running.
+    public var isSettled: Bool {
+        switch status {
+        case .completed, .rejected, .failed: return true
+        case .pending, .queued, .requiresApproval: return false
+        }
+    }
+
     init?(_ value: JSONValue) {
         guard let object = value.objectValue else { return nil }
         let type = object["type"]?.stringValue ?? ""
