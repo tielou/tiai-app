@@ -73,6 +73,10 @@ public struct ConversationView: View {
             // iOS kills the socket on background anyway; saying so locally beats
             // coming back to a spinner that has been dead for ten minutes.
             if phase != .active { conversation.abandon() }
+            // Coming back from a browser sign-in is the normal way this changes:
+            // the tool said "not signed in", you signed in, and the row should
+            // know that without a relaunch.
+            else { Task { chatTools = (try? await session.client.chatTools()) ?? chatTools } }
         }
     }
 
@@ -193,9 +197,10 @@ struct MessageRow: View {
             VStack(alignment: .leading, spacing: 8) {
                 if !turn.reasoning.isEmpty { reasoning }
                 if turn.isWaitingForFirstToken {
-                    Label("Thinking…", systemImage: "ellipsis")
-                        .foregroundStyle(.secondary)
-                        .font(.callout)
+                    // A cat, not a spinner: the wait for a local model is long
+                    // enough to doubt anything started, and this one changes
+                    // between runs so it stays a signal rather than wallpaper.
+                    ThinkingAnimation(runID: turn.id)
                 }
                 // The question and the answer the user gave come *before* the
                 // answer they unlocked. That is the order it happened in, it is

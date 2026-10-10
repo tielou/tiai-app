@@ -51,4 +51,21 @@ public struct ChatTool: Codable, Equatable, Sendable, Identifiable {
         if let host = URL(string: value)?.host, !host.isEmpty { return host }
         return value
     }
+
+    /// The url that starts a sign-in for this tool, or nil when it needs none.
+    ///
+    /// Shape taken from the web client, which builds
+    /// `{base}/oauth/clients/{type}:{n}/authorize` and navigates to it when you
+    /// switch an unauthenticated server on. The `{type}:{n}` is this tool's id
+    /// with its `server:` prefix dropped, so `server:mcp:1` authorises at
+    /// `/oauth/clients/mcp:1/authorize` — and note that is at the site root,
+    /// not under `/api/v1`.
+    public func authorizeURL(base: URL) -> URL? {
+        guard authenticated == false, id.hasPrefix("server:") else { return nil }
+        let tail = id.dropFirst("server:".count)
+        guard !tail.isEmpty else { return nil }
+        var root = base.absoluteString
+        while root.hasSuffix("/") { root.removeLast() }
+        return URL(string: "\(root)/oauth/clients/\(tail)/authorize")
+    }
 }

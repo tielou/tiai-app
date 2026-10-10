@@ -681,3 +681,38 @@ enum AskUserFixture {
     // Unverified is not broken: only an explicit error disables a tool.
     #expect(tools[0].available)
 }
+
+@Test func unauthenticatedServerToolsCarryTheirSignInURL() throws {
+    func tool(_ id: String, _ authed: Bool?) -> ChatTool {
+        var json: [String: JSONValue] = ["id": .string(id), "name": .string("x")]
+        if let authed { json["authenticated"] = .bool(authed) }
+        return ChatTool(.object(json))!
+    }
+    let base = URL(string: "https://chat.example.co")!
+    // The shape the web client builds: the id without its `server:` prefix,
+    // at the site root rather than under /api/v1.
+    #expect(
+        tool("server:mcp:1", false).authorizeURL(base: base)?.absoluteString
+            == "https://chat.example.co/oauth/clients/mcp:1/authorize")
+    // A trailing slash on the stored url must not become a double slash.
+    let signed = tool("server:mcp:2", false).authorizeURL(base: URL(string: "https://chat.example.co/")!)
+    #expect(signed?.absoluteString == "https://chat.example.co/oauth/clients/mcp:2/authorize")
+    // Already signed in, or not an MCP server at all: nothing to open.
+    #expect(tool("server:mcp:1", true).authorizeURL(base: base) == nil)
+    #expect(tool("my_workspace_tool", nil).authorizeURL(base: base) == nil)
+}
+
+@Test func thinkingFramesDoNotReflow() {
+    for set in ThinkingAnimation.sets {
+        #expect(set.frames.count > 1, "\(set.name) has nothing to animate")
+        #expect(set.interval > 0)
+        // A frame wider than the last moves the text after it, which reads as
+        // a stutter rather than an animation.
+        let widths = set.frames.map { frame in
+            frame.components(separatedBy: "\n").map { $0.count }.max() ?? 0
+        }
+        #expect(Set(widths).count == 1, "\(set.name) frames vary in width: \(widths)")
+    }
+    // Seeded picks are stable, so a run keeps one animation for its whole life.
+    #expect(ThinkingAnimation.pick(seed: "abc").name == ThinkingAnimation.pick(seed: "abc").name)
+}

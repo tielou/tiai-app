@@ -53,6 +53,10 @@ public final class ConversationModel {
     public var modelIDs: [String] = []
 
     private let client: OWUIClient
+    /// The instance root, for links that are not API calls — an OAuth sign-in
+    /// page is a web page, and it lives at the site root rather than under
+    /// `/api/v1`.
+    public var serverURL: URL { client.server.baseURL }
     private let hub: ChatEventHub
     private var run: Task<Void, Never>?
     private var post: Task<Void, Never>?

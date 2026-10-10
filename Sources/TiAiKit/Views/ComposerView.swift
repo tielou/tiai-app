@@ -220,6 +220,7 @@ struct AddToChatSheet: View {
     /// "Tools" heading with nothing under it reads as a bug, not as "none".
     var tools: [ChatTool] = []
     var toolsError: String? = nil
+    @Environment(\.openURL) private var openURL
     var onCamera: () -> Void
     var onPhotos: () -> Void
     var onFiles: () -> Void
@@ -316,8 +317,16 @@ struct AddToChatSheet: View {
         Binding(
             get: { conversation.tools.contains(tool.id) },
             set: { on in
-                if on { conversation.tools.append(tool.id) }
-                else { conversation.tools.removeAll { $0 == tool.id } }
+                guard on else {
+                    conversation.tools.removeAll { $0 == tool.id }
+                    return
+                }
+                conversation.tools.append(tool.id)
+                // The same move the web client makes: an OAuth server that has
+                // not been signed into cannot serve anything, and the sign-in is
+                // a web page. Opening it is the difference between a toggle that
+                // looks broken and one that tells you the next step.
+                if let url = tool.authorizeURL(base: conversation.serverURL) { openURL(url) }
             })
     }
 
