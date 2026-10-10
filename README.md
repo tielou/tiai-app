@@ -5,8 +5,28 @@ assistant the way you would with any native app — streaming, offline list,
 attachments, memories — while the server keeps being the single place your
 conversations live.
 
-**Status: M1.** The kit, the contract tests and the connect/chat-list screens
-exist. The conversation screen is next. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+**Status: in daily use.** Chat, streaming, attachments, notes, memory, tools and
+sign-in all work against a live server. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it is put together.
+
+## What is in it
+
+Conversations stream token by token, with reasoning in a collapsed *Thoughts*
+section and a drawn cat while a slow model warms up. Markdown renders headings,
+lists, quotes and code, and a web-search answer carries its sources, numbered to
+match the `[1]` markers in the text.
+
+Attachments go both ways: camera, photo library and files from the phone, and a
+picture attached in the web UI renders here too. Messages can be edited and
+resent, regenerated answers become siblings you page through, and answers can be
+rated.
+
+Tools come from the server rather than being compiled in — whatever MCP servers
+the instance has are listed, and one that needs signing in opens the sign-in in
+app. Notes are the server's notes: list, read, edit, create, delete, shared with
+the web UI. Memory is read from the server too.
+
+Dark mode, iPad and iPhone, and no telemetry of any kind.
 
 ## What it is not
 
