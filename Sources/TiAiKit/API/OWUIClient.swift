@@ -367,6 +367,17 @@ public struct OWUIClient: Sendable {
         return items.compactMap(ToolServer.init)
     }
 
+    /// Workspace tools the user may switch on for a chat.
+    ///
+    /// A separate thing from an MCP server, and it is the other place Sonos or
+    /// Notion could plausibly live: workspace tools go out as `tool_ids`, servers
+    /// as `tool_servers`. Reading only one is how the section stayed empty while
+    /// the web composer plainly had them.
+    public func workspaceTools() async throws -> [ToolServer] {
+        let json: JSONValue = try await request("GET", "/tools/")
+        return Self.candidates(json)
+    }
+
     private func adminToolServers() async throws -> [ToolServer] {
         let json: JSONValue = try await request("GET", "/configs/tool_servers")
         return Self.candidates(json)

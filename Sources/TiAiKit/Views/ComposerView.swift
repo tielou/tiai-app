@@ -20,6 +20,7 @@ struct ComposerView: View {
     /// MCP servers configured on the instance, passed through to the `+` sheet.
     var toolServers: [ToolServer] = []
     var toolServersError: String? = nil
+    var workspaceTools: [ToolServer] = []
 
     @State private var sheet: Sheet?
     @State private var pending: Pending?
@@ -70,7 +71,7 @@ struct ComposerView: View {
             case .add:
                 AddToChatSheet(
                     conversation: conversation, models: models, servers: toolServers,
-                    toolServersError: toolServersError,
+                    toolServersError: toolServersError, workspaceTools: workspaceTools,
                     onCamera: { hand(.camera) }, onPhotos: { hand(.photos) },
                     onFiles: { hand(.files) })
             case .models:
@@ -220,6 +221,9 @@ struct AddToChatSheet: View {
     /// a "Servers" heading with nothing under it reads as a bug, not as "none".
     var servers: [ToolServer] = []
     var toolServersError: String? = nil
+    /// Workspace tools, listed apart from the MCP servers because they are
+    /// selected into different fields and a merged list could not be sent.
+    var workspaceTools: [ToolServer] = []
     var onCamera: () -> Void
     var onPhotos: () -> Void
     var onFiles: () -> Void
@@ -270,7 +274,22 @@ struct AddToChatSheet: View {
                     }
                 }
 
-                Section("Tools") {
+                if !workspaceTools.isEmpty {
+                    Section {
+                        ForEach(workspaceTools) { tool in
+                            Toggle(isOn: toolBinding(tool)) { VStack(alignment: .leading, spacing: 2) {
+                                Text(tool.name)
+                                Text(tool.id).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            } }
+                        }
+                    } header: {
+                        Text("Tools")
+                    } footer: {
+                        Text("From your server's workspace. On here means this chat can use them.")
+                    }
+                }
+
+                Section("Capabilities") {
                     ForEach(ChatFeature.allCases, id: \.self) { feature in
                         Toggle(isOn: binding(for: feature)) {
                             VStack(alignment: .leading, spacing: 2) {
@@ -310,6 +329,15 @@ struct AddToChatSheet: View {
             set: { on in
                 if on { conversation.servers.append(server.id) }
                 else { conversation.servers.removeAll { $0 == server.id } }
+            })
+    }
+
+    private func toolBinding(_ tool: ToolServer) -> Binding<Bool> {
+        Binding(
+            get: { conversation.tools.contains(tool.id) },
+            set: { on in
+                if on { conversation.tools.append(tool.id) }
+                else { conversation.tools.removeAll { $0 == tool.id } }
             })
     }
 

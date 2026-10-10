@@ -84,6 +84,10 @@ struct Probe {
                 do { report.note(path, Report.clip(try await client.rawJSON(path))) }
                 catch { report.note(path, "✗ \(error)") }
             }
+            for path in ["/tools/", "/functions/"] {
+                do { report.note(path, Report.clip(try await client.rawJSON(path))) }
+                catch { report.note(path, "✗ \(error)") }
+            }
             do {
                 let settings = try await client.rawJSON("/users/user/settings")
                 let servers = settings["toolServers"] ?? .null
