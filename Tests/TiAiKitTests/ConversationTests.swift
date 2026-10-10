@@ -867,3 +867,28 @@ enum AskUserFixture {
         .code(language: nil, code: "## not a heading")
     ])
 }
+
+@Test func citedSourcesFlattenTheServerShape() {
+    // What the server actually stores: a web hit carries a url, a file or a
+    // fetched page may not. The `[1]` markers in the answer text refer to this
+    // list's order, so order is preserved and nothing is deduplicated.
+    let json = """
+    {"id":"m1","role":"assistant","content":"x [1]","sources":[\
+      {"source":{"name":"Tagesspiegel","url":"https://tagesspiegel.de/a"},\
+       "document":["..."],"metadata":[{"title":"Tagesspiegel"}]},\
+      {"source":{"name":"rbb","url":"https://rbb-online.de/b"}},\
+      {"source":{"id":"f1","name":"notes.pdf","type":"file"}},\
+      {"source":{"url":"https://unnamed.example"}},\
+      {"unexpected":true}\
+    ]}
+    """
+    let message = try! JSONDecoder().decode(ChatMessage.self, from: Data(json.utf8))
+    let sources = message.citedSources
+    #expect(sources.count == 3)
+    #expect(sources[0].name == "Tagesspiegel")
+    #expect(sources[0].url == "https://tagesspiegel.de/a")
+    #expect(sources[1].url == "https://rbb-online.de/b")
+    // A file with no url is still a source worth listing, just not tappable.
+    #expect(sources[2].name == "notes.pdf")
+    #expect(sources[2].url == nil)
+}

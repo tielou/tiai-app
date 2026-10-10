@@ -6,6 +6,17 @@ import Foundation
 /// minted before sending, which the server then stores verbatim. That identity
 /// is what makes regenerate and edit possible without a reload: the app already
 /// knows which node in the chat's message tree it is talking about.
+/// A source a reply cites.
+///
+/// The server already sends these and the app already stored them; they were
+/// simply never shown, so a web-search answer arrived with a `[1]` in the text
+/// and nothing to click.
+public struct MessageSource: Identifiable, Equatable, Sendable {
+    public var id: String
+    public var name: String
+    public var url: String?
+}
+
 public struct Turn: Identifiable, Equatable, Sendable {
     public let id: String
     public var role: String
@@ -22,6 +33,8 @@ public struct Turn: Identifiable, Equatable, Sendable {
     /// one that is still awaiting the user is a run that is parked, not a run
     /// that finished, and the UI has to say so.
     public var calls: [ToolCall]
+    /// What the answer cites, in the order the server listed them.
+    public var sources: [MessageSource]
     public var createdAt: Date
 
     public init(
@@ -34,6 +47,7 @@ public struct Turn: Identifiable, Equatable, Sendable {
         model: String? = nil,
         usage: TokenUsage? = nil,
         calls: [ToolCall] = [],
+        sources: [MessageSource] = [],
         createdAt: Date = .now
     ) {
         self.id = id
@@ -45,6 +59,7 @@ public struct Turn: Identifiable, Equatable, Sendable {
         self.model = model
         self.usage = usage
         self.calls = calls
+        self.sources = sources
         self.createdAt = createdAt
     }
 
@@ -73,6 +88,7 @@ public struct Turn: Identifiable, Equatable, Sendable {
         model = message.model
         usage = message.usage
         calls = message.toolCalls
+        sources = message.citedSources
         createdAt = message.timestamp ?? .now
     }
 }

@@ -548,6 +548,22 @@ public final class ConversationModel {
         finished.error = outcome.failure
         flush(finished, into: index, final: true)
         pending = nil
+        // Sources are not streamed as deltas — the server attaches them when it
+        // saves the message. Without this a citation only appeared after leaving
+        // and re-entering the chat, which reads as the feature being broken.
+        if outcome.failure == nil, outcome.sawTerminal, finished.sources.isEmpty,
+            let chat = chatID {
+            let id = finished.id
+            Task { @MainActor [weak self] in
+                guard let self,
+                    let detail = try? await client.chat(id: chat),
+                    let stored = detail.messages[id],
+                    !stored.citedSources.isEmpty
+                else { return }
+                guard let at = self.turns.firstIndex(where: { $0.id == id }) else { return }
+                self.turns[at].sources = stored.citedSources
+            }
+        }
         return outcome
     }
 
@@ -673,6 +689,7 @@ public final class ConversationModel {
         // moment it arrives, which is worse than never showing it: the user sees
         // the answer stop and has no idea why.
         if !source.calls.isEmpty { turn.calls = source.calls }
+        if !source.sources.isEmpty { turn.sources = source.sources }
         turn.streaming = final ? false : turn.streaming
         turns[index] = turn
         if !final && (!source.text.isEmpty || !source.reasoning.isEmpty), phase.isBusy {

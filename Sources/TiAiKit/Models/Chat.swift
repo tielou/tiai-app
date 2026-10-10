@@ -153,6 +153,28 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
     /// socket does not replay, so a question that arrived and was never answered
     /// exists only here. A client that reads deltas alone loses it and leaves the
     /// user staring at a half answer with no way to continue.
+    /// What this message cites, flattened to a name and an optional url.
+    ///
+    /// The server stores sources as `{source: {name, url}, document, metadata}`
+    /// and the numbering in the text (`[^1]`) refers to this list's order, so
+    /// the order is preserved rather than deduplicated.
+    public var citedSources: [MessageSource] {
+        (sources ?? []).compactMap { value in
+            guard let object = value.objectValue else { return nil }
+            let source = object["source"] ?? value
+            let name = source["name"]?.stringValue ?? source["title"]?.stringValue
+            guard let name, !name.isEmpty else { return nil }
+            let url = source["url"]?.stringValue
+            return MessageSource(id: "\(name)|\(url ?? "")", name: name, url: url)
+        }
+    }
+
+    /// Tool calls and `ask_user` questions on this message.
+    ///
+    /// This is the only place a parked question survives an app restart: the
+    /// socket does not replay, so a question that arrived and was never answered
+    /// exists only here. A client that reads deltas alone loses it and leaves the
+    /// user staring at a half answer with no way to continue.
     public var toolCalls: [ToolCall] { ToolCall.calls(from: output) }
 
     public var isUser: Bool { role == "user" }

@@ -68,3 +68,34 @@ The runtime is not the app. A plain `TextField` boxes them, and Safari in the
 same simulator boxes every emoji on Wikipedia's emoji page. The runtime ships
 only `AppleColorEmoji-160px.ttc`. Copying the host's font in and rebooting does
 nothing: the runtime volume is sealed read-only APFS. Check emoji on a device.
+
+## Coordinate mapping (re-derived 2026-10-09, the old one was wrong)
+
+The device screen is **not** 1:1 with the window, and the accessibility frame
+AppleScript reports for it (position 909,168 size 390x844) does not match where
+clicks actually land. Two confirmed hits give the real mapping:
+
+    screen_x = 910 + pt_x
+    screen_y = 178 + 0.951 * pt_y
+
+Verify before a session by tapping the `+` button (pt 37,822 -> screen 947,960);
+the "Add to Chat" sheet opening means the mapping is right.
+
+**The composer sits higher than it looks.** The card's content ends at pt ~803,
+not at the bottom of the screen: text field at pt y ~763 (screen ~900), the
+`+`/model-chip/send row at pt y ~783 (screen ~922). Tapping where the placeholder
+appears to be lands on the model chip instead, which is how a session can end up
+opening "Select model" repeatedly while believing it is tapping the text field.
+Measure the card from pixels rather than eyeballing it:
+
+    python3 - <<'PY'   # brightness per row; the card is the bright band
+    ...scan the bottom 400 px-rows of the screenshot...
+
+## Dismissing sheets
+
+`osascript -e 'tell application "Simulator" to activate'` then
+`osascript -e 'tell application "System Events" to key code 53'` (Escape) closes
+a sheet. Tapping the X in a sheet is unreliable, and a sheet left open silently
+swallows every later tap — which makes subsequent taps look like they are hitting
+the wrong control when they are not reaching the screen at all. Always Escape and
+screenshot to confirm the screen is clear before the next tap.
