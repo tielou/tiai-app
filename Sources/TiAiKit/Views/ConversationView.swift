@@ -245,8 +245,7 @@ struct MessageRow: View {
 
     var body: some View {
         if turn.isUser {
-            VStack(alignment: .trailing, spacing: 5) {
-                if !turn.attachments.isEmpty {
+            VStack(alignment: .trailing, spacing: 5) {                if !turn.attachments.isEmpty {
                     ForEach(turn.attachments) { attachment in
                         if attachment.isImage, let fileLoader {
                             RemoteImageView(id: attachment.id, load: fileLoader)
@@ -263,7 +262,31 @@ struct MessageRow: View {
                 if editing {
                     editBox
                 } else {
-                    HStack(alignment: .bottom, spacing: 6) {
+                    HStack(alignment: .bottom, spacing: 4) {
+                        // On the inner side: out there it ran into the screen
+                        // edge and came back looking like a clipped glyph.
+                        if onEdit != nil, !turn.text.isEmpty {
+                            // A visible button rather than a long-press menu:
+                            // `.textSelection(.enabled)` owns the long-press on
+                            // this text, so a context menu here mostly did not
+                            // open — which is why "edit doesn't work".
+                            Button {
+                                draft = turn.text
+                                editing = true
+                            } label: {
+                                // `pencil.line` rather than `pencil` reads better, but it came
+                            // out as a clipped corner in the simulator — same
+                            // missing-glyph class as the emoji tofu. The old
+                            // symbol is in every runtime.
+                            Image(systemName: "pencil")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                                    .padding(6)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Edit message")
+                        }
                         // A message can be nothing but a picture, and an empty
                         // bubble with a pencil floating next to it looks like a
                         // rendering bug rather than an attachment.
@@ -274,28 +297,15 @@ struct MessageRow: View {
                                 .padding(.vertical, 9)
                                 .background(.tint.opacity(0.18), in: .rect(cornerRadius: 14))
                         }
-                        if onEdit != nil, !turn.text.isEmpty {
-                            // A visible button rather than a long-press menu:
-                            // `.textSelection(.enabled)` owns the long-press on
-                            // this text, so a context menu here mostly did not
-                            // open — which is why "edit doesn't work".
-                            Button {
-                                draft = turn.text
-                                editing = true
-                            } label: {
-                                Image(systemName: "pencil.line")
-                                    .font(.caption)
-                                    .foregroundStyle(.tertiary)
-                                    .padding(6)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Edit message")
-                        }
                     }
                 }
                 if let sibling { siblingPager(sibling) }
             }
+            // The transcript is a leading-aligned stack, so a bubble that only
+            // takes its text's width would sit on the left — which is exactly
+            // where a message you wrote should not be. Short messages showed
+            // this first; a long one filled the row and hid the bug.
+            .frame(maxWidth: .infinity, alignment: .trailing)
         } else {
             VStack(alignment: .leading, spacing: 8) {
                 if !turn.reasoning.isEmpty { reasoning }
