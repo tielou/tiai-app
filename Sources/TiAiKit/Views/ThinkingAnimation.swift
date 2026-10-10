@@ -28,24 +28,20 @@ struct ThinkingAnimation: View {
     }
 
     var body: some View {
-        if reduceMotion {
-            // Motion that conveys "still working" has to survive being turned
-            // off, so the words stay.
-            Label("Thinking…", systemImage: "ellipsis")
-                .font(.callout)
+        // Reduce Motion is about big movement across the screen, not about a
+        // four-character animation in a line of text — and dropping the cat
+        // entirely meant most of the time nobody saw it, because plenty of
+        // people leave Reduce Motion on for system-wide reasons. So it stays,
+        // slower and on the calmest set: still a signal that something is
+        // happening, without the flicker.
+        TimelineView(.periodic(from: .now, by: reduceMotion ? interval * 4 : interval)) { context in
+            let frames = reduceMotion ? Self.calmFrames : self.frames
+            let frame = Int(context.date.timeIntervalSinceReferenceDate / (reduceMotion ? interval * 4 : interval)) % frames.count
+            Text(frames[frame])
+                .font(.system(.footnote, design: .monospaced))
                 .foregroundStyle(.secondary)
-        } else {
-            // TimelineView rather than a Timer: no state to invalidate, no
-            // subscription to leak when the view disappears mid-stream, and it
-            // stops ticking on its own when the answer starts arriving.
-            TimelineView(.periodic(from: .now, by: interval)) { context in
-                let frame = Int(context.date.timeIntervalSinceReferenceDate / interval) % frames.count
-                Text(frames[frame])
-                    .font(.system(.footnote, design: .monospaced))
-                    .foregroundStyle(.secondary)
-            }
-            .accessibilityLabel("Thinking")
         }
+        .accessibilityLabel("Thinking")
     }
 
     struct Frames {
@@ -78,6 +74,11 @@ struct ThinkingAnimation: View {
         var hash = 5381
         for byte in seed.utf8 { hash = ((hash << 5) &+ hash) &+ Int(byte) }
         return sets[abs(hash) % sets.count]
+    }
+
+    /// The gentlest set, used when Reduce Motion asks for less movement.
+    private static var calmFrames: [String] {
+        sets.first { $0.name == "blink" }?.frames ?? sets[0].frames
     }
 
     // Every frame in a set is padded to the same width, because a Text that
