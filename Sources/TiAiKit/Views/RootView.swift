@@ -181,6 +181,13 @@ public struct ChatListView: View {
                     AppearancePicker()
                 }
                 ToolbarItem(placement: .primaryAction) {
+                    NavigationLink {
+                        NotesView(client: session.client)
+                    } label: {
+                        Label("Notes", systemImage: "note.text")
+                    }
+                }
+                ToolbarItem(placement: .primaryAction) {
                     Button { showingMemory = true } label: {
                         Label("Memory", systemImage: "brain")
                     }

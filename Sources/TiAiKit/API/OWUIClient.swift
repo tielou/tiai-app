@@ -489,6 +489,35 @@ public struct OWUIClient: Sendable {
         return try Self.validate(payload, http, as: FileRecord.self)
     }
 
+    // MARK: - notes
+
+    /// Notes are a separate object from chats, with their own list and sharing.
+    public func notes() async throws -> [Note] {
+        try await request("GET", "/notes/")
+    }
+
+    public func note(id: String) async throws -> Note {
+        try await request("GET", "/notes/\(id)")
+    }
+
+    public func createNote(title: String, markdown: String) async throws -> Note {
+        try await request(
+            "POST", "/notes/create", bodyData: Note.payload(title: title, markdown: markdown))
+    }
+
+    /// Saves a note. Only `title` and `content.md` are sent, because the server
+    /// merges the keys present and a note also carries a rich-editor document
+    /// this client has no business rewriting.
+    public func updateNote(id: String, title: String, markdown: String) async throws -> Note {
+        try await request(
+            "POST", "/notes/\(id)/update",
+            bodyData: Note.payload(title: title, markdown: markdown))
+    }
+
+    public func deleteNote(id: String) async throws {
+        let _: Bool = try await request("DELETE", "/notes/\(id)/delete")
+    }
+
     /// Raw bytes of an uploaded file.
     ///
     /// `AsyncImage` cannot be used here: the route is behind the bearer token,

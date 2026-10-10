@@ -489,3 +489,88 @@ struct ServerTests {
     // Reading only source.url is why a citation rendered as dead text.
     #expect(sources.first?.url == "https://www.rbb24.de/berlin/")
 }
+
+@Test func noteTimestampsSurviveWhateverUnitTheyArriveIn() throws {
+    // Recorded from the server: notes come back with nanosecond timestamps, and
+    // reading them as seconds put "December 5828963" in the list. The other
+    // units are covered because nothing in the API says which one it is.
+    func note(_ stamp: String) -> Note {
+        try! JSONDecoder().decode(
+            Note.self,
+            from: Data("""
+            {"id":"n1","title":"T","updated_at":\(stamp),"created_at":\(stamp),
+             "data":{"content":{"md":"# Head\\nbody line"}}}
+            """.utf8))
+    }
+    let expected = 1_790_407_934
+    for stamp in ["\(expected)", "\(expected)000", "\(expected)000000", "\(expected)000000000"] {
+        let seconds = note(stamp).updatedAt.timeIntervalSince1970
+        #expect(abs(seconds - Double(expected)) < 2, "stamp \(stamp) read as \(seconds)")
+    }
+    #expect(note("\(expected)000000000").markdown == "# Head\nbody line")
+    #expect(note("\(expected)000000000").preview == "Head")
+}
+
+@Test func notesRequestsMatchTheRoutes() async throws {
+    // The routes are `POST /notes/create`, `POST /notes/{id}/update` and
+    // `DELETE /notes/{id}/delete` — none of them RESTful, all of them easy to
+    // guess wrong, and a wrong guess only shows up when someone tries to save.
+    let transport = NotesTransport()
+    let client = OWUIClient(
+        server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"),
+        transport: transport)
+
+    _ = try await client.notes()
+    _ = try await client.note(id: "n1")
+    _ = try await client.createNote(title: "Groceries", markdown: "# List\n- bread")
+    _ = try await client.updateNote(id: "n1", title: "Groceries", markdown: "# List\n- milk")
+    try await client.deleteNote(id: "n1")
+
+    #expect(transport.calls.map { "\($0.0) \($0.1)" } == [
+        "GET /api/v1/notes",
+        "GET /api/v1/notes/n1",
+        "POST /api/v1/notes/create",
+        "POST /api/v1/notes/n1/update",
+        "DELETE /api/v1/notes/n1/delete",
+    ])
+    // Only `title` and `data.content.md` go on the wire. The note also holds a
+    // rich-editor document, and the server merges the keys present — sending
+    // anything else would overwrite what the web UI wrote.
+    // The delete sends nothing, so "last" would be an empty body.
+    let body = try #require(transport.bodies.last { !$0.isEmpty })
+    let json = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+    #expect(json?["title"] as? String == "Groceries")
+    let content = (json?["data"] as? [String: Any])?["content"] as? [String: Any]
+    #expect(content?["md"] as? String == "# List\n- milk")
+    #expect(json.map { Set($0.keys) } == ["title", "data"])
+}
+
+/// Answers just enough for the notes routes to decode.
+private final class NotesTransport: APITransport, @unchecked Sendable {
+    private(set) var calls: [(String, String)] = []
+    private(set) var bodies: [Data] = []
+
+    func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        let path = request.url?.path ?? ""
+        calls.append((request.httpMethod ?? "", path))
+        bodies.append(request.httpBody ?? Data())
+        let note = """
+        {"id":"n1","title":"Groceries","is_pinned":false,
+         "updated_at":1790407934000000000,"created_at":1790407934000000000,
+         "data":{"content":{"md":"# List\\n- bread"}}}
+        """
+        // The client drops the trailing slash on the way to the URL, so routes
+        // are matched by suffix here rather than by exact path.
+        let payload: String
+        if path.hasSuffix("/notes/n1/delete") { payload = "true" }
+        else if path.hasSuffix("/notes") { payload = "[\(note)]" }
+        else { payload = note }
+        let response = HTTPURLResponse(
+            url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        return (Data(payload.utf8), response)
+    }
+
+    func bytes(_ request: URLRequest) async throws -> (ByteStream, HTTPURLResponse) {
+        fatalError("notes do not stream")
+    }
+}
