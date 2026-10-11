@@ -80,7 +80,15 @@ public final class ConversationModel {
     /// How long a turn may sit between a `finish_reason` and the tool result that
     /// follows it. Long enough for a slow MCP server, short enough that a tool
     /// which died silently does not leave the composer spinning for three minutes.
-    static let handoffLimit: Duration = .seconds(60)    /// Deltas are coalesced before they reach observable state: a model emitting
+    static let handoffLimit: Duration = .seconds(60)
+
+    /// How long to wait after an errored run claims to have finished, to see
+    /// whether it really is finished.
+    ///
+    /// Not the tool-handoff budget: a tool may legitimately take a minute, but
+    /// an errored run that stays silent for a few seconds is done, and making
+    /// the user watch a spinner for a minute over a hiccup is its own bug.
+    static let errorRecoveryLimit: Duration = .seconds(3)    /// Deltas are coalesced before they reach observable state: a model emitting
     /// token by token would otherwise invalidate the transcript view per token,
     /// which is the difference between a smooth stream and a stuttering one.
     static let flushInterval: Duration = .milliseconds(60)
@@ -612,7 +620,10 @@ public final class ConversationModel {
                 // while it sent everything.
                 await refresh(messageID: assistantID)
                 if turns.first(where: { $0.id == assistantID })?.text.isEmpty ?? true {
-                    outcome.failure = "The server sent nothing."
+                    // The server's own reason beats our guess. "The server sent
+                    // nothing" is true but useless next to "Empty reply from
+                    // server", which names the thing that actually broke.
+                    outcome.failure = outcome.reportedError ?? "The server sent nothing."
                 } else {
                     leafID = assistantID
                 }
@@ -642,12 +653,28 @@ public final class ConversationModel {
                 turns[index].calls = Turn.reconciling(turns[index].calls, done: true)
             }
         }
+        // An error that arrived alongside a real answer is noise about how the
+        // answer was produced, not a reason to hide it. Only surface it when
+        // there is genuinely nothing to show.
+        if outcome.failure == nil, let reported = outcome.reportedError {
+            let got = turns.first(where: { $0.id == assistantID })?.text ?? ""
+            if got.isEmpty { outcome.failure = reported }
+        }
         if let failure = outcome.failure { error = failure }
         phase = .ready
     }
 
     struct DrainOutcome {
         var sawTerminal = false
+        /// An error the server reported mid-run, kept apart from `failure`.
+        ///
+        /// A model backend can drop the connection mid-image and the run can
+        /// carry on anyway — the user saw exactly that: "empty reply from
+        /// server" in a red banner, the spinner off, and the full answer
+        /// appearing when they reopened the chat. Recording it separately lets
+        /// the run be judged on what actually arrived rather than on the worst
+        /// frame that passed by.
+        var reportedError: String?
         /// Waiting on the user to answer a tool call. Distinct from finishing,
         /// because nothing more will arrive until they do.
         var parked = false
@@ -694,13 +721,19 @@ public final class ConversationModel {
         }
 
         var sawToolArguments = false
+        var erroredOnce = false
         var grace: Task<Void, Never>?
         for await frame in frames {
             if let messageID = frame.messageID, messageID != assistantID { continue }
             if let delta = frame.delta { pending?.text += delta }
             if let thinking = frame.reasoningDelta { pending?.reasoning += thinking }
             if let usage = frame.usage { pending?.usage = usage }
-            if let problem = frame.errorText { outcome.failure = problem }
+            if let problem = frame.errorText {
+                // Not `failure`: an error frame is the server reporting a
+                // problem, not the run ending. Treating it as terminal stopped
+                // the listener while the answer was still being written.
+                outcome.reportedError = problem
+            }
             if let answered = frame.answeredModel { pending?.model = answered }
             if let calls = frame.outputItems { pending?.calls = calls }
             if frame.isToolArgumentsDelta { sawToolArguments = true }
@@ -722,6 +755,21 @@ public final class ConversationModel {
                     sawToolArguments = false
                     grace = Task { [hub] in
                         try? await Task.sleep(for: Self.handoffLimit)
+                        if !Task.isCancelled { hub.expire(chatID: chatID ?? "") }
+                    }
+                    continue
+                }
+                // A run that reported an error and then "finished" is the one
+                // case where finishing is not to be believed: the upstream
+                // dropped, the server closed the stream, and then carried on
+                // writing the answer anyway. Ending here is what turned a
+                // recoverable hiccup into a red banner over an empty bubble
+                // while the real answer was still being produced. So wait once,
+                // on the same budget as a tool handoff, and see if it resumes.
+                if outcome.reportedError != nil && !erroredOnce {
+                    erroredOnce = true
+                    grace = Task { [hub] in
+                        try? await Task.sleep(for: Self.errorRecoveryLimit)
                         if !Task.isCancelled { hub.expire(chatID: chatID ?? "") }
                     }
                     continue
@@ -851,7 +899,7 @@ public final class ConversationModel {
             }
             if !outcome.sawTerminal && outcome.failure == nil
                 && self.turns.first(where: { $0.id == messageID })?.text.isEmpty ?? true {
-                outcome.failure = "The server sent nothing."
+                outcome.failure = outcome.reportedError ?? "The server sent nothing."
             }
             // The continuation after a tool answer is the case that started
             // this: the resumed run announces itself in a shape this client had
@@ -865,6 +913,10 @@ public final class ConversationModel {
             }
             if !outcome.parked, let index = self.turns.firstIndex(where: { $0.id == messageID }) {
                 self.turns[index].calls = Turn.reconciling(self.turns[index].calls, done: true)
+            }
+            if outcome.failure == nil, let reported = outcome.reportedError {
+                let got = self.turns.first(where: { $0.id == messageID })?.text ?? ""
+                if got.isEmpty { outcome.failure = reported }
             }
             if let failure = outcome.failure { self.error = failure }
             self.phase = .ready

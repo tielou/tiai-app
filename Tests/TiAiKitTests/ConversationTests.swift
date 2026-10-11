@@ -1156,3 +1156,63 @@ enum AskUserFixture {
     // matches on what it sent, not on what the badge made it look like.
     #expect(options[0].value == "Slovenia (recommended)")
 }
+
+// An upstream that drops mid-image and a run that actually failed look the same
+// in one frame and completely different by the end. The user saw the first one
+// rendered as the second: "empty reply from server" in a red banner, the spinner
+// off, and the full answer waiting when they reopened the chat.
+@Test @MainActor func anErrorFrameAlongsideAnAnswerIsNotAFailure() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"),
+                           transport: transport),
+        hub: hub)
+
+    conversation.draft = "what is in this picture?"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-1", messageID: id,
+                              inner: ["error": "Empty reply from server"]))
+    for piece in ["A ", "screenshot ", "of ", "a router."] {
+        hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-1", messageID: id, inner: [
+            "choices": [["index": 0, "delta": ["content": piece]]],
+        ]))
+    }
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-1", messageID: id,
+                              inner: ["choices": [["index": 0, "finish_reason": "stop"]]]))
+    // The app waits a few seconds after an errored "finish" to see if the run
+    // resumes, because that is exactly what the server does here.
+    try await waitUntil(timeout: .seconds(8)) { conversation.phase == .ready }
+
+    #expect(conversation.turns.last?.text == "A screenshot of a router.")
+    #expect(conversation.error == nil,
+            "the answer arrived; the hiccup that produced it is not the user's problem")
+}
+
+@Test @MainActor func anErrorFrameWithNothingElseIsStillAnError() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"),
+                           transport: transport),
+        hub: hub)
+
+    conversation.draft = "what is in this picture?"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-1", messageID: id,
+                              inner: ["error": "Empty reply from server"]))
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-1", messageID: id,
+                              inner: ["choices": [["index": 0, "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(8)) { conversation.phase == .ready }
+
+    #expect(conversation.error == "Empty reply from server",
+            "with no answer at all, the error is the only useful thing to say")
+}
