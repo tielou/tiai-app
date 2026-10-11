@@ -24,8 +24,11 @@
 	<false/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
+		<!-- The server is whatever the user types in, and an OAuth hand-off may
+		leave it for a self-hosted identity provider on plain http. Blocking that
+		makes the sign-in sheet do nothing at all, with no error anywhere. -->
 		<key>NSAllowsArbitraryLoads</key>
-		<false/>
+		<true/>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>

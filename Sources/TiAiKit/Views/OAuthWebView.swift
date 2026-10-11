@@ -23,11 +23,45 @@ struct OAuthWebView: View {
 
     @Environment(\.dismiss) private var dismiss
 
+    @State private var whereAmI: String?
+    @State private var failure: String?
+
     var body: some View {
         NavigationStack {
-            SessionBrowser(url: url, token: token, domain: domain) {
-                onFinished()
-                dismiss()
+            VStack(spacing: 0) {
+                // A hand-off that goes wrong fails silently by default: the sheet
+                // just sits there and the only honest description is "nothing
+                // happened". Both of these turn that into something to act on.
+                if let failure {
+                    Label(failure, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .background(.orange.opacity(0.12))
+                }
+                SessionBrowser(
+                    url: url, token: token, domain: domain,
+                    onURL: { whereAmI = $0 }, onFailed: { failure = $0 }
+                ) {
+                    onFinished()
+                    dismiss()
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                // Where the hand-off actually is. iOS 18 has no navigation
+                // subtitle, and guessing from a blank page is what we are here
+                // to stop doing.
+                if let whereAmI, !whereAmI.isEmpty {
+                    Text(whereAmI)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 3)
+                        .background(.bar)
+                }
             }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -51,12 +85,21 @@ private struct SessionBrowser: UIViewControllerRepresentable {
     let url: URL
     let token: String
     let domain: String
+    var onURL: (String) -> Void
+    var onFailed: (String) -> Void
     var onCallback: () -> Void
 
-    func makeCoordinator() -> Coordinator { Coordinator(onCallback: onCallback, host: domain) }
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onCallback: onCallback, host: domain, onURL: onURL, onFailed: onFailed)
+    }
 
     func makeUIViewController(context: Context) -> WebController {
         let configuration = WKWebViewConfiguration()
+        // Identity providers love opening their consent screen with window.open().
+        // By default WKWebView refuses that *before* the delegate is consulted, so
+        // the popup handler below never runs and the flow dies silently right
+        // after a successful login - which is exactly what this looked like.
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
         configuration.userContentController.addUserScript(WKUserScript(
             source: Self.autofillScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true,
             in: .page))
@@ -143,20 +186,42 @@ private struct SessionBrowser: UIViewControllerRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         private let onCallback: () -> Void
+        private let onURL: (String) -> Void
+        private let onFailed: (String) -> Void
         /// The Open WebUI host the flow started from. Coming back here is what
         /// "finished" means.
         private let host: String
         /// Set once the dance has gone off to the identity provider.
         private var leftOrigin = false
 
-        init(onCallback: @escaping () -> Void, host: String) {
+        init(onCallback: @escaping () -> Void, host: String,
+             onURL: @escaping (String) -> Void, onFailed: @escaping (String) -> Void) {
             self.onCallback = onCallback
             self.host = host
+            self.onURL = onURL
+            self.onFailed = onFailed
         }
 
         private func isMine(_ url: URL?) -> Bool {
             guard let host = url?.host else { return false }
             return host == self.host || host.hasSuffix(".\(self.host)")
+        }
+
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            onURL(webView.url.map(Self.describe) ?? "")
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            didFailProvisionalNavigation navigation: WKNavigation!,
+            withError error: Error
+        ) {
+            // ATS refusals and unreachable hosts used to leave a blank sheet.
+            onFailed((error as? LocalizedError)?.localizedDescription ?? error.localizedDescription)
+        }
+
+        private static func describe(_ url: URL) -> String {
+            url.host.map { $0 + (url.path == "/" ? "" : url.path) } ?? url.absoluteString
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -174,16 +239,6 @@ private struct SessionBrowser: UIViewControllerRepresentable {
             // fires and the sheet just sits there showing the web app, which
             // looks exactly like a login button that did nothing.
             if url?.path.contains("/callback") == true || leftOrigin { onCallback() }
-        }
-
-        func webView(
-            _ webView: WKWebView,
-            didFailProvisionalNavigation navigation: WKNavigation!,
-            withError error: Error
-        ) {
-            // A failed hand-off used to leave a blank sheet with no explanation.
-            // The url is the only clue the user has that anything happened at all.
-            leftOrigin = false
         }
 
         /// Identity providers love opening their login in a new window. A
