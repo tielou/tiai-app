@@ -1,4 +1,7 @@
-.PHONY: build test probe app-check check project icon clean
+.PHONY: build test probe app-check check project icon clean install ios ios-release
+
+# The simulator the app is built for and installed onto.
+SIM_UDID = 92C09667-3F60-4C1B-A548-3C863E2B6E63
 
 ## Compiles the kit for macOS. This is the whole point of the split: no Xcode,
 ## no simulator, no Apple ID -- just the Command Line Tools.
@@ -38,8 +41,10 @@ ios:
 install: app
 	xcodebuild -quiet -project TiAi.xcodeproj -scheme TiAi \
 	  -destination 'platform=iOS Simulator,name=iPhone 16e' build
-	xcrun simctl install $$DEVUDID \
+	xcrun simctl terminate $(SIM_UDID) co.wobker.tiai 2>/dev/null || true
+	xcrun simctl install $(SIM_UDID) \
 	  $$(ls -d $$HOME/Library/Developer/Xcode/DerivedData/TiAi-*/Build/Products/Debug-iphonesimulator/TiAi.app | head -1)
+	xcrun simctl launch $(SIM_UDID) co.wobker.tiai
 
 ios-release: app
 	xcodebuild -quiet -project TiAi.xcodeproj -scheme TiAi \
