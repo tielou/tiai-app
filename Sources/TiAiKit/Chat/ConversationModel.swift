@@ -563,18 +563,32 @@ public final class ConversationModel {
                 // a broken one. The partial answer is the answer they got.
                 leafID = assistantID
             } else {
-                // The frame stream ended without ever saying it was finished.
-                // Most of the time that is a socket blip and not a failed run:
-                // the server has the whole answer, and leaving the chat and
-                // coming back shows it. So look there before calling it a
-                // failure — "the server sent nothing" while it sent everything
-                // is a claim the user can disprove by doing exactly that.
+                // No terminal frame at all: usually a socket blip rather than a
+                // failed run, so look before claiming "the server sent nothing"
+                // while it sent everything.
                 await refresh(messageID: assistantID)
                 if turns.first(where: { $0.id == assistantID })?.text.isEmpty ?? true {
                     outcome.failure = "The server sent nothing."
                 } else {
                     leafID = assistantID
                 }
+            }
+            // And reconcile even when it *did* finish cleanly.
+            //
+            // A terminal frame says the run ended; it does not say this client
+            // understood everything that arrived. Sources, attachments, usage,
+            // and the continuation after a tool call all live in frames we may
+            // parse incompletely or not at all, and the failure mode is
+            // invisible: the answer looks fine until you leave the chat and
+            // come back and it is suddenly longer. That "refresh fixes it"
+            // feeling is the bug, in three places so far.
+            //
+            // One GET after every run is the cheap universal answer, and
+            // `refresh` only ever grows a turn, so a good live stream is never
+            // made worse by it.
+            if outcome.failure == nil && !outcome.parked {
+                await refresh(messageID: assistantID)
+                leafID = assistantID
             }
         }
         if let failure = outcome.failure { error = failure }
@@ -749,6 +763,28 @@ public final class ConversationModel {
                 try await self.client.resolveToolCall(
                     chatID: chat, messageID: messageID, callID: call.callID,
                     action: action, answers: answers)
+            } catch let error as APIError {
+                // 404 "Tool call not found" after an answer almost never means
+                // the answer was lost — it means the server already took it and
+                // moved on, and this client was holding a stale card. The run
+                // continues under the same message, so the honest response is
+                // to look at the message, not to shout.
+                //
+                // A multi-question prompt made this routine: answering question
+                // one settles the whole call, and the second tap for question
+                // two lands on an id that no longer exists.
+                if case .http(404, _) = error {
+                    await self.refresh(messageID: messageID)
+                    if let index = self.turns.firstIndex(where: { $0.id == messageID }) {
+                        self.turns[index].streaming = false
+                    }
+                    self.leafID = messageID
+                    self.phase = .ready
+                    return
+                }
+                self.error = error.localizedDescription
+                self.phase = .ready
+                return
             } catch {
                 self.error = error.localizedDescription
                 self.phase = .ready
@@ -759,16 +795,19 @@ public final class ConversationModel {
                 self.phase = .ready
                 return
             }
-            if outcome.sawTerminal { self.leafID = messageID }
-            else if outcome.failure == nil {
-                // Same reasoning as the first run: a resumed stream that ends
-                // quietly is usually a blip, and the answer is already stored.
+            if !outcome.sawTerminal && outcome.failure == nil
+                && self.turns.first(where: { $0.id == messageID })?.text.isEmpty ?? true {
+                outcome.failure = "The server sent nothing."
+            }
+            // The continuation after a tool answer is the case that started
+            // this: the resumed run announces itself in a shape this client had
+            // not learned, so the text arrived and was dropped, and the screen
+            // sat on the pre-question text until you left and came back.
+            // Reconciling against the stored message makes the answer correct
+            // regardless of which frames we happened to understand.
+            if outcome.failure == nil && !outcome.parked {
                 await self.refresh(messageID: messageID)
-                if self.turns.first(where: { $0.id == messageID })?.text.isEmpty ?? true {
-                    outcome.failure = "The server sent nothing."
-                } else {
-                    self.leafID = messageID
-                }
+                self.leafID = messageID
             }
             if let failure = outcome.failure { self.error = failure }
             self.phase = .ready
@@ -795,7 +834,13 @@ public final class ConversationModel {
         if fresh.text.count > turn.text.count { turn.text = fresh.text }
         if fresh.reasoning.count > turn.reasoning.count { turn.reasoning = fresh.reasoning }
         if !fresh.calls.isEmpty { turn.calls = fresh.calls }
+        if !fresh.sources.isEmpty { turn.sources = fresh.sources }
+        if !fresh.attachments.isEmpty { turn.attachments = fresh.attachments }
         turn.usage = fresh.usage ?? turn.usage
+        // The stored message is the authority on how the run ended. If it is
+        // settled and we are still showing a spinner, the live stream missed
+        // the ending and there is nothing more coming.
+        if message.done { turn.streaming = false }
         turns[index] = turn
     }
 

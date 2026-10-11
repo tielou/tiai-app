@@ -874,10 +874,15 @@ extension ToolCall {
 
     var settledSummary: String {
         if isAskUser {
+            if let failure = failureText { return failure }
             if status == .rejected { return "Skipped" }
-            guard let answer = answerSummary else { return "Answered" }
+            // "Answered" with nothing after it was a lie twice over: the call
+            // may have been skipped, or the answer simply never came back, and
+            // either way the tick next to it was already wrong.
+            guard let answer = answerSummary else { return "No answer recorded" }
             return answer.count > 120 ? String(answer.prefix(120)) + "…" : answer
         }
+        if status == .failed, let failure = failureText { return "\(name): \(failure)" }
         return status == .rejected ? "\(name) rejected" : name
     }
 }

@@ -90,6 +90,30 @@ public struct ToolCall: Equatable, Sendable, Identifiable {
         self.resultText = Self.text(from: object["output"])
     }
 
+    /// The tool's own failure, when it failed.
+    ///
+    /// A rejected `ask_user` does not arrive as an HTTP error and does not stop
+    /// the run: the server validates the model's arguments, decides "Each
+    /// question requires 2-3 options", and writes that back as the call's
+    /// output. Reading it as a normal result rendered a green tick next to the
+    /// sentence saying it had failed, which is worse than saying nothing.
+    public var failureText: String? {
+        guard let raw = resultText?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty
+        else { return nil }
+        if raw.hasPrefix("Error:") || raw.hasPrefix("error:") {
+            return String(raw.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+        }
+        guard let data = raw.data(using: .utf8),
+              let json = try? JSONDecoder().decode(JSONValue.self, from: data),
+              let object = json.objectValue
+        else { return nil }
+        if let message = object["error"]?.stringValue { return message }
+        if object["status"]?.stringValue == "error",
+           let message = object["message"]?.stringValue { return message }
+        return nil
+    }
+
     /// What the user actually chose, pulled out of the tool's own reply.
     ///
     /// The stored result is the JSON the tool was handed back —
@@ -97,6 +121,10 @@ public struct ToolCall: Equatable, Sendable, Identifiable {
     /// verbatim, as the first builds did, puts a JSON blob where a sentence
     /// belongs. The user picked Pizza; the transcript should say Pizza.
     public var answerSummary: String? {
+        // An error is not an answer, and putting the sentence under a tick is
+        // how the transcript ends up claiming the user chose "Each question
+        // requires 2-3 options".
+        if failureText != nil { return nil }
         guard let raw = resultText else { return nil }
         guard let data = raw.data(using: .utf8),
               let json = try? JSONDecoder().decode(JSONValue.self, from: data)
@@ -124,7 +152,9 @@ public struct ToolCall: Equatable, Sendable, Identifiable {
             guard let call = ToolCall(item) else { continue }
             if type == "function_call_output", var existing = byID[call.callID] {
                 existing.resultText = call.resultText ?? existing.resultText
-                if existing.status != .rejected { existing.status = .completed }
+                if existing.status != .rejected {
+                    existing.status = existing.failureText == nil ? .completed : .failed
+                }
                 byID[call.callID] = existing
                 continue
             }

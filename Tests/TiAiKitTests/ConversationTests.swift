@@ -1014,3 +1014,49 @@ enum AskUserFixture {
     #expect(links.contains("https://cdn.example.com/i.ico"))
     #expect(!links.contains("https://example.com/style.css"))
 }
+
+// A rejected ask_user does not fail the request; the server writes its complaint
+// into the call's output and carries on. Every one of these was visible on a
+// real chat as a green tick next to the sentence saying it had failed.
+@Test func toolOutputThatIsAnErrorIsNotAnAnswer() {
+    func call(_ output: String) -> ToolCall? {
+        ToolCall(.object([
+            "type": .string("function_call_output"),
+            "call_id": .string("c1"), "name": .string("ask_user"),
+            "status": .string("completed"),
+            "output": .array([.object(["type": .string("input_text"),
+                                       "text": .string(output)])]),
+        ]))
+    }
+    guard let plain = call("Error: Each question requires 2-3 options.") else {
+        Issue.record("call should parse"); return
+    }
+    #expect(plain.failureText == "Each question requires 2-3 options.")
+    #expect(plain.answerSummary == nil, "the error must not be presented as the user's choice")
+
+    guard let answered = call(#"{"status":"answered","answers":{"q1":"Pizza"}}"#) else {
+        Issue.record("call should parse"); return
+    }
+    #expect(answered.failureText == nil)
+    #expect(answered.answerSummary == "Pizza")
+
+    guard let structured = call(#"{"error":"Tool not available"}"#) else {
+        Issue.record("call should parse"); return
+    }
+    #expect(structured.failureText == "Tool not available")
+}
+
+@Test func foldingAnErrorOutputMarksTheCallFailed() {
+    let items: [JSONValue] = [
+        .object(["type": .string("function_call"), "call_id": .string("c1"),
+                 "name": .string("ask_user"), "status": .string("pending")]),
+        .object(["type": .string("function_call_output"), "call_id": .string("c1"),
+                 "name": .string("ask_user"), "status": .string("completed"),
+                 "output": .array([.object(["type": .string("input_text"),
+                                            "text": .string("Error: nope")])])]),
+    ]
+    let calls = ToolCall.calls(from: items)
+    #expect(calls.count == 1, "a call and its output are one row, not two")
+    #expect(calls[0].status == .failed)
+    #expect(calls[0].isSettled)
+}
