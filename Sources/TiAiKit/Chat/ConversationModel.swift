@@ -85,13 +85,42 @@ public final class ConversationModel {
     /// which is the difference between a smooth stream and a stuttering one.
     static let flushInterval: Duration = .milliseconds(60)
 
+    /// A chat that is never saved.
+    ///
+    /// Open WebUI's contract, read out of its own frontend bundle: a chat id of
+    /// `temporary:<socket sid>` is temporary, `local:` is the legacy spelling of
+    /// the same thing, and anything else is a saved chat. The server checks
+    /// `is_saved_chat_id` before writing a message, so nothing is persisted —
+    /// and it resolves the embedded sid back to the socket to decide who owns
+    /// the chat, which is why the id has to carry *this* socket's id and not a
+    /// made-up one.
+    public var incognito = false
+
+    /// Whether incognito can still be switched. Once anything is on the wire the
+    /// answer is already decided: a saved chat has messages the server kept, and
+    /// a temporary one has nothing to switch back to.
+    public var canChangeIncognito: Bool { Self.canChangeIncognito(given: turns) }
+
+    static func canChangeIncognito(given turns: [Turn]) -> Bool {
+        turns.allSatisfy { turn in
+            turn.text.isEmpty && turn.role != "user" && turn.calls.isEmpty
+        }
+    }
+
+    /// The chat id a temporary run uses, or nil until the socket has one.
+    private var temporaryChatID: String? {
+        hub.sessionID.map { "temporary:\($0)" }
+    }
+
     public init(
         chatID: String?,
         title: String = "New Chat",
         models: [ChatModel] = [],
+        incognito: Bool = false,
         client: OWUIClient,
         hub: ChatEventHub
     ) {
+        self.incognito = incognito
         self.chatID = chatID
         self.title = title
         self.client = client
@@ -99,7 +128,7 @@ public final class ConversationModel {
         self.models = models
         modelIDs = models.map(\.id)
         model = models.first?.id ?? ""
-        features = Self.seedFeatures(for: models.first)
+        features = Self.seedFeatures(for: models.first, incognito: incognito)
     }
 
     /// The toggles a model starts a chat with.
@@ -110,11 +139,13 @@ public final class ConversationModel {
     /// it is a worse surprise than one that remembers too much. Memory is only
     /// offered where the model reports the capability, because a toggle that
     /// does nothing is worse than no toggle.
-    static func seedFeatures(for model: ChatModel?) -> [String: Bool] {
+    static func seedFeatures(for model: ChatModel?, incognito: Bool = false) -> [String: Bool] {
         guard let model else { return [:] }
         var seeded = Dictionary(
             uniqueKeysWithValues: (model.defaultFeatureIDs ?? []).map { ($0, true) })
-        if model.supports(.memory) { seeded[ChatFeature.memory.rawValue] = true }
+        // Incognito has to mean something. Remembering what the user just said
+        // in a chat that is supposed to vanish is the opposite of the request.
+        if model.supports(.memory) && !incognito { seeded[ChatFeature.memory.rawValue] = true }
         return seeded
     }
 
@@ -133,14 +164,14 @@ public final class ConversationModel {
         // A chat can open before the model list arrives, which leaves the
         // toggles unseeded. Fill them in, but never over a choice the user has
         // already made in this chat.
-        if features.isEmpty { features = Self.seedFeatures(for: models.first) }
+        if features.isEmpty { features = Self.seedFeatures(for: models.first, incognito: incognito) }
     }
 
     /// Called when the model changes: the defaults belong to the model, so the
     /// toggles have to follow it rather than keep the previous model's settings.
     public func select(model id: String, from models: [ChatModel]) {
         model = id
-        features = Self.seedFeatures(for: models.first { $0.id == id })
+        features = Self.seedFeatures(for: models.first { $0.id == id }, incognito: incognito)
     }
 
     /// Connects the shared socket. Failures are not fatal: the REST calls still
@@ -155,6 +186,13 @@ public final class ConversationModel {
 
     public func load() async {
         guard let chatID else { return }
+        // A temporary chat has no history to fetch — that is the whole point —
+        // and asking for one is a guaranteed 404 on an id the server never
+        // stored, which would put a red error banner on a perfectly good chat.
+        if incognito || chatID.hasPrefix("temporary:") || chatID.hasPrefix("local:") {
+            phase = .ready
+            return
+        }
         phase = .loading
         do {
             let detail = try await client.chat(id: chatID)
@@ -937,7 +975,16 @@ public final class ConversationModel {
     /// The chat has to exist before the completion is sent, and a brand-new
     /// conversation does not exist until this returns.
     private func ensureChat(named text: String) async throws -> String {
-        if let chatID { return chatID }
+        if let chatID, !incognito { return chatID }
+        if incognito {
+            // No POST /chats/create: a chat record is the thing incognito
+            // promises not to leave behind. The id is derived, not allocated.
+            guard let temporary = temporaryChatID else {
+                throw APIError.unreachable("Waiting for the connection to open.")
+            }
+            chatID = temporary
+            return temporary
+        }
         let created = try await client.createChat(title: Self.title(from: text))
         chatID = created.id
         title = created.title

@@ -77,7 +77,9 @@ public struct ConversationView: View {
                 chatTools: chatTools, chatToolsError: chatToolsError,
                 onAuthorize: { authorizing = AuthorizeRequest(url: $0) })
         }
-        .inlineTitle(conversation.title)
+        // A chat that is not being saved has to say so where you are looking,
+        // not only in a sheet you set once at the start and never opened again.
+        .inlineTitle(conversation.incognito ? "Incognito" : conversation.title)
         #if os(iOS)
         .sheet(item: $authorizing) { request in
             OAuthWebView(

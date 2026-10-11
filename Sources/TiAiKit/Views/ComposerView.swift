@@ -402,6 +402,29 @@ struct AddToChatSheet: View {
                         .disabled(currentModel.map { !$0.supports(feature) } ?? false)
                     }
                 }
+
+                Section {
+                    Toggle(isOn: $conversation.incognito) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Label("Incognito", systemImage: "mask")
+                            Text(conversation.incognito
+                                ? "This chat is not saved to your history."
+                                : "Don't save this chat to my history")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    // Turning it on halfway through a saved chat cannot undo the
+                    // messages already written, and turning it off cannot bring a
+                    // discarded chat back. So it is a choice for the start of a
+                    // conversation, which is also how the web UI treats it.
+                    .disabled(!conversation.canChangeIncognito)
+                    if !conversation.canChangeIncognito {
+                        Text("Incognito is set when a chat starts.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Privacy")
+                }
             }
             .inlineTitle("Add to Chat")
             .toolbar {

@@ -1097,3 +1097,27 @@ enum AskUserFixture {
     #expect(call(#"{"nonsense":true}"#).hasStructuredArguments == true,
             "parsed but unrecognised is the case that gets the free-text fallback")
 }
+
+// Incognito is Open WebUI's own feature, and its contract is read from the
+// server's own bundle: a chat id of `temporary:<socket sid>` is never written to
+// the database. These pin the two client-side promises that go with it.
+@Test @MainActor func incognitoDoesNotSeedMemory() {
+    let model = ChatModel.stub("local-personal", caps: ["web_search": true, "memory": true])
+    #expect(model.supports(.memory))
+    #expect(ConversationModel.seedFeatures(for: model).keys.contains(ChatFeature.memory.rawValue),
+            "memory is on by default where the model supports it")
+    #expect(!ConversationModel.seedFeatures(for: model, incognito: true)
+        .keys.contains(ChatFeature.memory.rawValue),
+        "a chat that is supposed to vanish must not leave memories behind")
+}
+
+@Test @MainActor func incognitoIsAChoiceOnlyAtTheStart() {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    #expect(ConversationModel.canChangeIncognito(given: []))
+    #expect(!ConversationModel.canChangeIncognito(given: [Turn(id: "u1", role: "user", text: "sent")]),
+            "messages already on the server cannot be unsent by switching it on now")
+    #expect(!ConversationModel.canChangeIncognito(
+        given: [Turn(id: "a1", role: "assistant", text: "an answer")]),
+        "a saved answer cannot be un-saved either")
+    _ = server
+}
