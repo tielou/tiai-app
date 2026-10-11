@@ -91,10 +91,31 @@ public struct Turn: Identifiable, Equatable, Sendable {
         error = message.error
         model = message.model
         usage = message.usage
-        calls = message.toolCalls
+        calls = Turn.reconciling(message.toolCalls, done: message.done)
         sources = message.citedSources
         attachments = message.messageAttachments
         createdAt = message.timestamp ?? .now
+    }
+
+    /// A finished message is not waiting on anyone.
+    ///
+    /// A stored message can keep a `function_call` item in `pending` after the
+    /// run has moved past it — the server appends the output rather than
+    /// rewriting the call, and when the two do not fold together the leftover
+    /// reads as a question still on screen. The result was a card that said "The
+    /// model is asking a question" with no question, an empty field and a Send
+    /// button that could not be pressed: a dead end the user cannot leave, on a
+    /// message that had already finished and printed its answer underneath.
+    ///
+    /// `done` is the authority. If the message is finished, nothing is parked.
+    static func reconciling(_ calls: [ToolCall], done: Bool) -> [ToolCall] {
+        guard done else { return calls }
+        return calls.map { call in
+            guard call.isAwaitingUser else { return call }
+            var settled = call
+            settled.status = call.failureText == nil ? .completed : .failed
+            return settled
+        }
     }
 }
 

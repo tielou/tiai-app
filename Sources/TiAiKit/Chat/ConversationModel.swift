@@ -590,6 +590,13 @@ public final class ConversationModel {
                 await refresh(messageID: assistantID)
                 leafID = assistantID
             }
+            // Once the run is genuinely over nothing is parked any more. Not
+            // done inside the flush: a parked run also flushes as final, because
+            // the finish frame arrives before the pause frame, and clearing
+            // there would wipe the question the user is meant to answer.
+            if !outcome.parked, let index = turns.firstIndex(where: { $0.id == assistantID }) {
+                turns[index].calls = Turn.reconciling(turns[index].calls, done: true)
+            }
         }
         if let failure = outcome.failure { error = failure }
         phase = .ready
@@ -808,6 +815,9 @@ public final class ConversationModel {
             if outcome.failure == nil && !outcome.parked {
                 await self.refresh(messageID: messageID)
                 self.leafID = messageID
+            }
+            if !outcome.parked, let index = self.turns.firstIndex(where: { $0.id == messageID }) {
+                self.turns[index].calls = Turn.reconciling(self.turns[index].calls, done: true)
             }
             if let failure = outcome.failure { self.error = failure }
             self.phase = .ready

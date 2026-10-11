@@ -1060,3 +1060,21 @@ enum AskUserFixture {
     #expect(calls[0].status == .failed)
     #expect(calls[0].isSettled)
 }
+
+// A finished message must never leave a question on screen. The bug this pins:
+// a card reading "The model is asking a question" with no question, an empty
+// field and a Send button that could not be pressed — below an answer that had
+// already printed. A dead end the user cannot leave, on a turn that was over.
+@Test func aFinishedMessageIsNeverWaitingOnTheUser() {
+    let pending = ToolCall(.object([
+        "type": .string("function_call"), "call_id": .string("c9"),
+        "name": .string("ask_user"), "status": .string("pending"),
+    ]))
+    #expect(pending?.isAwaitingUser == true)
+
+    #expect(Turn.reconciling([pending!], done: false).first?.isAwaitingUser == true,
+            "while the run is live the question has to stay up")
+    let settled = Turn.reconciling([pending!], done: true).first
+    #expect(settled?.isAwaitingUser == false)
+    #expect(settled?.isSettled == true)
+}
