@@ -122,8 +122,21 @@ public final class ChatEventSocket: @unchecked Sendable {
         /// A frame some servers end with. Not observed on 0.11.4 — the terminal
         /// frame there is `chat:completion` carrying `finish_reason` — so
         /// nothing may rely on this alone.
+        ///
+        /// `done` is not one flag. A `status` frame ends with `done: true` to mean
+        /// "this step is finished", live: `{"type":"status","data":{"count":0,
+        /// "action":"sources_retrieved","done":true}}`. Reading that as the end of
+        /// the run stops the listener before a single token arrives — which is
+        /// what happened on every image message, because retrieving the image
+        /// emits one: the answer streamed, the app just was not watching any more.
         public var isDone: Bool {
-            data["done"]?.boolValue == true || inner?["done"]?.boolValue == true
+            // `done` only ends a run on the frames that end one: the closing
+            // `chat:completion`, or an OpenAI chunk. Anything else that carries
+            // the flag is reporting on itself.
+            let endsARun = kind == "chat:completion"
+                || inner?["choices"] != nil || inner?["object"] != nil
+            guard endsARun else { return false }
+            return data["done"]?.boolValue == true || inner?["done"]?.boolValue == true
         }
 
         /// Marks the end of the model's output. Not the same as `isDone`: the
@@ -197,6 +210,19 @@ public final class ChatEventSocket: @unchecked Sendable {
         // The root namespace, which is where Open WebUI mounts its handlers and
         // where `get_event_emitter` emits to `user:<id>`.
         client = manager.defaultSocket
+        #if DEBUG
+        // Whether the socket came up at all decides which of two very different
+        // problems "no frames arrived" is.
+        client.on(clientEvent: .connect) { data, _ in
+            Self.dump(raw: ["_connect", Self.describe(data)])
+        }
+        client.on(clientEvent: .disconnect) { data, _ in
+            Self.dump(raw: ["_disconnect", Self.describe(data)])
+        }
+        client.on(clientEvent: .error) { data, _ in
+            Self.dump(raw: ["_error", Self.describe(data)])
+        }
+        #endif
     }
 
     deinit {
@@ -257,10 +283,37 @@ public final class ChatEventSocket: @unchecked Sendable {
         handlers.value = handlers.value + [handler]
         client.on("events") { [weak self] payload, _ in
             guard let self else { return }
+            // Dumped before parsing: a frame that arrives and fails to parse is
+            // invisible to the UI too, and "nothing arrived" versus "it arrived
+            // and we dropped it" need different fixes.
+            Self.dump(raw: payload)
             guard let dictionary = payload.first as? [String: Any], let frame = Frame(dictionary) else { return }
             for handler in self.handlers.value { handler(frame) }
         }
     }
+
+    #if DEBUG
+    /// Appends every frame to `TIAI_DEBUG_DUMP` as JSON lines.
+    ///
+    /// A run that produced a visible answer on reload but nothing on screen was
+    /// either the server sending something unexpected or the client dropping it,
+    /// and a screenshot cannot tell those apart. Same reasoning as the response
+    /// dump: read the bytes instead of theorising.
+    static func dump(raw payload: [Any]) {
+        guard let dir = ProcessInfo.processInfo.environment["TIAI_DEBUG_DUMP"] else { return }
+        let object: Any = payload.count == 1 ? payload[0] : payload
+        let line = (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
+        guard let line = String(data: line, encoding: .utf8) else { return }
+        let url = URL(fileURLWithPath: dir).appendingPathComponent("frames.jsonl")
+        if !FileManager.default.fileExists(atPath: url.path) {
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+        }
+        guard let handle = try? FileHandle(forWritingTo: url) else { return }
+        defer { try? handle.close() }
+        handle.seekToEndOfFile()
+        handle.write((line + "\n").data(using: .utf8) ?? Data())
+    }
+    #endif
 
     private static func describe(_ data: [Any]) -> String {
         data.first.map { String(describing: $0) } ?? "unknown"

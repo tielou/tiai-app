@@ -53,7 +53,7 @@ private struct SessionBrowser: UIViewControllerRepresentable {
     let domain: String
     var onCallback: () -> Void
 
-    func makeCoordinator() -> Coordinator { Coordinator(onCallback: onCallback) }
+    func makeCoordinator() -> Coordinator { Coordinator(onCallback: onCallback, host: domain) }
 
     func makeUIViewController(context: Context) -> WebController {
         let configuration = WKWebViewConfiguration()
@@ -143,13 +143,47 @@ private struct SessionBrowser: UIViewControllerRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         private let onCallback: () -> Void
-        init(onCallback: @escaping () -> Void) { self.onCallback = onCallback }
+        /// The Open WebUI host the flow started from. Coming back here is what
+        /// "finished" means.
+        private let host: String
+        /// Set once the dance has gone off to the identity provider.
+        private var leftOrigin = false
+
+        init(onCallback: @escaping () -> Void, host: String) {
+            self.onCallback = onCallback
+            self.host = host
+        }
+
+        private func isMine(_ url: URL?) -> Bool {
+            guard let host = url?.host else { return false }
+            return host == self.host || host.hasSuffix(".\(self.host)")
+        }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             // Allowed to complete first: the callback request is what makes the
             // server exchange the code for a token. Cancelling the navigation to
             // close earlier would end the dance one step short of it working.
-            if webView.url?.path.contains("/callback") == true { onCallback() }
+            let url = webView.url
+            guard isMine(url) else {
+                leftOrigin = true
+                return
+            }
+            // The callback handler answers with a redirect to the Open WebUI
+            // root, so by the time a navigation *finishes* the url is the site
+            // home, not `/callback` - watching for the callback path alone never
+            // fires and the sheet just sits there showing the web app, which
+            // looks exactly like a login button that did nothing.
+            if url?.path.contains("/callback") == true || leftOrigin { onCallback() }
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            didFailProvisionalNavigation navigation: WKNavigation!,
+            withError error: Error
+        ) {
+            // A failed hand-off used to leave a blank sheet with no explanation.
+            // The url is the only clue the user has that anything happened at all.
+            leftOrigin = false
         }
 
         /// Identity providers love opening their login in a new window. A

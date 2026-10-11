@@ -72,7 +72,7 @@ private let terminal = """
     #expect(f.kind == "chat:completion")
     #expect(f.finishReason == "stop")
     #expect(f.isFinish)
-    #expect(!f.isDone)  // nothing in a real run ever sets `done`
+    #expect(!f.isDone)  // the terminal frame here is `finish_reason`, not `done`
     #expect(f.isTerminal)
 }
 
@@ -133,4 +133,30 @@ private let terminal = """
         $0.delta != nil || $0.reasoningDelta != nil || $0.isTerminal || $0.kind == "chat:list"
     }
     #expect(understood.count == frames.count)
+}
+
+@Test func aStatusFrameSayingDoneDoesNotEndTheRun() throws {
+    // Live capture, 0.11.4, sent while a picture was being retrieved:
+    //   {"type":"status","data":{"count":0,"action":"sources_retrieved","done":true}}
+    // `done` there means "this step finished". Treated as the end of the run it
+    // stopped the listener before a single token arrived, so every image message
+    // streamed a full answer that the app threw away - the transcript stayed
+    // empty until the chat was reopened and refetched.
+    let f = try frame("""
+        {"chat_id":"c1","message_id":"m1",
+         "data":{"type":"status","data":{"count":0,"action":"sources_retrieved","done":true}}}
+        """)
+    #expect(f.kind == "status")
+    #expect(!f.isDone)
+    #expect(!f.isTerminal)
+}
+
+@Test func aCompletionFrameSayingDoneStillEndsTheRun() throws {
+    // The other `done`: `chat:completion` really does mean the run is over.
+    let f = try frame("""
+        {"chat_id":"c1","message_id":"m1",
+         "data":{"type":"chat:completion","data":{"done":true}}}
+        """)
+    #expect(f.isDone)
+    #expect(f.isTerminal)
 }
