@@ -136,10 +136,28 @@ struct ComposerView: View {
     /// HEIC is the default on iPhones, and a gateway fronting a model is not
     /// promised to read it. ImageIO decodes HEIC fine, so the app normalises on
     /// the way out rather than hoping the server copes.
+    /// Longest side an image is sent at.
+    ///
+    /// The picture travels inside the message as a data url, so its size is
+    /// paid for in the request body and again in whatever stores the message.
+    /// Vision models resample to roughly this scale anyway.
+    private static let maxEdge: CGFloat = 1568
+
     private static func jpeg(from data: Data) -> Data? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
             let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
-        return UIImage(cgImage: image).jpegData(compressionQuality: 0.9)
+        let width = CGFloat(image.width), height = CGFloat(image.height)
+        guard max(width, height) > maxEdge else {
+            return UIImage(cgImage: image).jpegData(compressionQuality: 0.9)
+        }
+        let scale = maxEdge / max(width, height)
+        let size = CGSize(width: width * scale, height: height * scale)
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 1
+        let shrunk = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            UIImage(cgImage: image).draw(in: CGRect(origin: .zero, size: size))
+        }
+        return shrunk.jpegData(compressionQuality: 0.85)
     }
 
 #endif

@@ -51,6 +51,10 @@ public final class ConversationModel {
     /// The chat's template variables, carried back untouched on every send.
     public var chatVariables: JSONValue?
     public var modelIDs: [String] = []
+    /// The models themselves, kept because capabilities live on them
+    /// and a few decisions — can this model be shown a picture at all —
+    /// cannot be made from an id.
+    public var models: [ChatModel] = []
 
     private let client: OWUIClient
     /// The instance root, for links that are not API calls — an OAuth sign-in
@@ -92,6 +96,7 @@ public final class ConversationModel {
         self.title = title
         self.client = client
         self.hub = hub
+        self.models = models
         modelIDs = models.map(\.id)
         model = models.first?.id ?? ""
         features = Self.seedFeatures(for: models.first)
@@ -122,6 +127,7 @@ public final class ConversationModel {
     }
 
     public func setModels(_ models: [ChatModel]) {
+        self.models = models
         modelIDs = models.map(\.id)
         if model.isEmpty { model = models.first?.id ?? "" }
         // A chat can open before the model list arrives, which leaves the
@@ -170,10 +176,17 @@ public final class ConversationModel {
     /// A file chosen in the composer and uploaded, waiting to be sent with the
     /// next message.
     public struct PendingAttachment: Identifiable, Equatable, Sendable {
-        /// The server's file id — this is what goes in the completion's `files`.
+        /// The server's file id — what the completion's `files` list carries.
         public let id: String
         public let name: String
         public let mimeType: String
+        /// The bytes, kept until the message is sent.
+        ///
+        /// The file id alone is not enough: `files` is what the retrieval
+        /// pipeline and the transcript see, and a vision model gets its picture
+        /// from the message content. Sending the id and nothing else is why a
+        /// photo looked attached, sent cleanly, and then never arrived.
+        public let data: Data
         public var isImage: Bool { mimeType.hasPrefix("image/") }
     }
 
@@ -195,7 +208,7 @@ public final class ConversationModel {
             do {
                 let file = try await client.uploadFile(data: data, filename: name, mimeType: mimeType)
                 attachments.append(
-                    PendingAttachment(id: file.id, name: file.filename, mimeType: mimeType))
+                    PendingAttachment(id: file.id, name: file.filename, mimeType: mimeType, data: data))
             } catch {
                 self.error = "Could not attach \(name): \(error.localizedDescription)"
             }
@@ -374,6 +387,64 @@ public final class ConversationModel {
         var index: Int
     }
 
+    /// Whether the current model can be shown a picture at all.
+    private var modelSupportsVision: Bool {
+        models.first { $0.id == model }?.supportsVision ?? false
+    }
+
+    /// The user message as the server needs it.
+    ///
+    /// A picture has to be *inside* the message. `files` is what the retrieval
+    /// pipeline ingests and what the transcript stores; a vision model receives
+    /// its image from the message content, and sending the file id alone meant
+    /// the photo was uploaded, shown as attached, sent — and never reached the
+    /// model. `data:image/…` is passed straight through by the server, so no
+    /// file URL has to be resolved or re-authenticated on the way.
+    static func userContent(
+        text: String, files: [PendingAttachment], vision: Bool
+    ) -> MessageContent {
+        let images = vision ? files.filter(\.isImage) : []
+        guard !images.isEmpty else { return .text(text) }
+        var blocks: [JSONValue] = []
+        if !text.isEmpty {
+            blocks.append(.object(["type": .string("text"), "text": .string(text)]))
+        }
+        for image in images {
+            blocks.append(
+                .object([
+                    "type": .string("image_url"),
+                    "image_url": .object([
+                        "url": .string(
+                            "data:\(image.mimeType);base64,\(image.data.base64EncodedString())")
+                    ]),
+                ]))
+        }
+        return .blocks(blocks)
+    }
+
+    /// The `files` list, in the shape the server walks.
+    ///
+    /// Each entry is an object with a `type` and a nested `file`; the code that
+    /// reads them does `item['type']`, so a list of id strings is not a
+    /// shorter way of saying the same thing.
+    static func filePayload(_ files: [PendingAttachment]) -> [JSONValue] {
+        files.map { file in
+            .object([
+                "type": .string("file"),
+                "id": .string(file.id),
+                "name": .string(file.name),
+                "file": .object([
+                    "id": .string(file.id),
+                    "filename": .string(file.name),
+                    "meta": .object([
+                        "name": .string(file.name),
+                        "content_type": .string(file.mimeType),
+                    ]),
+                ]),
+            ])
+        }
+    }
+
     private func exchange(text: String, regenerating: String?, files: [PendingAttachment]) async {
         guard !model.isEmpty else {
             error = "No model selected."
@@ -394,9 +465,15 @@ public final class ConversationModel {
         let parentID = regenerating ?? leafID
 
         if regenerating == nil {
-            turns.append(Turn(id: userMessageID, role: "user", text: text))
+            turns.append(
+                Turn(
+                    id: userMessageID, role: "user", text: text,
+                    attachments: files.map {
+                        MessageAttachment(id: $0.id, name: $0.name, isImage: $0.isImage)
+                    }))
         }
-        let history = wireHistory(through: userMessageID, userText: text)
+        let content = Self.userContent(text: text, files: files, vision: modelSupportsVision)
+        let history = wireHistory(through: userMessageID, content: content)
         turns.append(Turn(id: assistantID, role: "assistant", streaming: true))
         let assistantIndex = turns.count - 1
 
@@ -409,11 +486,11 @@ public final class ConversationModel {
             chatID: chat,
             parentID: parentID.map(CompletionRequest.ParentID.message) ?? .root,
             userMessage: CompletionRequest.WireMessage(
-                id: userMessageID, role: "user", content: .text(text),
+                id: userMessageID, role: "user", content: content,
                 parentID: parentID, model: model),
             messageID: assistantID,
             features: features,
-            files: files.isEmpty ? nil : files.map(\.id),
+            files: files.isEmpty ? nil : Self.filePayload(files),
             // `ask` is what makes the server park on a tool call and wait for a
             // tap. Left unset the server runs every tool without asking, which is
             // right for a headless client and wrong for one in the hand.
@@ -750,7 +827,7 @@ public final class ConversationModel {
     /// message pointing at its parent. The message being (re)asked is included
     /// with the caller's text, since locally it is still the empty placeholder or
     /// the previous answer's text.
-    private func wireHistory(through userMessageID: String, userText: String)
+    private func wireHistory(through userMessageID: String, content: MessageContent)
         -> [CompletionRequest.WireMessage]
     {
         var out: [CompletionRequest.WireMessage] = []
@@ -759,7 +836,7 @@ public final class ConversationModel {
             let message: CompletionRequest.WireMessage?
             if turn.id == userMessageID {
                 message = .init(
-                    id: turn.id, role: "user", content: .text(userText), parentID: parent, model: model)
+                    id: turn.id, role: "user", content: content, parentID: parent, model: model)
             } else if turn.isAssistant, !turn.text.isEmpty, !turn.streaming {
                 message = .init(
                     id: turn.id, role: "assistant", content: .text(turn.text), parentID: parent,

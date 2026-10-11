@@ -122,7 +122,10 @@ public struct CompletionRequest: Encodable, Sendable {
     /// Set only when continuing or regenerating an existing assistant message.
     public var assistantMessageID: String?
     public var features: [String: Bool]
-    public var files: [String]?
+    /// Attached files, in the shape the server walks: objects with a
+    /// `type` and a nested `file`, not bare ids. The retrieval pipeline reads
+    /// `item['type']` off each one, so a list of strings is not a shortcut.
+    public var files: [JSONValue]?
     public var params: Params
     public var folderID: String?
     /// Tools and MCP servers for this run. The server reads these top level, not
@@ -146,7 +149,7 @@ public struct CompletionRequest: Encodable, Sendable {
         messageID: String? = nil,
         assistantMessageID: String? = nil,
         features: [String: Bool] = [:],
-        files: [String]? = nil,
+        files: [JSONValue]? = nil,
         params: Params = Params(),
         stream: Bool = true,
         folderID: String? = nil,

@@ -385,10 +385,69 @@ extension ChatModel {
     try await transport.awaitCompletion()
     let raw = try #require(transport.completionBody)
     let json = try #require(JSONSerialization.jsonObject(with: raw) as? [String: Any])
-    #expect(json["files"] as? [String] == ["file-1"])
+    // Not bare ids: the server walks `item["type"]` on each entry, so a list of
+    // strings is not a shorter way of saying the same thing.
+    let files = try #require(json["files"] as? [[String: Any]])
+    #expect(files.first?["type"] as? String == "file")
+    let inner = try #require(files.first?["file"] as? [String: Any])
+    #expect(inner["id"] as? String == "file-1")
+    #expect(inner["filename"] as? String == "notes.txt")
     // Attached to the message it was added for, then cleared - a chip that
     // lingered would silently re-send the same file on every later message.
     #expect(conversation.attachments.isEmpty)
+}
+
+@Test @MainActor func aPictureGoesInsideTheMessageNotJustInTheFilesList() async throws {
+    // The bug this pins: the photo uploaded, the composer said "attached", the
+    // message sent cleanly, and the model said it had received no image. `files`
+    // is what retrieval and the transcript see; a vision model is given its
+    // picture in the message content, and the app was only sending the id.
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-personal", caps: ["vision": true])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub)
+
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "shot.jpg", mimeType: "image/jpeg")
+    try await waitUntil { conversation.attachments.count == 1 }
+    conversation.draft = "what is in this?"
+    conversation.send()
+    try await transport.awaitCompletion()
+
+    let raw = try #require(transport.completionBody)
+    let json = try #require(JSONSerialization.jsonObject(with: raw) as? [String: Any])
+    let messages = try #require(json["messages"] as? [[String: Any]])
+    let user = try #require(messages.last { ($0["role"] as? String) == "user" })
+    let blocks = try #require(user["content"] as? [[String: Any]])
+    #expect(blocks.contains { ($0["type"] as? String) == "text" && ($0["text"] as? String) == "what is in this?" })
+    let image = try #require(blocks.first { ($0["type"] as? String) == "image_url" })
+    let url = ((image["image_url"] as? [String: Any])?["url"] as? String) ?? ""
+    // A data url, because the server passes `data:image/...` straight through to
+    // the model. A file URL would have to be resolved and re-authenticated
+    // server-side, which is a second thing to get wrong.
+    #expect(url.hasPrefix("data:image/jpeg;base64,"))
+
+    // And a model without vision is not sent a picture it cannot read.
+    // A fresh transport: the assertion is about this request, not the last one.
+    let blindTransport = ScriptedTransport()
+    let blind = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-deep", caps: ["vision": false])],
+        client: OWUIClient(server: server, transport: blindTransport),
+        hub: ChatEventHub(server: server))
+    blind.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "shot.jpg", mimeType: "image/jpeg")
+    try await waitUntil { blind.attachments.count == 1 }
+    blind.draft = "and this?"
+    blind.send()
+    try await blindTransport.awaitCompletion()
+    let after = try #require(blindTransport.completionBody)
+    let blindJSON = try #require(JSONSerialization.jsonObject(with: after) as? [String: Any])
+    let blindMessages = try #require(blindJSON["messages"] as? [[String: Any]])
+    let blindUser = try #require(blindMessages.last { ($0["role"] as? String) == "user" })
+    #expect(blindUser["content"] as? String == "and this?")
 }
 
 @Test @MainActor func memoryIsOnByDefaultWhereTheModelHasIt() {
