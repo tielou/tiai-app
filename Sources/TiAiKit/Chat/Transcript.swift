@@ -73,6 +73,12 @@ public struct Turn: Identifiable, Equatable, Sendable {
     /// The call the user still has to answer, if any.
     public var awaitingCall: ToolCall? { calls.first(where: \ .isAwaitingUser) }
 
+    /// True while the client is still waiting for a parked question's arguments
+    /// to arrive. The view shows a spinner only for as long as this is set, so
+    /// the wait has an end and a stuck question falls through to the free-text
+    /// box rather than spinning at the user forever.
+    public var questionIncoming = false
+
     /// Nothing to show yet, but something is happening.
     public var isWaitingForFirstToken: Bool {
         isAssistant && streaming && text.isEmpty && error == nil

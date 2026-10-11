@@ -355,7 +355,8 @@ struct MessageRow: View {
                 ForEach(ToolCall.grouped(turn.calls)) { group in
                     switch group {
                     case .awaiting(let call):
-                        ToolCallCard(call: call) { action, answers in
+                        ToolCallCard(call: call, questionIncoming: turn.questionIncoming) {
+                            action, answers in
                             onResolve?(call, action, answers)
                         }
                     case .settled(let calls):
@@ -603,6 +604,10 @@ struct CodeBlockView: View {
 /// decides which actions to offer from the call itself.
 struct ToolCallCard: View {
     let call: ToolCall
+    /// Whether the client is still expecting this question's arguments to turn
+    /// up. When it is not, an unparseable question goes to the free-text box
+    /// instead of a spinner with no end.
+    var questionIncoming = false
     var onResolve: (ToolCallAction, JSONValue?) -> Void
 
     /// Selections are stored **per question**. The single shared set this used to
@@ -675,7 +680,7 @@ struct ToolCallCard: View {
                     .disabled(!answered(question))
                 }
             }
-        } else if call.isAskUser && !call.hasStructuredArguments {
+        } else if call.isAskUser && !call.hasStructuredArguments && questionIncoming {
             // The arguments are still arriving. A question you cannot read yet
             // is not a question you can answer, and offering a text field for it
             // produced a box with an empty prompt and a Send button that could

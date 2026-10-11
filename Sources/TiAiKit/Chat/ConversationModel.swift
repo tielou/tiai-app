@@ -552,12 +552,11 @@ public final class ConversationModel {
             // it was: the answer this turn is still owed, and resending would
             // fork the chat instead of continuing it.
             //
-            // And refetch. The question arrives as streamed text, so what this
-            // client assembled can be a truncated half of it — and unlike a
-            // finished answer, a parked question is never corrected later. The
-            // run is stopped until the user answers, so a question that came
-            // through unreadable has nothing that will ever fix it.
-            await refresh(messageID: assistantID)
+            // And refetch until the question is there. Unlike a finished
+            // answer, a parked question is never corrected later: the run is
+            // stopped until the user answers, so a question that came through
+            // unreadable has nothing that will ever fix it.
+            await awaitQuestion(messageID: assistantID)
             phase = .ready
             return
         }
@@ -806,12 +805,9 @@ public final class ConversationModel {
             }
             var outcome = await self.drain(frames, assistantID: messageID, index: index, continuing: true)
             if outcome.parked {
-                // Refetch on a park. The question arrives as streamed text, so
-                // the copy this client assembled can be a truncated half of it,
-                // and unlike a finished answer a parked question is never
-                // corrected later — the run is stopped until the user answers,
-                // and an unreadable question has nothing to fix it.
-                await self.refresh(messageID: messageID)
+                // Same as the first run: keep looking until the question has
+                // actually landed, because nothing later will fix it.
+                await self.awaitQuestion(messageID: messageID)
                 self.phase = .ready
                 return
             }
@@ -835,6 +831,36 @@ public final class ConversationModel {
             if let failure = outcome.failure { self.error = failure }
             self.phase = .ready
         }
+    }
+
+    /// Refetches until a parked question has actually arrived.
+    ///
+    /// A park is detected the moment the server says it is waiting, which is
+    /// *before* the model has finished streaming the question's arguments — so
+    /// the first refetch lands on a call with empty or truncated arguments and
+    /// the card has nothing to render. Retrying with a short backoff is what
+    /// closes that gap; the alternative, which this client used to do, was to
+    /// show a question that could never be answered.
+    ///
+    /// Bounded, and it gives up into the free-text fallback rather than spinning:
+    /// a "Preparing the question…" that never resolves is the same dead end with
+    /// a nicer animation, and at least a text field can be typed into.
+    private func awaitQuestion(messageID: String) async {
+        mark(messageID, questionIncoming: true)
+        defer { mark(messageID, questionIncoming: false) }
+        for attempt in 0..<10 {
+            await refresh(messageID: messageID)
+            guard let turn = turns.first(where: { $0.id == messageID }),
+                  let awaiting = turn.awaitingCall,
+                  !awaiting.hasStructuredArguments
+            else { return }
+            try? await Task.sleep(for: .milliseconds(200 * (attempt + 1)))
+        }
+    }
+
+    private func mark(_ messageID: String, questionIncoming: Bool) {
+        guard let index = turns.firstIndex(where: { $0.id == messageID }) else { return }
+        turns[index].questionIncoming = questionIncoming
     }
 
     /// Pulls the stored message back after a resumed run.
