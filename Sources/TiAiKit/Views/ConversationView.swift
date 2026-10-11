@@ -675,6 +675,17 @@ struct ToolCallCard: View {
                     .disabled(!answered(question))
                 }
             }
+        } else if call.isAskUser && !call.hasStructuredArguments {
+            // The arguments are still arriving. A question you cannot read yet
+            // is not a question you can answer, and offering a text field for it
+            // produced a box with an empty prompt and a Send button that could
+            // not be pressed — while the real questions were one frame away.
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Preparing the question…")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+            }
         } else if call.isAskUser {
             // The schema was not recognised. Showing the raw question beats
             // showing nothing: the user can still answer by typing.

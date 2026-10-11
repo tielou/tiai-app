@@ -43,6 +43,19 @@ public struct ToolCall: Equatable, Sendable, Identifiable {
     public var id: String { callID }
     public var isAskUser: Bool { name == "ask_user" }
 
+    /// Whether the arguments have arrived *complete*.
+    ///
+    /// A model streams tool arguments as text, so for a moment the stored
+    /// `arguments` is a truncated JSON string. Parsing fails, the raw string is
+    /// kept, and every attempt to read a question out of it fails too — which
+    /// this client treated as "unrecognised question shape" and answered with a
+    /// free-text box: "The model is asking a question." with nothing to answer,
+    /// on a call that had three perfectly good questions on the way in.
+    ///
+    /// "Not yet" and "not recognisable" need different screens. Only one of them
+    /// is a dead end.
+    public var hasStructuredArguments: Bool { arguments?.objectValue != nil }
+
     /// Whether the run is waiting on *this* call. `ask_user` sits in `pending`
     /// while every other tool waits in `requires_approval` or `queued`, so the
     /// test has to cover both rather than guess which one a given version uses.

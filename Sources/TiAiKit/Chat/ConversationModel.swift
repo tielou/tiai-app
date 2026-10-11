@@ -551,6 +551,13 @@ public final class ConversationModel {
             // The run is parked on a question, not finished. `leafID` stays where
             // it was: the answer this turn is still owed, and resending would
             // fork the chat instead of continuing it.
+            //
+            // And refetch. The question arrives as streamed text, so what this
+            // client assembled can be a truncated half of it — and unlike a
+            // finished answer, a parked question is never corrected later. The
+            // run is stopped until the user answers, so a question that came
+            // through unreadable has nothing that will ever fix it.
+            await refresh(messageID: assistantID)
             phase = .ready
             return
         }
@@ -799,6 +806,12 @@ public final class ConversationModel {
             }
             var outcome = await self.drain(frames, assistantID: messageID, index: index, continuing: true)
             if outcome.parked {
+                // Refetch on a park. The question arrives as streamed text, so
+                // the copy this client assembled can be a truncated half of it,
+                // and unlike a finished answer a parked question is never
+                // corrected later — the run is stopped until the user answers,
+                // and an unreadable question has nothing to fix it.
+                await self.refresh(messageID: messageID)
                 self.phase = .ready
                 return
             }

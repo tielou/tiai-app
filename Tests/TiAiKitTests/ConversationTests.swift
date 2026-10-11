@@ -1078,3 +1078,22 @@ enum AskUserFixture {
     #expect(settled?.isAwaitingUser == false)
     #expect(settled?.isSettled == true)
 }
+
+// The model streams tool arguments as text, so the JSON is truncated for a
+// moment. That is "not yet", not "unrecognisable", and the two need different
+// screens — the old one was a box with no question and a Send button that could
+// not be pressed, on a call that had three real questions arriving.
+@Test func halfArrivedArgumentsAreNotAnUnrecognisedQuestion() {
+    func call(_ arguments: String) -> ToolCall {
+        ToolCall(.object([
+            "type": .string("function_call"), "call_id": .string("c1"),
+            "name": .string("ask_user"), "status": .string("pending"),
+            "arguments": .string(arguments),
+        ]))!
+    }
+    #expect(call(#"{"questions":[{"id":"a","question":"A?"}]"#).hasStructuredArguments == false,
+            "truncated JSON must read as still-arriving")
+    #expect(call(#"{"questions":[{"id":"a","question":"A?"}]}"#).hasStructuredArguments == true)
+    #expect(call(#"{"nonsense":true}"#).hasStructuredArguments == true,
+            "parsed but unrecognised is the case that gets the free-text fallback")
+}
