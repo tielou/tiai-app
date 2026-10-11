@@ -35,3 +35,18 @@ import Testing
     let blocks = Markdown.blocks("Hello! 👋 How can I help you today?")
     #expect(blocks == [.prose("Hello! 👋 How can I help you today?")])
 }
+
+// The thinking animation's poses live in the view layer, but the thing that can
+// actually be wrong about them is the selection: a pose that no run can reach,
+// or one that changes while you are looking at it. Both are cheap to pin here.
+@Test func everyThinkingPoseIsReachableAndStable() {
+    #expect(ThinkingAnimation.poseIndex(for: "a") == ThinkingAnimation.poseIndex(for: "a"),
+            "the same run id must keep the same pose, or the cat changes mid-flight")
+    var reached = Set<String>()
+    for index in 0..<600 { reached.insert(ThinkingAnimation.poseName(for: "run-\(index)")) }
+    #expect(reached.count == ThinkingAnimation.distinctPoseCount,
+            "every pose should turn up eventually; one that never does is dead code")
+    for index in 0..<200 {
+        #expect(ThinkingAnimation.poseIndex(for: "x\(index)") < ThinkingAnimation.poseSlotCount)
+    }
+}

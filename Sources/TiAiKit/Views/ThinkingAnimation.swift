@@ -39,6 +39,16 @@ struct ThinkingAnimation: View {
     /// the animation mid-flight, and spread across ids so consecutive runs do
     /// not all look the same. `UInt(bitPattern:)` rather than `abs()` because
     /// `abs(Int.min)` traps and a hash is exactly where that value turns up.
+    /// Slots in the selection wheel, and how many distinct poses it holds —
+    /// they differ, because typing is weighted to appear more often.
+    static var poseSlotCount: Int { wheel.count }
+    static var distinctPoseCount: Int { Pose.allCases.count }
+
+    /// Which pose a run id gets, as a name a test can compare.
+    static func poseName(for runID: String) -> String {
+        String(describing: wheel[poseIndex(for: runID)])
+    }
+
     static func poseIndex(for runID: String) -> Int {
         var hasher = Hasher()
         hasher.combine(runID)

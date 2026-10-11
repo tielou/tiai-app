@@ -499,6 +499,14 @@ public final class ConversationModel {
         turns.append(Turn(id: assistantID, role: "assistant", streaming: true))
         let assistantIndex = turns.count - 1
 
+        // A socket that died in the background, or never came up because the
+        // phone was mid-handover when the chat opened, would otherwise send
+        // without a session_id — which silently drops the server's builtin tools
+        // — and then listen on a dead connection, so the answer exists on the
+        // server and never reaches the screen. `connect()` is a no-op when the
+        // socket is already up, so this costs nothing on the normal path.
+        hub.reconnectIfNeeded()
+
         // Subscribing before the POST matters: frames can arrive while the
         // request is still in flight, and the socket has no replay.
         let frames = hub.frames(for: chat)

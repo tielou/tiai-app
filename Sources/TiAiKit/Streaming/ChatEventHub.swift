@@ -53,6 +53,21 @@ public final class ChatEventHub {
         }
     }
 
+    /// Kicks a reconnect without waiting for it.
+    ///
+    /// Used on the send path, where holding the message hostage to a dead
+    /// network is worse than sending without it: the socket comes back on its
+    /// own, and a run whose frames were missed is recovered by the refetch the
+    /// conversation already does. `connect()` is what you call when you can
+    /// afford to wait — opening a chat, returning to the foreground.
+    public func reconnectIfNeeded() {
+        guard !isConnected else { return }
+        Task {
+            do { try await socket.connect(); isConnected = true }
+            catch { lastError = error.localizedDescription }
+        }
+    }
+
     public func disconnect() {
         socket.disconnect()
         isConnected = false

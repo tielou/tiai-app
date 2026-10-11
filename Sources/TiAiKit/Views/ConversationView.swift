@@ -20,6 +20,9 @@ public struct ConversationView: View {
     /// tools simply has no Tools row.
     @State private var chatTools: [ChatTool] = []
     @State private var chatToolsError: String?
+
+    /// Cache keys are per server, so two instances on one phone never trade data.
+    private var host: String { session.client.server.baseURL.host ?? "local" }
     /// A tool waiting on a sign-in. The browser lives here because the tool list
     /// does, and the list has to be read again the moment the browser closes.
     @State private var authorizing: AuthorizeRequest?
@@ -93,12 +96,26 @@ public struct ConversationView: View {
         .toolbar { toolbar }
         .task {
             await conversation.connect()
+            // Cached tools and models appear immediately; the network corrects
+            // them a beat later. A chat with no model to name cannot send.
+            if models.isEmpty,
+               let cached = DiskCache.load([ChatModel].self, key: DiskCache.key("models", host: host)) {
+                models = cached
+            }
+            if let cached = DiskCache.load([ChatTool].self, key: DiskCache.key("tools", host: host)) {
+                chatTools = cached
+            }
             await conversation.load()
-            // The list may not have finished loading models before someone taps
-            // a chat; a conversation with no model to name cannot send anything.
-            if models.isEmpty { models = (try? await session.client.models()) ?? [] }
+            if models.isEmpty, let fresh = try? await session.client.models(), !fresh.isEmpty {
+                models = fresh
+                DiskCache.save(fresh, key: DiskCache.key("models", host: host))
+            }
             conversation.setModels(models)
-            do { chatTools = try await session.client.chatTools() }
+            do {
+                let fresh = try await session.client.chatTools()
+                chatTools = fresh
+                DiskCache.save(fresh, key: DiskCache.key("tools", host: host))
+            }
             // Kept rather than swallowed: an absent Tools section is otherwise
             // indistinguishable from an instance that has no tools, and the
             // second one is normal while the first is a bug.
@@ -108,10 +125,21 @@ public struct ConversationView: View {
             // iOS kills the socket on background anyway; saying so locally beats
             // coming back to a spinner that has been dead for ten minutes.
             if phase != .active { conversation.abandon() }
-            // Coming back from a browser sign-in is the normal way this changes:
-            // the tool said "not signed in", you signed in, and the row should
-            // know that without a relaunch.
-            else { Task { chatTools = (try? await session.client.chatTools()) ?? chatTools } }
+            else {
+                Task {
+                    // The socket is gone after a background sojourn and nothing
+                    // else would notice until a send quietly streamed into the
+                    // void. Cheap when it is already up.
+                    await conversation.connect()
+                    // Coming back from a browser sign-in is the normal way this
+                    // changes: the tool said "not signed in", you signed in, and
+                    // the row should know that without a relaunch.
+                    if let tools = try? await session.client.chatTools() {
+                        chatTools = tools
+                        DiskCache.save(tools, key: DiskCache.key("tools", host: host))
+                    }
+                }
+            }
         }
     }
 

@@ -112,6 +112,11 @@ public struct ChatListView: View {
     @Bindable private var session: SessionStore
     @State private var chats: Resource<[ChatSummary]>
     @State private var models: [ChatModel] = []
+
+    /// Cache keys are per server: the app can point at any Open WebUI, and
+    /// showing one instance's models while you look at another is worse than
+    /// no cache at all.
+    private var host: String { session.client.server.baseURL.host ?? "local" }
     @State private var query = ""
     @State private var searchResults: [ChatSummary] = []
     @State private var showingMemory = false
@@ -164,8 +169,19 @@ public struct ChatListView: View {
             .searchable(text: $query)
             .refreshable { await chats.refresh() }
             .task {
+                // Cached first, network second: the list and the model name come
+                // up at once and correct themselves a moment later, instead of
+                // the app looking broken while a slow server thinks.
+                if models.isEmpty,
+                   let cached = DiskCache.load([ChatModel].self,
+                                               key: DiskCache.key("models", host: host)) {
+                    models = cached
+                }
                 await chats.refresh()
-                if models.isEmpty { models = (try? await session.client.models()) ?? [] }
+                if let fresh = try? await session.client.models(), !fresh.isEmpty {
+                    models = fresh
+                    DiskCache.save(fresh, key: DiskCache.key("models", host: host))
+                }
             }
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
