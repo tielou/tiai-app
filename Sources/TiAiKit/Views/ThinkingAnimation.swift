@@ -64,7 +64,7 @@ struct ThinkingAnimation: View {
         case .nyan: CGSize(width: 156, height: 46)
         case .peek: CGSize(width: 96, height: 34)
         case .stretch: CGSize(width: 116, height: 34)
-        case .ride: CGSize(width: 132, height: 46)
+        case .ride: CGSize(width: 132, height: 52)
         default: CGSize(width: 104, height: 32)
         }
     }
@@ -398,81 +398,139 @@ struct ThinkingAnimation: View {
 
     // MARK: - riding the robot vacuum
 
-    /// A cat riding a robot vacuum. It is a real video everyone has seen, it is
-    /// funny, and it is an unreasonably good metaphor for a background job: the
-    /// cat is not doing anything, something else is moving, and it will carry on
-    /// until it bumps into something.
+    /// A cat lying on a robot vacuum, seen from above, slowly turning.
     ///
-    /// The whole rig drifts and tilts together, which is the difference between
-    /// a cat on a vacuum and a cat sticker pasted above a disc.
+    /// The gif everyone means is shot from the ceiling: the cat is sprawled on
+    /// the disc, completely boneless about it, and the whole thing rotates. A
+    /// side view of a cat standing on a moving disc is a different joke and
+    /// does not read at all, which is what the first attempt drew.
+    ///
+    /// Top-down works better at this size anyway: a circle with a cat on it is
+    /// legible in a way a low side silhouette is not.
     private func drawRide(_ ctx: inout GraphicsContext, t: Double) {
         let ink = Ink.make()
-        let drift = wave(t, 0.85) * 20
-        let tilt = Double(sin(t * 0.85)) * 0.05
-        let deck = CGPoint(x: size.width * 0.52 + drift, y: size.height - 11)
+        let centre = CGPoint(x: size.width * 0.36, y: size.height * 0.52)
+        let discR: CGFloat = size.height * 0.44
 
-        // Dust and crumbs being chased, left behind as the rig moves.
-        for i in 0..<3 {
-            let phase = (t * 1.6 + Double(i) * 0.7).truncatingRemainder(dividingBy: 2.0)
-            let x = deck.x - 40 - CGFloat(phase) * 12
-            let alpha = 0.35 * (1 - CGFloat(phase / 2))
-            ctx.fill(Path(ellipseIn: CGRect(x: x, y: deck.y + 2 + CGFloat(i) * 2,
-                                            width: 2.4, height: 1.8)),
-                     with: .color(ink.shade.opacity(alpha)))
+        // Floor marks, deliberately *not* rotating: without something standing
+        // still there is no way to tell the disc is turning, and it looks like a
+        // cat on a plate.
+        for (dx, dy) in [(-discR - 7, -discR * 0.5), (-discR - 5, discR * 0.7),
+                         (discR + 5, -discR * 0.8), (discR + 7, discR * 0.4)] {
+            ctx.fill(Path(ellipseIn: CGRect(x: centre.x + dx, y: centre.y + dy,
+                                            width: 2.6, height: 2.0)),
+                     with: .color(ink.shade.opacity(0.4)))
+        }
+        // Shadow under the disc, offset a little so it reads as lifted off the
+        // floor, and fixed while everything above it turns.
+        ctx.fill(Path(ellipseIn: CGRect(x: centre.x - discR - 1, y: centre.y - discR + 2,
+                                        width: discR * 2 + 2, height: discR * 2 + 2)),
+                 with: .color(.black.opacity(0.10)))
+
+        // The disc itself does not rotate — a plain circle rotating is
+        // invisible — but its bumper light travels, which is what sells it.
+        ctx.fill(Path(ellipseIn: CGRect(x: centre.x - discR, y: centre.y - discR,
+                                        width: discR * 2, height: discR * 2)),
+                 with: .color(ink.shade))
+        ctx.fill(Path(ellipseIn: CGRect(x: centre.x - discR + 2.5, y: centre.y - discR + 2.5,
+                                        width: discR * 2 - 5, height: discR * 2 - 5)),
+                 with: .color(ink.fur.opacity(0.45)))
+        let spin = t * 1.15
+        let ledAngle = CGFloat(cos(spin)) * 0.9 - 1.57
+        let led = CGPoint(x: centre.x + cos(ledAngle) * (discR - 3),
+                          y: centre.y + sin(ledAngle) * (discR - 3))
+        ctx.fill(Path(ellipseIn: CGRect(x: led.x - 1.7, y: led.y - 1.7, width: 3.4, height: 3.4)),
+                 with: .color(.green.opacity(0.55 + 0.45 * sin(t * 3.0))))
+
+        // Everything above turns together.
+        ctx.translateBy(x: centre.x, y: centre.y)
+        ctx.rotate(by: .radians(spin))
+
+        // Paws draped over the rim, past the disc edge — the detail that says
+        // the cat is being carried rather than standing somewhere.
+        for (angle, radius) in [(2.5, discR + 1), (0.65, discR + 1),
+                                (-2.5, discR + 1), (-0.65, discR + 1)] {
+            let x = cos(CGFloat(angle)) * radius
+            let y = sin(CGFloat(angle)) * radius
+            ctx.fill(Path(roundedRect: CGRect(x: x - 2.6, y: y - 2.0, width: 5.2, height: 4.4),
+                         cornerRadius: 2.2), with: .color(ink.fur))
         }
 
-        ctx.translateBy(x: deck.x, y: deck.y)
-        ctx.rotate(by: .radians(tilt))
-        ctx.translateBy(x: -deck.x, y: -deck.y)
+        // Tail flicking off the side, the one part of the cat that is not limp.
+        var tail = Path()
+        tail.move(to: CGPoint(x: 2, y: discR * 0.55))
+        tail.addQuadCurve(
+            to: CGPoint(x: discR * 0.95 + wave(t, 2.4) * 3, y: discR * 1.05),
+            control: CGPoint(x: discR * 0.85, y: discR * 0.8))
+        ctx.stroke(tail, with: .color(ink.fur),
+                   style: StrokeStyle(lineWidth: 3.0, lineCap: .round))
 
-        // The vacuum: a low disc with a lit bumper sensor and a wheel shadow.
-        let disc = CGRect(x: deck.x - 34, y: deck.y - 6, width: 68, height: 13)
-        ctx.fill(Path(roundedRect: disc, cornerRadius: 6.5), with: .color(ink.shade))
-        ctx.fill(Path(roundedRect: disc.insetBy(dx: 3, dy: 1.5).offsetBy(dx: 0, dy: -1),
-                     cornerRadius: 5), with: .color(ink.fur.opacity(0.55)))
-        // Bumper light, blinking on a slow pulse rather than a hard flash.
-        let led = 0.35 + 0.65 * (0.5 + 0.5 * sin(t * 3.4))
-        ctx.fill(Path(ellipseIn: CGRect(x: deck.x + 27, y: deck.y - 2, width: 3.4, height: 3.4)),
-                 with: .color(.green.opacity(led)))
-        // Brush housing under the lip, so it reads as a machine and not a hat.
-        ctx.fill(Path(roundedRect: CGRect(x: deck.x - 20, y: deck.y + 5, width: 40, height: 2.6),
-                     cornerRadius: 1.3), with: .color(ink.feature.opacity(0.35)))
-
-        // The cat, sitting on the deck. Ears pinned back — the airplane-ear
-        // position cats actually adopt when they are not entirely thrilled.
-        let r: CGFloat = 9
-        let head = CGPoint(x: deck.x - 2, y: deck.y - 20)
-        var body = Path()
-        body.move(to: CGPoint(x: deck.x - r * 1.0, y: deck.y - 5))
-        body.addQuadCurve(to: CGPoint(x: deck.x + r * 1.0, y: deck.y - 5),
-                          control: CGPoint(x: deck.x, y: head.y + r * 0.2))
-        ctx.fill(body, with: .color(ink.fur))
-        for side in [-1.0, 1.0] {
-            ctx.fill(Path(roundedRect: CGRect(x: deck.x + CGFloat(side) * r * 0.45 - 2.6,
-                                              y: deck.y - 7, width: 5.2, height: 4.4),
-                          cornerRadius: 2.2), with: .color(ink.shade))
-        }
-        drawTail(&ctx, root: CGPoint(x: deck.x + r * 0.9, y: deck.y - 8), r: r,
-                 ink: ink, t: t, upright: true)
-        drawEars(&ctx, centre: head, r: r, ink: ink, t: t, swept: true)
-        ctx.fill(Path(ellipseIn: CGRect(x: head.x - r, y: head.y - r * 0.9,
-                                        width: r * 2, height: r * 1.8)),
+        // Body: a long loaf, sprawled rather than curled. Loose about the middle
+        // so it does not look glued to the disc.
+        let sag = wave(t, 1.3) * 1.2
+        ctx.fill(Path(ellipseIn: CGRect(x: -11, y: -discR * 0.62 + sag,
+                                        width: 22, height: discR * 1.35)),
                  with: .color(ink.fur))
-        // Wide eyes: the pupils go round instead of slitted when a cat is
-        // surprised, and here that is the joke.
-        for side in [-1.0, 1.0] {
-            let x = head.x + CGFloat(side) * r * 0.40
-            ctx.fill(Path(ellipseIn: CGRect(x: x - 2.9, y: head.y - 3.2, width: 5.8, height: 6.2)),
-                     with: .color(ink.feature))
-            ctx.fill(Path(ellipseIn: CGRect(x: x - 1.0, y: head.y - 1.4, width: 2.0, height: 2.0)),
-                     with: .color(.white.opacity(0.9)))
+        // Tabby stripes across the back.
+        for (i, dy) in [-6.0, 0.0, 6.0].enumerated() {
+            var stripe = Path()
+            stripe.move(to: CGPoint(x: -9, y: CGFloat(dy) + sag))
+            stripe.addQuadCurve(to: CGPoint(x: 9, y: CGFloat(dy) + sag),
+                                control: CGPoint(x: 0, y: CGFloat(dy) + sag + (i.isMultiple(of: 2) ? 2 : -2)))
+            ctx.stroke(stripe, with: .color(ink.shade),
+                       style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
         }
-        // Mouth: a flat, unimpressed line instead of the usual "3".
-        var flat = Path()
-        flat.move(to: CGPoint(x: head.x - 2.6, y: head.y + r * 0.40))
-        flat.addLine(to: CGPoint(x: head.x + 2.6, y: head.y + r * 0.40))
-        ctx.stroke(flat, with: .color(ink.feature),
-                   style: StrokeStyle(lineWidth: 1.0, lineCap: .round))
+
+        // Head at the front, cheek fur and ears, eyes half shut: the cat has
+        // made peace with this.
+        let head = CGPoint(x: 0, y: -discR * 0.72 + sag)
+        for side in [-1.0, 1.0] {
+            let s = CGFloat(side)
+            var ear = Path()
+            ear.move(to: CGPoint(x: head.x + s * 7.4, y: head.y - 2.2))
+            ear.addQuadCurve(to: CGPoint(x: head.x + s * 1.4, y: head.y - 7.2),
+                             control: CGPoint(x: head.x + s * 2.6, y: head.y - 12.4))
+            ear.closeSubpath()
+            ctx.fill(ear, with: .color(ink.fur))
+            var inner = Path()
+            inner.move(to: CGPoint(x: head.x + s * 5.8, y: head.y - 2.6))
+            inner.addQuadCurve(to: CGPoint(x: head.x + s * 2.2, y: head.y - 6.2),
+                               control: CGPoint(x: head.x + s * 2.6, y: head.y - 9.6))
+            inner.closeSubpath()
+            ctx.fill(inner, with: .color(ink.pink))
+        }
+        ctx.fill(Path(ellipseIn: CGRect(x: head.x - 8, y: head.y - 7, width: 16, height: 14)),
+                 with: .color(ink.fur))
+        // Slow-blink eyes, nearly closed. Wide eyes would be a frightened cat,
+        // and the whole point of that gif is that this one is not.
+        let blink = (t.truncatingRemainder(dividingBy: 4.2))
+        let open: CGFloat = blink > 3.5 ? 0.15 : 1.0
+        let eye = StrokeStyle(lineWidth: 1.3, lineCap: .round)
+        for side in [-1.0, 1.0] {
+            let x = head.x + CGFloat(side) * 3.4
+            if open < 0.3 {
+                var lid = Path()
+                lid.move(to: CGPoint(x: x - 1.9, y: head.y - 0.4))
+                lid.addLine(to: CGPoint(x: x + 1.9, y: head.y - 0.4))
+                ctx.stroke(lid, with: .color(ink.feature), style: eye)
+            } else {
+                ctx.fill(Path(ellipseIn: CGRect(x: x - 1.9, y: head.y - 2.2, width: 3.8, height: 3.6)),
+                         with: .color(ink.feature))
+                ctx.fill(Path(ellipseIn: CGRect(x: x - 0.6, y: head.y - 1.4, width: 1.2, height: 1.2)),
+                         with: .color(.white.opacity(0.9)))
+            }
+        }
+        var nose = Path()
+        nose.move(to: CGPoint(x: head.x - 1.3, y: head.y + 2.0))
+        nose.addLine(to: CGPoint(x: head.x + 1.3, y: head.y + 2.0))
+        nose.addLine(to: CGPoint(x: head.x, y: head.y + 3.4))
+        nose.closeSubpath()
+        ctx.fill(nose, with: .color(ink.pink))
+
+        ctx.rotate(by: .radians(-spin))
+        ctx.translateBy(x: -centre.x, y: -centre.y)
+
+        drawDots(&ctx, ink: ink, t: t, left: size.width * 0.70)
     }
 
     // MARK: - parts
