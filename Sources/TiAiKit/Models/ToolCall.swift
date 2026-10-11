@@ -247,13 +247,16 @@ public struct AskUserPrompt: Equatable, Sendable {
                 if let label = option.stringValue, !label.isEmpty {
                     return Option(value: label, label: label, detail: nil, recommended: false)
                 }
-                guard let label = option["label"]?.stringValue ?? option["title"]?.stringValue
+                guard let raw = option["label"]?.stringValue ?? option["title"]?.stringValue
                     ?? option["value"]?.stringValue else { return nil }
+                let (label, marker) = Self.splitRecommendation(raw)
                 return Option(
-                    value: option["id"]?.stringValue ?? label,
+                    value: option["id"]?.stringValue ?? raw,
                     label: label,
                     detail: option["description"]?.stringValue ?? option["detail"]?.stringValue,
-                    recommended: option["recommended"]?.boolValue ?? false)
+                    // A tool that says so structurally wins; otherwise the hint
+                    // has to be read back out of the label.
+                    recommended: option["recommended"]?.boolValue ?? marker)
             }
             return Question(
                 value: object["id"]?.stringValue ?? text,
@@ -264,6 +267,38 @@ public struct AskUserPrompt: Equatable, Sendable {
         }
         guard !parsed.isEmpty else { return nil }
         questions = parsed
+    }
+
+    /// Pulls the model's "this one" hint out of the label.
+    ///
+    /// There is no `recommended` field in practice. The model writes the hint
+    /// into the label itself — `"Slovenia (recommended)"` — which the web UI
+    /// prints verbatim, so the hint arrives as a parenthetical in the middle of
+    /// a place name. Reading it back out lets it render as a badge, and keeps
+    /// the answer that goes back to the model free of it.
+    ///
+    /// Only a trailing marker is stripped. "Best (recommended) overall" is a
+    /// label with a parenthetical in it, and cutting mid-phrase would be worse
+    /// than leaving it alone.
+    static func splitRecommendation(_ label: String) -> (String, Bool) {
+        let trimmed = label.trimmingCharacters(in: .whitespaces)
+        guard let open = trimmed.lastIndex(of: "("), trimmed.hasSuffix(")") else {
+            // Also catch the em/en-dash and colon forms, which the model uses
+            // when it feels like it.
+            for sep in [" — recommended", " - recommended", ": recommended", " (recommended)"] {
+                if let r = trimmed.range(of: sep, options: .backwards),
+                   r.upperBound == trimmed.endIndex {
+                    return (String(trimmed[..<r.lowerBound]).trimmingCharacters(in: .whitespaces), true)
+                }
+            }
+            return (trimmed, false)
+        }
+        let inner = String(trimmed[trimmed.index(after: open)..<trimmed.index(before: trimmed.endIndex)])
+            .trimmingCharacters(in: .whitespaces)
+        guard inner.lowercased() == "recommended" || inner.lowercased() == "best" else {
+            return (trimmed, false)
+        }
+        return (String(trimmed[..<open]).trimmingCharacters(in: .whitespaces), true)
     }
 
     /// What to send back, keyed by question id with the option values, which is

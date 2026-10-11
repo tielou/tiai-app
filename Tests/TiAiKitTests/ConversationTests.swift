@@ -1121,3 +1121,38 @@ enum AskUserFixture {
         "a saved answer cannot be un-saved either")
     _ = server
 }
+
+// The model does not send a `recommended` flag; it writes "(recommended)" into
+// the label, so the hint arrives as a parenthetical inside a place name. The
+// web UI prints that verbatim.
+@Test func recommendationHintIsReadOutOfTheLabel() {
+    #expect(AskUserPrompt.splitRecommendation("Slovenia (recommended)") == ("Slovenia", true))
+    #expect(AskUserPrompt.splitRecommendation("Crete (Recommended)") == ("Crete", true))
+    #expect(AskUserPrompt.splitRecommendation("Alpine lakes — recommended") == ("Alpine lakes", true))
+    #expect(AskUserPrompt.splitRecommendation("Transylvania") == ("Transylvania", false),
+            "an ordinary label must come back untouched")
+    #expect(AskUserPrompt.splitRecommendation("Best (recommended) overall")
+        == ("Best (recommended) overall", false),
+        "a parenthetical in the middle of a phrase is not a marker")
+}
+
+@Test func optionFromRealArgumentsCarriesTheRecommendation() {
+    let prompt = AskUserPrompt(arguments: .object([
+        "questions": .array([.object([
+            "id": .string("dest"), "question": .string("Where?"),
+            "options": .array([
+                .object(["label": .string("Slovenia (recommended)"),
+                         "description": .string("Alpine lakes")]),
+                .object(["label": .string("Transylvania")]),
+            ]),
+        ])]),
+    ]))
+    let options = prompt?.questions.first?.options ?? []
+    #expect(options.count == 2)
+    #expect(options[0].label == "Slovenia", "the label should not still say (recommended)")
+    #expect(options[0].recommended)
+    #expect(options[1].recommended == false)
+    // The value goes back to the tool, so it keeps the original text: the tool
+    // matches on what it sent, not on what the badge made it look like.
+    #expect(options[0].value == "Slovenia (recommended)")
+}
