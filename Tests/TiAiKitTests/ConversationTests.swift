@@ -997,3 +997,20 @@ enum AskUserFixture {
     // The text is still the text; stealing it would blank the bubble.
     #expect(message.content.text == "what is this")
 }
+
+@Test func faviconsAreFoundWhereSitesActuallyPutThem() {
+    // `/favicon.ico` is the guess and usually the wrong one; the real location
+    // is a link tag in the head, sometimes relative, sometimes protocol-relative.
+    let html = """
+        <html><head>
+        <link rel="apple-touch-icon" href="/touch.png">
+        <link rel="icon" type="image/png" href="/static/fav.png">
+        <link rel="shortcut icon" href="//cdn.example.com/i.ico">
+        <link rel="stylesheet" href="/style.css">
+        </head><body>hi</body></html>
+        """
+    let links = FaviconCache.iconLinks(in: html, base: "https://example.com")
+    #expect(links.contains("https://example.com/static/fav.png"))
+    #expect(links.contains("https://cdn.example.com/i.ico"))
+    #expect(!links.contains("https://example.com/style.css"))
+}

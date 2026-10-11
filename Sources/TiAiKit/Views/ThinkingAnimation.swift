@@ -16,14 +16,21 @@ import SwiftUI
 /// the thing that tells you *this* run is working, over there.
 struct ThinkingAnimation: View {
     private enum Pose: Int, CaseIterable {
-        case blink, chase, pounce
+        case typing, blink, chase, pounce
     }
+
+    /// Which pose a run gets, in order of how much of it you should see.
+    ///
+    /// Typing is the signature - a cat at a keyboard is the joke, and the one
+    /// people recognise as "it is working on my thing" - so it appears twice in
+    /// the wheel and the idle poses fill the rest.
+    private static let wheel: [Pose] = [.typing, .typing, .typing, .blink, .chase, .pounce]
 
     private let pose: Pose
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init(runID: String? = nil) {
-        pose = Pose.allCases[Self.poseIndex(for: runID ?? UUID().uuidString)]
+        pose = Self.wheel[Self.poseIndex(for: runID ?? UUID().uuidString)]
     }
 
     /// Which pose a run gets.
@@ -35,7 +42,7 @@ struct ThinkingAnimation: View {
     static func poseIndex(for runID: String) -> Int {
         var hasher = Hasher()
         hasher.combine(runID)
-        return Int(UInt(bitPattern: hasher.finalize()) % UInt(Pose.allCases.count))
+        return Int(UInt(bitPattern: hasher.finalize()) % UInt(wheel.count))
     }
 
     var body: some View {
@@ -46,9 +53,10 @@ struct ThinkingAnimation: View {
         TimelineView(.animation(minimumInterval: reduceMotion ? 0.4 : 1.0 / 15.0)) { context in
             Canvas { ctx, size in
                 let t = context.date.timeIntervalSinceReferenceDate * (reduceMotion ? 0.3 : 1)
-                draw(&ctx, size: size, t: t)
+                if pose == .typing { drawTyping(&ctx, size: size, t: t) }
+                else { draw(&ctx, size: size, t: t) }
             }
-            .frame(width: 96, height: 26)
+            .frame(width: pose == .typing ? 118 : 96, height: pose == .typing ? 34 : 26)
         }
         .accessibilityLabel("Thinking")
     }
@@ -141,6 +149,73 @@ struct ThinkingAnimation: View {
                 Path(ellipseIn: CGRect(x: x, y: size.height * 0.52 + lift,
                                        width: dot * 2, height: dot * 2)),
                 with: .color(ink.opacity(alpha)))
+        }
+    }
+
+    // MARK: - the one at the keyboard
+
+    /// A cat typing on a laptop: paws alternating over the keys, the screen
+    /// line scrolling as it writes, the occasional blink.
+    ///
+    /// Drawn rather than the gif everyone knows, for the same reason as the
+    /// others: it inherits the colour scheme, stays crisp at 3x, and does not
+    /// arrive with a photograph of someone's kitchen glued behind it.
+    private func drawTyping(_ ctx: inout GraphicsContext, size: CGSize, t: Double) {
+        let ink = Color.secondary
+        let head = CGPoint(x: 30, y: 10.5)
+        let r: CGFloat = 8.5
+
+        // The laptop lid, seen from behind the cat: a slab with a glow leaking
+        // over its top edge, which is what actually sells "screen is on".
+        let lid = Path(roundedRect: CGRect(x: 12, y: 20, width: 40, height: 8),
+                       cornerRadius: 1.5)
+        ctx.fill(lid, with: .color(ink.opacity(0.30)))
+        ctx.stroke(
+            Path { p in
+                p.move(to: CGPoint(x: 13, y: 20))
+                p.addLine(to: CGPoint(x: 51, y: 20))
+            },
+            with: .color(.primary.opacity(0.55)), lineWidth: 1)
+
+        // Keyboard, drawn as a slab in perspective so it reads as a laptop and
+        // not a rectangle.
+        var keys = Path()
+        keys.move(to: CGPoint(x: 8, y: 28))
+        keys.addLine(to: CGPoint(x: 56, y: 28))
+        keys.addLine(to: CGPoint(x: 60, y: 32))
+        keys.addLine(to: CGPoint(x: 4, y: 32))
+        keys.closeSubpath()
+        ctx.fill(keys, with: .color(ink.opacity(0.45)))
+
+        // Paws alternate, roughly four taps a second, never both at once -
+        // simultaneous paws read as a still image.
+        let tap = CGFloat(sin(t * 8.0))
+        for (side, phase) in [(-1.0, tap), (1.0, -tap)] {
+            let x = head.x + CGFloat(side) * r * 0.62
+            let y = 27 - max(0, phase) * 2.4
+            ctx.fill(
+                Path(roundedRect: CGRect(x: x - 2.6, y: y, width: 5.2, height: 4.2),
+                     cornerRadius: 2.1),
+                with: .color(ink.opacity(0.9)))
+        }
+
+        drawEars(&ctx, centre: head, r: r, ink: ink, t: t)
+        ctx.fill(
+            Path(ellipseIn: CGRect(x: head.x - r, y: head.y - r, width: r * 2, height: r * 2)),
+            with: .color(ink.opacity(0.85)))
+        drawEyes(&ctx, centre: head, r: r, t: t)
+
+        // Lines of "text" marching up the side, the part that says output is
+        // being produced rather than time merely passing.
+        let line = Color.primary.opacity(0.22)
+        for index in 0..<3 {
+            let phase = (t * 1.6 + Double(index) * 0.5).truncatingRemainder(dividingBy: 1.5)
+            let y = 8 + CGFloat(index) * 6 - CGFloat(phase) * 2
+            let width: CGFloat = [22, 16, 26][index]
+            ctx.fill(
+                Path(roundedRect: CGRect(x: 70, y: y, width: width, height: 2),
+                     cornerRadius: 1),
+                with: .color(line))
         }
     }
 }

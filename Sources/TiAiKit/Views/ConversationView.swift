@@ -418,40 +418,13 @@ struct MessageRow: View {
 
     /// What the answer cites, numbered to match the `[1]` markers in the text.
     ///
+    /// The stacked favicon bubbles, expanding into what was actually cited.
+    ///
     /// Collapsed by default: a search that returned twelve pages produces a list
     /// longer than the answer, and the people who want it are the ones looking
     /// for it. Without this the citation markers point at nothing.
     private var sources: some View {
-        DisclosureGroup {
-            VStack(alignment: .leading, spacing: 8) {
-                ForEach(Array(turn.sources.enumerated()), id: \.element.id) { number, source in
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text("\(number + 1).")
-                            .foregroundStyle(.tertiary)
-                            .monospacedDigit()
-                        if let string = source.url, let url = URL(string: string) {
-                            Link(destination: url) {
-                                Text(source.name)
-                                    .foregroundStyle(.tint)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        } else {
-                            Text(source.name)
-                                .foregroundStyle(.secondary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-                }
-            }
-            .font(.footnote)
-            .padding(.top, 6)
-        } label: {
-            Label("Source\(turn.sources.count == 1 ? "" : "s") (\(turn.sources.count))",
-                  systemImage: "text.page")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .tint(.secondary)
+        SourcesRow(sources: turn.sources)
     }
 
     /// Thumbs up and down. Quiet by design: the answer is the point, and a
