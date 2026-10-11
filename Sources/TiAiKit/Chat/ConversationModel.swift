@@ -365,9 +365,31 @@ public final class ConversationModel {
         guard let chatID, phase.isBusy else { return }
         phase = .stopping
         Task {
-            do { try await client.stop(chatID: chatID) }
-            catch { self.error = error.localizedDescription }
+            do {
+                try await client.stop(chatID: chatID)
+            } catch {
+                self.error = error.localizedDescription
+            }
+            // The server has confirmed the task is stopped. Waiting for a frame
+            // to prove it was the old design, and on a real stop that frame
+            // never came: the run was over but nothing terminal was emitted, so
+            // the button stayed red and the chat looked frozen even though
+            // nothing was happening. A Stop button that stops is what was asked
+            // for. Whatever arrived stays on screen.
+            finishLocally(chatID: chatID)
         }
+    }
+
+    /// Ends the run in the app, whatever the server does next.
+    private func finishLocally(chatID: String) {
+        run?.cancel()
+        post?.cancel()
+        post = nil
+        hub.expire(chatID: chatID)
+        if let index = turns.lastIndex(where: \.isAssistant) {
+            turns[index].streaming = false
+        }
+        phase = .ready
     }
 
     /// Gives up on the local view of a run — used when the app goes to the
@@ -528,7 +550,10 @@ public final class ConversationModel {
             leafID = assistantID
         } else if outcome.failure == nil {
             if phase == .stopping {
-                outcome.failure = "Stopped."
+                // A stop the user asked for is not a failure, and saying
+                // "Stopped." in an error banner made a working button look like
+                // a broken one. The partial answer is the answer they got.
+                leafID = assistantID
             } else {
                 // The frame stream ended without ever saying it was finished.
                 // Most of the time that is a socket blip and not a failed run:
