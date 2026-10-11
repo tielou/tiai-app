@@ -29,6 +29,18 @@ ios:
 ## unguarded code — compiles clean under `make ios` and fails the archive on a
 ## runner three minutes and one dispatch later. Run this before triggering a
 ## build and that class of failure dies here instead.
+## Build the simulator app and put it on the running simulator, in one step.
+##
+## Splitting "build" from "install" caused a real bug: a Release archive was
+## built, the fix was confirmed, and the *stale Debug* product from an hour
+## earlier was installed instead — so the fix was tested and reported as not
+## working. There is no reason to ever install something you did not just build.
+install: app
+	xcodebuild -quiet -project TiAi.xcodeproj -scheme TiAi \
+	  -destination 'platform=iOS Simulator,name=iPhone 16e' build
+	xcrun simctl install $$DEVUDID \
+	  $$(ls -d $$HOME/Library/Developer/Xcode/DerivedData/TiAi-*/Build/Products/Debug-iphonesimulator/TiAi.app | head -1)
+
 ios-release: app
 	xcodebuild -quiet -project TiAi.xcodeproj -scheme TiAi \
 	  -destination 'generic/platform=iOS' -configuration Release build \

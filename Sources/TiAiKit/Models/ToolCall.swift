@@ -80,7 +80,7 @@ public struct ToolCall: Equatable, Sendable, Identifiable {
         }
     }
 
-    init?(_ value: JSONValue) {
+    public init?(_ value: JSONValue) {
         guard let object = value.objectValue else { return nil }
         let type = object["type"]?.stringValue ?? ""
         guard type == "function_call" || type == "function_call_output" else { return nil }
@@ -225,7 +225,7 @@ public struct AskUserPrompt: Equatable, Sendable {
     /// field; a tool that says no should not get an answer it will ignore.
     public var allowsOther: Bool
 
-    init?(arguments: JSONValue?) {
+    public init?(arguments: JSONValue?) {
         guard let arguments else { return nil }
         title = arguments["title"]?.stringValue ?? arguments["header"]?.stringValue
         allowsOther = arguments["allow_other"]?.boolValue ?? true
