@@ -159,7 +159,7 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
     /// all — the bubble rendered `content` alone. The id is what the file
     /// content route wants; `url` is the same id, not a resolvable link.
     public var messageAttachments: [MessageAttachment] {
-        (files ?? []).compactMap { value in
+        let fromFiles = (files ?? []).compactMap { value -> MessageAttachment? in
             let inner = value["file"] ?? value
             let id = (inner["id"] ?? value["id"])?.stringValue
             guard let id, !id.isEmpty else { return nil }
@@ -171,6 +171,24 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
             return MessageAttachment(
                 id: id, name: name, isImage: looksLikeImage || mime.hasPrefix("image/"))
         }
+        // ...and a picture the sender put straight into the message, which is
+        // where a vision model is actually handed its image. The app's own
+        // uploads land here and carry no `files` entry at all, so reading only
+        // the file list showed a message with a photo in it and no photo.
+        let fromContent = contentImageURLs.compactMap { url -> MessageAttachment? in
+            guard url.hasPrefix("data:") else { return nil }
+            return MessageAttachment(id: url, name: "image", isImage: true, dataURL: url)
+        }
+        return fromFiles + fromContent
+    }
+
+    /// `image_url` targets inside a multipart message body, in order.
+    public var contentImageURLs: [String] {
+        content.blocks?
+            .compactMap { block in
+                guard block["type"]?.stringValue == "image_url" else { return nil }
+                return block["image_url"]?["url"]?.stringValue
+            } ?? []
     }
 
     /// What this message cites, flattened to a name and an optional url.
@@ -376,4 +394,13 @@ public struct MessageAttachment: Identifiable, Equatable, Sendable {
     public var id: String
     public var name: String
     public var isImage: Bool
+    /// Set when the bytes travel with the message instead of being fetched by id.
+    public var dataURL: String?
+
+    public init(id: String, name: String, isImage: Bool, dataURL: String? = nil) {
+        self.id = id
+        self.name = name
+        self.isImage = isImage
+        self.dataURL = dataURL
+    }
 }

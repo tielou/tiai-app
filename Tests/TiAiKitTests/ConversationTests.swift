@@ -979,3 +979,21 @@ enum AskUserFixture {
     conversation.selectSibling(of: "u1", direction: 1)
     #expect(conversation.turns.map(\.id) == ["u1", "a2"])
 }
+
+@Test func anImageInsideTheMessageBodyCountsAsAnAttachment() throws {
+    // The app's own uploads are stored with the picture in the message content
+    // and no `files` entry at all, so a renderer that only reads `files` shows a
+    // message with a photo in it and no photo - which is the bug this pins.
+    let data = """
+        {"id":"u1","role":"user","parent_id":null,"children_ids":[],
+         "content":[{"type":"text","text":"what is this"},
+                    {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}}]}
+        """.data(using: .utf8)!
+    let message = try JSONDecoder().decode(ChatMessage.self, from: data)
+    let attachments = message.messageAttachments
+    #expect(attachments.count == 1)
+    #expect(attachments.first?.isImage == true)
+    #expect(attachments.first?.dataURL == "data:image/jpeg;base64,AAAA")
+    // The text is still the text; stealing it would blank the bubble.
+    #expect(message.content.text == "what is this")
+}

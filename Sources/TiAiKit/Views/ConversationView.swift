@@ -245,9 +245,14 @@ struct MessageRow: View {
 
     var body: some View {
         if turn.isUser {
-            VStack(alignment: .trailing, spacing: 5) {                if !turn.attachments.isEmpty {
+            VStack(alignment: .trailing, spacing: 5) {
+                if !turn.attachments.isEmpty {
                     ForEach(turn.attachments) { attachment in
-                        if attachment.isImage, let fileLoader {
+                        if attachment.isImage, let dataURL = attachment.dataURL {
+                            // The bytes came with the message, so there is nothing
+                            // to fetch.
+                            InlineImageView(dataURL: dataURL)
+                        } else if attachment.isImage, let fileLoader {
                             RemoteImageView(id: attachment.id, load: fileLoader)
                         } else {
                             Label(attachment.name, systemImage: "paperclip")
@@ -919,6 +924,44 @@ extension ToolCall {
 /// `AsyncImage` is not an option: `/files/{id}/content` is behind the bearer
 /// token, and handing it a bare URL produced a 401 and an empty gap — which is
 /// how a photo attached in the web UI ended up invisible on the phone.
+/// An image carried as a `data:` url inside the message itself.
+struct InlineImageView: View {
+    let dataURL: String
+
+    #if os(iOS)
+    @State private var image: UIImage?
+    #endif
+
+    var body: some View {
+        #if os(iOS)
+        Group {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: 260, maxHeight: 320)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+            } else {
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(.quaternary.opacity(0.4))
+                    .frame(width: 160, height: 120)
+            }
+        }
+        .onAppear { load() }
+        #else
+        Color.clear.frame(height: 0)
+        #endif
+    }
+
+    #if os(iOS)
+    private func load() {
+        guard image == nil, let comma = dataURL.firstIndex(of: ",") else { return }
+        let base64 = String(dataURL[dataURL.index(after: comma)...])
+        if let data = Data(base64Encoded: base64) { image = UIImage(data: data) }
+    }
+    #endif
+}
+
 struct RemoteImageView: View {
     let id: String
     let load: (String) async -> Data?
