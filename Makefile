@@ -23,6 +23,17 @@ ios:
 	xcodebuild -quiet -project TiAi.xcodeproj -scheme TiAi \
 	  -destination 'platform=iOS Simulator,name=iPhone 16e' build
 
+## Release configuration, which is the one TestFlight builds.
+##
+## This exists because a `#if DEBUG` mistake — a debug-only helper called from
+## unguarded code — compiles clean under `make ios` and fails the archive on a
+## runner three minutes and one dispatch later. Run this before triggering a
+## build and that class of failure dies here instead.
+ios-release: app
+	xcodebuild -quiet -project TiAi.xcodeproj -scheme TiAi \
+	  -destination 'generic/platform=iOS' -configuration Release build \
+	  CODE_SIGNING_ALLOWED=NO
+
 ## The gate. Everything that runs without Xcode, and therefore everything that
 ## runs on any machine, including the one you are on.
 check: build app-check test

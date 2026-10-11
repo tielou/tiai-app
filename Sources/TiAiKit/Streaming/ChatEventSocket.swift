@@ -283,10 +283,12 @@ public final class ChatEventSocket: @unchecked Sendable {
         handlers.value = handlers.value + [handler]
         client.on("events") { [weak self] payload, _ in
             guard let self else { return }
+            #if DEBUG
             // Dumped before parsing: a frame that arrives and fails to parse is
             // invisible to the UI too, and "nothing arrived" versus "it arrived
             // and we dropped it" need different fixes.
             Self.dump(raw: payload)
+            #endif
             guard let dictionary = payload.first as? [String: Any], let frame = Frame(dictionary) else { return }
             for handler in self.handlers.value { handler(frame) }
         }
