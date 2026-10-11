@@ -245,8 +245,15 @@ struct ComposerView: View {
                 Text(models.first(where: { $0.id == conversation.model })?.name.nonEmpty ?? conversation.model)
                     .font(.footnote.weight(.medium))
                     .lineLimit(1)
-                if let hint = chipHint {
-                    Text(hint).font(.footnote).foregroundStyle(.secondary).lineLimit(1)
+                if !featuresOn.isEmpty {
+                    HStack(spacing: 6) {
+                        ForEach(featuresOn, id: \.self) { feature in
+                            Image(systemName: feature.symbol)
+                                .font(.system(size: 11, weight: .medium))
+                                .accessibilityLabel(feature.title)
+                        }
+                    }
+                    .foregroundStyle(.secondary)
                 }
             }
             .padding(.horizontal, 12)
@@ -258,11 +265,9 @@ struct ComposerView: View {
         .accessibilityLabel("Model \(conversation.model)")
     }
 
-    /// What is on for this message, in the chip's secondary slot — the same slot
-    /// Claude uses for "Medium".
-    private var chipHint: String? {
-        let on = ChatFeature.allCases.filter { conversation.features[$0.rawValue] ?? false }
-        return on.isEmpty ? nil : on.map(\.shortTitle).joined(separator: " · ")
+    /// Which capabilities are on for this message, in the chip's secondary slot.
+    private var featuresOn: [ChatFeature] {
+        ChatFeature.allCases.filter { conversation.features[$0.rawValue] ?? false }
     }
 
     private var attachmentStrip: some View {

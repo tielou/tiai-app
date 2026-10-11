@@ -141,4 +141,16 @@ public enum ChatFeature: String, CaseIterable, Codable, Sendable {
         case .imageGeneration: "Image generation"
         }
     }
+
+    /// The composer chip shows these as glyphs, because four words after the
+    /// model name is a sentence where a glance should do. `title` stays the
+    /// thing VoiceOver reads, so the icons cost nothing in meaning.
+    public var symbol: String {
+        switch self {
+        case .webSearch: "magnifyingglass"
+        case .memory: "brain"
+        case .codeInterpreter: "curlybraces"
+        case .imageGeneration: "photo"
+        }
+    }
 }

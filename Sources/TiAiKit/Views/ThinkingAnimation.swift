@@ -50,13 +50,13 @@ struct ThinkingAnimation: View {
         // small figure in a line of text — and hiding the cat entirely meant
         // most people never saw it, because plenty of people leave Reduce Motion
         // on for unrelated reasons. So it stays, slowed down.
-        TimelineView(.animation(minimumInterval: reduceMotion ? 0.4 : 1.0 / 15.0)) { context in
+        TimelineView(.animation(minimumInterval: reduceMotion ? 0.4 : 1.0 / 24.0)) { context in
             Canvas { ctx, size in
                 let t = context.date.timeIntervalSinceReferenceDate * (reduceMotion ? 0.3 : 1)
                 if pose == .typing { drawTyping(&ctx, size: size, t: t) }
                 else { draw(&ctx, size: size, t: t) }
             }
-            .frame(width: pose == .typing ? 118 : 96, height: pose == .typing ? 34 : 26)
+            .frame(width: pose == .typing ? 118 : 96, height: pose == .typing ? 36 : 26)
         }
         .accessibilityLabel("Thinking")
     }
@@ -106,7 +106,8 @@ struct ThinkingAnimation: View {
         }
     }
 
-    private func drawEyes(_ ctx: inout GraphicsContext, centre: CGPoint, r: CGFloat, t: Double) {
+    private func drawEyes(_ ctx: inout GraphicsContext, centre: CGPoint, r: CGFloat, t: Double,
+                          downward: Bool = false) {
         // Blink roughly every three seconds, and close over two frames rather
         // than snapping, so it reads as a blink and not a glitch.
         let cycle = t.truncatingRemainder(dividingBy: 3.0)
@@ -120,13 +121,14 @@ struct ThinkingAnimation: View {
         for side in [-1.0, 1.0] {
             let x = centre.x + CGFloat(side) * r * 0.38
             let rect = CGRect(
-                x: x - eyeR, y: centre.y - eyeR * open - r * 0.05,
+                x: x - eyeR, y: centre.y - eyeR * open + (downward ? r * 0.22 : -r * 0.05),
                 width: eyeR * 2, height: eyeR * 2 * open)
             if open < 0.2 {
                 // A closed eye is a line; a squashed ellipse disappears at this size.
                 var lid = Path()
-                lid.move(to: CGPoint(x: x - eyeR, y: centre.y - r * 0.05))
-                lid.addLine(to: CGPoint(x: x + eyeR, y: centre.y - r * 0.05))
+                let lidY = centre.y + (downward ? r * 0.22 : -r * 0.05)
+                lid.move(to: CGPoint(x: x - eyeR, y: lidY))
+                lid.addLine(to: CGPoint(x: x + eyeR, y: lidY))
                 ctx.stroke(lid, with: .color(.primary),
                            style: StrokeStyle(lineWidth: 1.2, lineCap: .round))
             } else {
@@ -154,68 +156,83 @@ struct ThinkingAnimation: View {
 
     // MARK: - the one at the keyboard
 
-    /// A cat typing on a laptop: paws alternating over the keys, the screen
-    /// line scrolling as it writes, the occasional blink.
+    /// A cat typing on a laptop, after the gif everyone means: shoulders and
+    /// head above the lid, both paws over the keys alternately, and fast enough
+    /// that it reads as typing rather than idling.
     ///
-    /// Drawn rather than the gif everyone knows, for the same reason as the
-    /// others: it inherits the colour scheme, stays crisp at 3x, and does not
-    /// arrive with a photograph of someone's kitchen glued behind it.
+    /// Drawn rather than the gif itself, for the same reason as the others: it
+    /// takes the colour scheme, stays crisp at 3x, and does not arrive with a
+    /// photograph of someone's kitchen glued behind it.
     private func drawTyping(_ ctx: inout GraphicsContext, size: CGSize, t: Double) {
         let ink = Color.secondary
-        let head = CGPoint(x: 30, y: 10.5)
-        let r: CGFloat = 8.5
+        let dark = ink.opacity(0.85)
+        let head = CGPoint(x: 30, y: 10)
+        let r: CGFloat = 8
 
-        // The laptop lid, seen from behind the cat: a slab with a glow leaking
-        // over its top edge, which is what actually sells "screen is on".
-        let lid = Path(roundedRect: CGRect(x: 12, y: 20, width: 40, height: 8),
-                       cornerRadius: 1.5)
-        ctx.fill(lid, with: .color(ink.opacity(0.30)))
-        ctx.stroke(
-            Path { p in
-                p.move(to: CGPoint(x: 13, y: 20))
-                p.addLine(to: CGPoint(x: 51, y: 20))
-            },
-            with: .color(.primary.opacity(0.55)), lineWidth: 1)
+        // Shoulders behind the lid, so the cat is sitting at the machine and not
+        // floating above it.
+        // Shoulders only: the lid hides the rest, and a body that spills below it
+        // turns the cat into a blob sitting on the desk.
+        var body = Path()
+        body.move(to: CGPoint(x: head.x - r * 1.05, y: 20))
+        body.addQuadCurve(
+            to: CGPoint(x: head.x + r * 1.05, y: 20),
+            control: CGPoint(x: head.x, y: 7))
+        ctx.fill(body, with: .color(dark))
 
-        // Keyboard, drawn as a slab in perspective so it reads as a laptop and
-        // not a rectangle.
-        var keys = Path()
-        keys.move(to: CGPoint(x: 8, y: 28))
-        keys.addLine(to: CGPoint(x: 56, y: 28))
-        keys.addLine(to: CGPoint(x: 60, y: 32))
-        keys.addLine(to: CGPoint(x: 4, y: 32))
-        keys.closeSubpath()
-        ctx.fill(keys, with: .color(ink.opacity(0.45)))
+        // The lid, seen from behind: a slab leaning back over the keyboard.
+        var lid = Path()
+        lid.move(to: CGPoint(x: 13, y: 27))
+        lid.addLine(to: CGPoint(x: 49, y: 27))
+        lid.addLine(to: CGPoint(x: 46, y: 17))
+        lid.addLine(to: CGPoint(x: 16, y: 17))
+        lid.closeSubpath()
+        ctx.fill(lid, with: .color(ink.opacity(0.35)))
+        ctx.stroke(lid, with: .color(ink.opacity(0.6)), lineWidth: 0.8)
 
-        // Paws alternate, roughly four taps a second, never both at once -
-        // simultaneous paws read as a still image.
-        let tap = CGFloat(sin(t * 8.0))
+        // Keyboard deck, drawn as a parallelogram so it has some depth.
+        var deck = Path()
+        deck.move(to: CGPoint(x: 9, y: 27))
+        deck.addLine(to: CGPoint(x: 53, y: 27))
+        deck.addLine(to: CGPoint(x: 58, y: 32))
+        deck.addLine(to: CGPoint(x: 4, y: 32))
+        deck.closeSubpath()
+        ctx.fill(deck, with: .color(ink.opacity(0.55)))
+
+        // Paws over the front of the lid, alternating at roughly three taps a
+        // second. Never both down at once: that reads as a still image.
+        let tap = sin(t * 16.0)
         for (side, phase) in [(-1.0, tap), (1.0, -tap)] {
             let x = head.x + CGFloat(side) * r * 0.62
-            let y = 27 - max(0, phase) * 2.4
+            let down = max(0, CGFloat(phase))
+            let y = 25.5 - (1 - down) * 3.0
             ctx.fill(
-                Path(roundedRect: CGRect(x: x - 2.6, y: y, width: 5.2, height: 4.2),
-                     cornerRadius: 2.1),
-                with: .color(ink.opacity(0.9)))
+                Path(roundedRect: CGRect(x: x - 3, y: y, width: 6, height: 4.6),
+                     cornerRadius: 2.3),
+                with: .color(dark))
+            // The key being struck lights for one frame.
+            if down > 0.85 {
+                ctx.fill(
+                    Path(roundedRect: CGRect(x: x - 2.4, y: 29.6, width: 4.8, height: 1.4),
+                         cornerRadius: 0.7),
+                    with: .color(.primary.opacity(0.5)))
+            }
         }
 
         drawEars(&ctx, centre: head, r: r, ink: ink, t: t)
-        ctx.fill(
-            Path(ellipseIn: CGRect(x: head.x - r, y: head.y - r, width: r * 2, height: r * 2)),
-            with: .color(ink.opacity(0.85)))
-        drawEyes(&ctx, centre: head, r: r, t: t)
+        ctx.fill(Path(ellipseIn: CGRect(x: head.x - r, y: head.y - r, width: r * 2, height: r * 2)),
+                 with: .color(dark))
+        drawEyes(&ctx, centre: head, r: r, t: t, downward: true)
 
-        // Lines of "text" marching up the side, the part that says output is
-        // being produced rather than time merely passing.
-        let line = Color.primary.opacity(0.22)
+        // Output marching up the side — the part that says something is being
+        // produced rather than time merely passing.
         for index in 0..<3 {
-            let phase = (t * 1.6 + Double(index) * 0.5).truncatingRemainder(dividingBy: 1.5)
+            let phase = (t * 2.4 + Double(index) * 0.5).truncatingRemainder(dividingBy: 1.5)
             let y = 8 + CGFloat(index) * 6 - CGFloat(phase) * 2
             let width: CGFloat = [22, 16, 26][index]
             ctx.fill(
-                Path(roundedRect: CGRect(x: 70, y: y, width: width, height: 2),
-                     cornerRadius: 1),
-                with: .color(line))
+                Path(roundedRect: CGRect(x: 70, y: y, width: width, height: 2), cornerRadius: 1),
+                with: .color(.primary.opacity(0.22)))
         }
     }
 }
