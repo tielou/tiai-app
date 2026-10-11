@@ -36,6 +36,12 @@ struct OAuthWebView: View {
                     // way out the sheet would be a trap.
                     Button("Done") { onFinished(); dismiss() }
                 }
+                ToolbarItem(placement: .topBarLeading) {
+                    // The way out when the page itself will not cooperate in a web
+                    // view. Safari usually already holds an Open WebUI session, so
+                    // it often skips the sign-in step entirely.
+                    Button("Safari") { UIApplication.shared.open(url) }
+                }
             }
         }
     }
@@ -50,7 +56,15 @@ private struct SessionBrowser: UIViewControllerRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(onCallback: onCallback) }
 
     func makeUIViewController(context: Context) -> WebController {
-        let web = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let configuration = WKWebViewConfiguration()
+        configuration.userContentController.addUserScript(WKUserScript(
+            source: Self.autofillScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true,
+            in: .page))
+        let web = WKWebView(frame: .zero, configuration: configuration)
+        // The sign-in form is centred, so with the keyboard up the submit button
+        // sits underneath it — and nothing scrolled, so there was no way to reach
+        // it or to get rid of the keyboard.
+        web.scrollView.keyboardDismissMode = .interactive
         web.navigationDelegate = context.coordinator
         web.uiDelegate = context.coordinator
         let controller = WebController(web: web)
@@ -82,6 +96,27 @@ private struct SessionBrowser: UIViewControllerRepresentable {
         uiViewController.web.stopLoading()
     }
 
+    /// iOS fills a password field without firing the events a single-page app
+    /// listens for, so its "both fields are filled, enable the button" check
+    /// never runs and sign-in looks unclickable after autofill. Re-broadcast the
+    /// input when the field turns yellow.
+    static let autofillScript = """
+        (() => {
+          const style = document.createElement('style')
+          style.textContent = '@keyframes tiai-autofill { from { } to { } }'
+            + 'input:-webkit-autofill { animation-name: tiai-autofill; '
+            + 'animation-duration: 0.01s; animation-delay: 0.01s; }'
+          document.head.appendChild(style)
+          document.addEventListener('animationstart', event => {
+            const node = event.target
+            if (node && node.tagName === 'INPUT' && event.animationName === 'tiai-autofill') {
+              node.dispatchEvent(new Event('input', { bubbles: true }))
+              node.dispatchEvent(new Event('change', { bubbles: true }))
+            }
+          }, true)
+        })()
+        """
+
     /// A `WKWebView` is a view, not a view controller, so it needs a host.
     final class WebController: UIViewController {
         let web: WKWebView
@@ -95,8 +130,10 @@ private struct SessionBrowser: UIViewControllerRepresentable {
             super.viewDidLoad()
             web.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview(web)
+            // Pinned to the safe area, not the view: under the navigation bar the
+            // top of the form was unreachable.
             NSLayoutConstraint.activate([
-                web.topAnchor.constraint(equalTo: view.topAnchor),
+                web.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
                 web.bottomAnchor.constraint(equalTo: view.bottomAnchor),
                 web.leadingAnchor.constraint(equalTo: view.leadingAnchor),
                 web.trailingAnchor.constraint(equalTo: view.trailingAnchor),

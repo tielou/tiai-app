@@ -136,6 +136,22 @@ struct ComposerView: View {
     /// HEIC is the default on iPhones, and a gateway fronting a model is not
     /// promised to read it. ImageIO decodes HEIC fine, so the app normalises on
     /// the way out rather than hoping the server copes.
+    /// EXIF orientation to UIKit's. The two enums agree on numbers 1-4 and then
+    /// diverge, so the last four have to be translated rather than cast.
+    private static func uiOrientation(_ raw: UInt32) -> UIImage.Orientation {
+        switch raw {
+        case 1: return .up
+        case 2: return .upMirrored
+        case 3: return .down
+        case 4: return .downMirrored
+        case 5: return .leftMirrored
+        case 6: return .right
+        case 7: return .rightMirrored
+        case 8: return .left
+        default: return .up
+        }
+    }
+
     /// Longest side an image is sent at.
     ///
     /// The picture travels inside the message as a data url, so its size is
@@ -146,16 +162,27 @@ struct ComposerView: View {
     private static func jpeg(from data: Data) -> Data? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
             let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+
+        // A phone-stored photo is landscape pixels plus an orientation flag, and
+        // `CGImageSourceCreateImageAtIndex` hands you the pixels. Re-encoding
+        // without applying that flag sends the picture sideways - which is exactly
+        // what this used to do.
+        let properties = (CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any]) ?? [:]
+        let oriented = UIImage(
+            cgImage: image, scale: 1,
+            orientation: Self.uiOrientation(
+                (properties[kCGImagePropertyOrientation as String] as? UInt32)
+                ?? CGImagePropertyOrientation.up.rawValue))
+
         let width = CGFloat(image.width), height = CGFloat(image.height)
-        guard max(width, height) > maxEdge else {
-            return UIImage(cgImage: image).jpegData(compressionQuality: 0.9)
-        }
+        guard max(width, height) > maxEdge else { return oriented.jpegData(compressionQuality: 0.9) }
         let scale = maxEdge / max(width, height)
         let size = CGSize(width: width * scale, height: height * scale)
         let format = UIGraphicsImageRendererFormat.default()
         format.scale = 1
+        // Draws in the orientation, so the output is upright and flag-free.
         let shrunk = UIGraphicsImageRenderer(size: size, format: format).image { _ in
-            UIImage(cgImage: image).draw(in: CGRect(origin: .zero, size: size))
+            oriented.draw(in: CGRect(origin: .zero, size: size))
         }
         return shrunk.jpegData(compressionQuality: 0.85)
     }
