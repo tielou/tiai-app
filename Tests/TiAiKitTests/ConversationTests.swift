@@ -1332,3 +1332,50 @@ enum AskUserFixture {
     }) else { Issue.record("expected a code block"); return }
     #expect(code == "let a = 1\n\n\nlet b = 2")
 }
+
+// The picker hands the bytes over immediately; the upload answers a moment
+// later. Pressing send inside that gap used to produce a message with no photo
+// and no error — the reported "image with the first message never reaches the
+// backend". Send has to wait for what is still in flight.
+@Test @MainActor func sendWaitsForAnUploadStillInFlight() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: nil,
+        models: [ChatModel.stub("local-personal", caps: ["vision": true])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: ChatEventHub(server: server))
+
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "shot.jpg", mimeType: "image/jpeg")
+    // Deliberately no wait. The upload has been started and has not landed.
+    #expect(conversation.attachments.isEmpty, "nothing has come back yet")
+    #expect(conversation.uploading, "and the app knows it")
+
+    conversation.draft = "what is in this?"
+    conversation.send()
+    try await transport.awaitCompletion()
+
+    let raw = try #require(transport.completionBody)
+    let json = try #require(JSONSerialization.jsonObject(with: raw) as? [String: Any])
+    let messages = try #require(json["messages"] as? [[String: Any]])
+    let user = try #require(messages.last { ($0["role"] as? String) == "user" })
+    let blocks = try #require(user["content"] as? [[String: Any]])
+    #expect(blocks.contains { ($0["type"] as? String) == "image_url" },
+            "the photo must be in the message that was sent")
+
+    let files = try #require(json["files"] as? [Any])
+    #expect(!files.isEmpty, "and in the files list the retrieval pipeline reads")
+}
+
+@Test @MainActor func sendIsAllowedWhileAnUploadIsInFlight() {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let conversation = ConversationModel(
+        chatID: nil,
+        models: [ChatModel.stub("local-personal", caps: ["vision": true])],
+        client: OWUIClient(server: server, transport: ScriptedTransport()),
+        hub: ChatEventHub(server: server))
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "shot.jpg", mimeType: "image/jpeg")
+    // Disabled-while-uploading would read as a broken picker; the button stays
+    // live and the send waits.
+    #expect(conversation.canSend)
+}

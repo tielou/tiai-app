@@ -38,6 +38,13 @@ public struct OWUIClient: Sendable {
         if let bodyData {
             req.httpBody = bodyData
             if let contentType { req.setValue(contentType, forHTTPHeaderField: "Content-Type") }
+            #if DEBUG
+            // The request side of the same trick. A screenshot cannot show
+            // whether a field made it onto the wire, and "the photo was sent but
+            // the model never saw it" is exactly the kind of claim worth
+            // checking instead of reasoning about.
+            Self.dump(url: url, method: "REQ_\(method)", data: bodyData)
+            #endif
         }
 
         let data: Data
@@ -305,6 +312,12 @@ public struct OWUIClient: Sendable {
         // No timeout: a long cold prefill on a local engine is normal, not hung.
         req.timeoutInterval = 0
         req.httpBody = try JSONEncoder().encode(completion)
+        #if DEBUG
+        // The completion does not go through `perform`, so it needs its own
+        // dump. This is the request worth reading when someone says "it sent but
+        // the model never saw it" — the answer is either in here or it is not.
+        Self.dump(url: url, method: "REQ_POST", data: req.httpBody ?? Data())
+        #endif
 
         let (bytes, http) = try await transport.bytes(req)
         switch http.statusCode {

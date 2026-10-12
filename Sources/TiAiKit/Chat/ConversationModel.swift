@@ -165,7 +165,10 @@ public final class ConversationModel {
         // button sit there disabled after a picture was attached, which read as
         // the upload having failed.
         let hasText = !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        return (hasText || !attachments.isEmpty) && !phase.isBusy
+        // Uploading counts as content for the same reason send() waits for it:
+        // the picture is coming, and greying the button out until it lands is
+        // honest in a way that sending without it is not.
+        return (hasText || !attachments.isEmpty || uploading) && !phase.isBusy
     }
 
     public func setModels(_ models: [ChatModel]) {
@@ -252,8 +255,12 @@ public final class ConversationModel {
         guard !name.isEmpty else { return }
         uploading = true
         error = nil
-        Task {
-            defer { uploading = false }
+        uploadsInFlight += 1
+        pendingUploads.append(Task {
+            defer {
+                uploadsInFlight -= 1
+                uploading = uploadsInFlight > 0
+            }
             do {
                 let file = try await client.uploadFile(data: data, filename: name, mimeType: mimeType)
                 attachments.append(
@@ -261,7 +268,25 @@ public final class ConversationModel {
             } catch {
                 self.error = "Could not attach \(name): \(error.localizedDescription)"
             }
-        }
+        })
+    }
+
+    /// Uploads that have been started and not finished.
+    ///
+    /// The upload begins when the file is picked, which is right, but it means
+    /// there is a window in which the picture is chosen, visible in the composer,
+    /// and *not yet in* `attachments` — because the id does not exist until the
+    /// server answers. Pressing send inside that window used to send the message
+    /// without the file and without any complaint. That is the whole of
+    /// "I sent a photo and the backend never got it".
+    private var pendingUploads: [Task<Void, Never>] = []
+    private var uploadsInFlight = 0
+
+    private func waitForUploads() async {
+        guard !pendingUploads.isEmpty else { return }
+        let waiting = pendingUploads
+        pendingUploads = []
+        for task in waiting { _ = await task.value }
     }
 
     /// A file the picker handed over and the app could not read.
@@ -275,16 +300,24 @@ public final class ConversationModel {
 
     public func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !(text.isEmpty && attachments.isEmpty), !phase.isBusy else { return }
-        let files = attachments
-        attachments = []
+        // `uploading` counts as content. A picture that is still on the wire is
+        // not an absent picture, and refusing to send until it lands is better
+        // than sending a message that quietly lost it.
+        guard !(text.isEmpty && attachments.isEmpty && !uploading), !phase.isBusy else { return }
         draft = ""
         error = nil
         // Set here rather than inside the task: the button's feedback should not
         // wait for a scheduling hop, and a caller that then awaits something
         // conditioned on the phase would otherwise race the run it just started.
         phase = .waiting
-        run = Task { await self.exchange(text: text, regenerating: nil, files: files) }
+        run = Task {
+            // Taken *after* the wait, because until the upload answers there is
+            // no file id to take.
+            await self.waitForUploads()
+            let files = self.attachments
+            self.attachments = []
+            await self.exchange(text: text, regenerating: nil, files: files)
+        }
     }
 
     /// The stored chat, kept so the message tree can be walked without another
