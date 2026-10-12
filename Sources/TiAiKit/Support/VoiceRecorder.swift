@@ -43,13 +43,20 @@ public final class VoiceRecorder {
     /// called with the words; the caller decides where they go.
     public func toggle(client: OWUIClient, onText: @escaping (String) -> Void) async {
         switch phase {
-        case .recording:
-            await finish(client: client, onText: onText)
-        case .transcribing, .starting:
-            break
-        default:
-            await begin()
+        case .recording: await stop(client: client, onText: onText)
+        case .transcribing, .starting: break
+        default: await start()
         }
+    }
+
+    /// Start, for a caller that also wants to stop on its own schedule — the
+    /// composer holds the mic, so a press starts and a release may end it.
+    public func start() async { await begin() }
+
+    /// Stop and transcribe.
+    public func stop(client: OWUIClient, onText: @escaping (String) -> Void) async {
+        guard phase == .recording else { return }
+        await finish(client: client, onText: onText)
     }
 
     // MARK: - recording

@@ -34,6 +34,8 @@ struct ComposerView: View {
     @State private var cameraRequest = false
     #if os(iOS)
     @State private var voice = VoiceRecorder()
+    @State private var pressStart: Date? = nil
+    @State private var startedByPress = false
     #endif
 
     private enum Sheet: Identifiable {
@@ -227,53 +229,100 @@ struct ComposerView: View {
     }
 
     #if os(iOS)
-    /// Dictation. Recording replaces the send button's neighbour rather than
-    /// opening anything, so the gesture is one tap to start and the same tap to
-    /// stop, and the words land in the field where you can still edit them
-    /// before sending.
+    /// Dictation, with two gestures on one control because people expect both.
+    ///
+    /// A tap starts recording and it keeps going until you tap again — good when
+    /// you are dictating at length and want to look at what you have said. A
+    /// press-and-hold records for as long as the finger is down and releases
+    /// when you let go, which is faster for a single sentence and needs no
+    /// second aim at a small button.
+    ///
+    /// The two are told apart by how long the press lasted, which means the
+    /// recording starts on touch-down: waiting to see which gesture it was would
+    /// clip the first syllable, and the first syllable is usually the word that
+    /// matters.
     @ViewBuilder private var micButton: some View {
-        Button {
-            Task {
-                await voice.toggle(client: conversation.client) { text in
-                    let existing = conversation.draft.trimmingCharacters(in: .whitespaces)
-                    conversation.draft = existing.isEmpty ? text : existing + " " + text
-                }
-            }
-        } label: {
-            Group {
-                switch voice.phase {
-                case .recording:
-                    HStack(spacing: 5) {
-                        Image(systemName: "stop.fill")
-                        Text(voice.elapsed.formatted(.number.precision(.fractionLength(0))))
-                            .monospacedDigit()
+        micLabel
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in
+                        guard pressStart == nil, !voice.isBusy, !conversation.phase.isBusy else { return }
+                        pressStart = Date()
+                        startedByPress = voice.phase != .recording
+                        if startedByPress {
+                            haptic(.light)
+                            Task { await voice.start() }
+                        }
                     }
-                case .transcribing, .starting:
-                    ProgressView().controlSize(.small)
-                default:
-                    Image(systemName: "mic")
+                    .onEnded { _ in
+                        let held = pressStart.map { Date().timeIntervalSince($0) } ?? 0
+                        pressStart = nil
+                        defer { startedByPress = false }
+                        guard !voice.isBusy else { return }
+                        // A short tap that started the recording leaves it
+                        // running; everything else — a long hold, or any press
+                        // while already recording — ends it and transcribes.
+                        if startedByPress && held < Self.holdThreshold { return }
+                        haptic(.medium)
+                        Task {
+                            await voice.stop(client: conversation.client) { text in
+                                let existing = conversation.draft.trimmingCharacters(in: .whitespaces)
+                                conversation.draft = existing.isEmpty ? text : existing + " " + text
+                            }
+                        }
+                    }
+            )
+            .overlay(alignment: .top) {
+                if case .failed(let message) = voice.phase {
+                    Text(message)
+                        .font(.caption2).foregroundStyle(.red)
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(.regularMaterial, in: .capsule)
+                        .offset(y: -26)
+                        .transition(.opacity)
                 }
             }
-            .font(.system(size: 15, weight: .medium))
-            .foregroundStyle(voice.phase == .recording ? .white : .secondary)
-            .frame(width: 34, height: 34)
-            .background(voice.phase == .recording ? AnyShapeStyle(.red)
-                                                  : AnyShapeStyle(.quaternary.opacity(0.7)),
-                        in: .circle)
-        }
-        .buttonStyle(.plain)
-        .disabled(conversation.phase.isBusy)
-        .accessibilityLabel(voice.phase == .recording ? "Stop dictation" : "Dictate")
-        .overlay(alignment: .top) {
-            if case .failed(let message) = voice.phase {
-                Text(message)
-                    .font(.caption2).foregroundStyle(.red)
-                    .padding(.horizontal, 8).padding(.vertical, 3)
-                    .background(.regularMaterial, in: .capsule)
-                    .offset(y: -26)
-                    .transition(.opacity)
+            .accessibilityLabel(voice.phase == .recording ? "Stop dictation" : "Dictate")
+            .accessibilityAction {
+                Task {
+                    await voice.toggle(client: conversation.client) { text in
+                        let existing = conversation.draft.trimmingCharacters(in: .whitespaces)
+                        conversation.draft = existing.isEmpty ? text : existing + " " + text
+                    }
+                }
+            }
+    }
+
+    /// Below this a press was a tap, not a hold. Long enough to be deliberate,
+    /// short enough that nobody notices the difference.
+    static let holdThreshold: TimeInterval = 0.35
+
+    private func haptic(_ style: UIImpactFeedbackGenerator.FeedbackStyle) {
+        UIImpactFeedbackGenerator(style: style).impactOccurred()
+    }
+
+    @ViewBuilder private var micLabel: some View {
+        Group {
+            switch voice.phase {
+            case .recording:
+                HStack(spacing: 5) {
+                    Image(systemName: "stop.fill")
+                    Text(voice.elapsed.formatted(.number.precision(.fractionLength(0))))
+                        .monospacedDigit()
+                }
+            case .transcribing, .starting:
+                ProgressView().controlSize(.small)
+            default:
+                Image(systemName: "mic")
             }
         }
+        .font(.system(size: 15, weight: .medium))
+        .foregroundStyle(voice.phase == .recording ? .white : .secondary)
+        .frame(width: 34, height: 34)
+        .background(voice.phase == .recording ? AnyShapeStyle(.red)
+                                              : AnyShapeStyle(.quaternary.opacity(0.7)),
+                    in: .circle)
+        .contentShape(.circle)
     }
     #endif
 
