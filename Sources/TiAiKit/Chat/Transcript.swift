@@ -200,7 +200,23 @@ public enum Markdown {
             else if let block = classify(line) {
                 flushProse()
                 blocks.append(block)
-            } else { prose.append(line) }
+            } else {
+                // Collapse runs of blank lines to one. Upstream models emit
+                // long flights of newlines — between tool calls, after a
+                // reasoning block, sometimes just because — and rendering them
+                // literally turns the message into a tall empty column that you
+                // scroll through and mistake for the end of the chat. The web
+                // renderer has the same habit, which is why it happens there
+                // too. Markdown itself treats any run of blank lines as a single
+                // paragraph break, so this is conformance rather than a fudge.
+                // Inside a code fence the lines still go through untouched:
+                // source code keeps its spacing.
+                let blank = line.trimmingCharacters(in: .whitespaces).isEmpty
+                if blank, prose.last.map({ $0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? true {
+                    continue
+                }
+                prose.append(line)
+            }
         }
         if inFence { flushCode(terminated: false) } else { flushProse() }
         return blocks

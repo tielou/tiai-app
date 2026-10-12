@@ -1304,3 +1304,31 @@ enum AskUserFixture {
         conversation.turns.last?.text == "the full answer, all of it"
     }
 }
+
+// A long flight of newlines in a message renders as a tall empty column, which
+// reads as the end of the chat and is the same habit the web renderer has.
+@Test func runsOfBlankLinesCollapseToOne() {
+    let source = "the answer\n\n\n\n\n\n\n\n\n\n\n\n\n\nis: train 09:42"
+    let blocks = Markdown.blocks(source)
+    #expect(blocks.count == 1, "one paragraph, not a column of air")
+    guard case .prose(let text)? = blocks.first else {
+        Issue.record("expected prose, got \(blocks)"); return
+    }
+    #expect(text == "the answer\n\nis: train 09:42")
+}
+
+@Test func leadingAndTrailingBlankLinesAreNotBlocksAtAll() {
+    #expect(Markdown.blocks("\n\n\n\njust this\n\n\n").count == 1)
+    #expect(Markdown.blocks("\n\n\n   \n\t\n").isEmpty, "a message of nothing stays invisible")
+}
+
+// Source code keeps its spacing. Collapsing there would corrupt the one place
+// blank lines carry meaning.
+@Test func blankLinesInsideACodeFenceSurvive() {
+    let source = "```swift\nlet a = 1\n\n\nlet b = 2\n```"
+    let blocks = Markdown.blocks(source)
+    guard case .code(_, let code)? = blocks.first(where: {
+        if case .code = $0 { return true }; return false
+    }) else { Issue.record("expected a code block"); return }
+    #expect(code == "let a = 1\n\n\nlet b = 2")
+}
