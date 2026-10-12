@@ -1216,3 +1216,91 @@ enum AskUserFixture {
     #expect(conversation.error == "Empty reply from server",
             "with no answer at all, the error is the only useful thing to say")
 }
+
+/// A finish frame is the app's guess about the end of a turn; the stored
+/// message's `done` flag is the server's answer. On long runs with several tool
+/// calls they disagree, and settling on the guess left the composer showing a
+/// finished prompt over half an answer — which the user then saw complete itself
+/// after leaving and re-entering the chat.
+@Test @MainActor func aFinishFrameTheServerDisagreesWithIsNotTheEnd() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"),
+                           transport: transport),
+        hub: hub)
+
+    conversation.draft = "look up three things and compare them"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    func stored(done: Bool, content: String) {
+        transport.chatDetailOverride = Data("""
+        {"id":"chat-1","title":"t","updated_at":1,"created_at":1,
+         "chat":{"models":["local-personal"],"history":{"currentId":"\(id)","messages":{
+           "\(id)":{"id":"\(id)","role":"assistant","content":"\(content)","model":"local-personal",
+                    "done":\(done),"parentId":null,"childrenIds":[]}}}}}
+        """.utf8)
+    }
+
+    stored(done: false, content: "half an answer")
+    for piece in ["half ", "an ", "answer"] {
+        hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-1", messageID: id, inner: [
+            "choices": [["index": 0, "delta": ["content": piece]]],
+        ]))
+    }
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-1", messageID: id,
+                              inner: ["choices": [["index": 0, "finish_reason": "stop"]]]))
+    try await Task.sleep(for: .milliseconds(500))
+    #expect(conversation.phase.isBusy,
+            "the server still has the message open, so a finish frame must not end the run")
+
+    // The rest of the turn arrives under the same message id.
+    stored(done: true, content: "half an answer, and the rest of it")
+    for piece in [", and the rest of it"] {
+        hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-1", messageID: id, inner: [
+            "choices": [["index": 0, "delta": ["content": piece]]],
+        ]))
+    }
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-1", messageID: id,
+                              inner: ["choices": [["index": 0, "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(8)) { conversation.phase == .ready }
+    #expect(conversation.turns.last?.text == "half an answer, and the rest of it")
+}
+
+/// When the stream dies for good, the stored message is the only copy of the
+/// tail. Adopting it is what turns the refetch from "the workaround the user
+/// discovered" into a safety net.
+@Test @MainActor func aStoredAnswerLongerThanTheStreamIsAdopted() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"),
+                           transport: transport),
+        hub: hub)
+
+    conversation.draft = "long question"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-1","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"\(id)","messages":{
+       "\(id)":{"id":"\(id)","role":"assistant","content":"the full answer, all of it",
+                "model":"local-personal","done":true,"parentId":null,"childrenIds":[]}}}}}
+    """.utf8)
+
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-1", messageID: id, inner: [
+        "choices": [["index": 0, "delta": ["content": "the full an"]]],
+    ]))
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-1", messageID: id,
+                              inner: ["choices": [["index": 0, "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(8)) { conversation.phase == .ready }
+    try await waitUntil(timeout: .seconds(4)) {
+        conversation.turns.last?.text == "the full answer, all of it"
+    }
+}

@@ -133,6 +133,12 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
     public var childrenIDs: [String]
     public var model: String?
     public var done: Bool
+    /// `done` as the server actually sent it: nil when the field was absent.
+    ///
+    /// `done` above defaults to true, which is the right rendering default and
+    /// the wrong one for asking "is this message still being written?" — an
+    /// absent field must not read as "finished".
+    public var doneFlag: Bool?
     public var error: String?
     public var timestamp: Date?
     public var sources: [JSONValue]?
@@ -239,7 +245,8 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
         parentID = try? c.decode(String.self, forKey: .parentID)
         childrenIDs = (try? c.decode([String].self, forKey: .childrenIDs)) ?? []
         model = try? c.decode(String.self, forKey: .model)
-        done = (try? c.decode(Bool.self, forKey: .done)) ?? true
+        doneFlag = try? c.decode(Bool.self, forKey: .done)
+        done = doneFlag ?? true
         // `error` is `{"content": "..."}` or a bare string depending on which
         // code path wrote it.
         error =

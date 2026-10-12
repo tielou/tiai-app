@@ -777,6 +777,23 @@ public final class ConversationModel {
                     }
                     continue
                 }
+                // The stream says it is over. Ask the server anyway.
+                //
+                // A finish frame is the app's best guess about the end of a
+                // turn; the stored message's `done` flag is the server's answer,
+                // and on long runs they disagree — the upstream finishes one
+                // segment while the run carries on under the same assistant
+                // message id. Settling on the guess left the composer showing a
+                // finished prompt over half an answer, and leaving and re-entering
+                // the chat, which refetches, showed the real one. That asymmetry
+                // is the whole bug: the truth was always in the stored message.
+                if let chat = chatID, await serverStillOpen(chatID: chat, messageID: assistantID) {
+                    grace = Task { [hub] in
+                        try? await Task.sleep(for: Self.handoffLimit)
+                        if !Task.isCancelled { hub.expire(chatID: chat) }
+                    }
+                    continue
+                }
                 outcome.sawTerminal = true
                 break
             }
@@ -800,20 +817,53 @@ public final class ConversationModel {
         // Sources are not streamed as deltas — the server attaches them when it
         // saves the message. Without this a citation only appeared after leaving
         // and re-entering the chat, which reads as the feature being broken.
-        if outcome.failure == nil, outcome.sawTerminal, finished.sources.isEmpty,
-            let chat = chatID {
+        if outcome.failure == nil, outcome.sawTerminal, let chat = chatID {
             let id = finished.id
+            let streamed = finished.text
             Task { @MainActor [weak self] in
                 guard let self,
                     let detail = try? await client.chat(id: chat),
                     let stored = detail.messages[id],
-                    !stored.citedSources.isEmpty
+                    let at = self.turns.firstIndex(where: { $0.id == id })
                 else { return }
-                guard let at = self.turns.firstIndex(where: { $0.id == id }) else { return }
-                self.turns[at].sources = stored.citedSources
+                // Sources are not streamed as deltas — the server attaches them
+                // when it saves the message. Without this a citation only
+                // appeared after leaving and re-entering the chat, which reads
+                // as the feature being broken.
+                if stored.citedSources.isEmpty == false {
+                    self.turns[at].sources = stored.citedSources
+                }
+                // And if the stored answer is longer than what arrived, the run
+                // outlived the stream. Adopt the stored text rather than leaving
+                // a truncated answer on screen; the refetch that used to be the
+                // only way to see it is now the safety net instead of the fix.
+                let storedText = stored.content.text
+                if storedText.count > streamed.count + 1 {
+                    self.turns[at].text = storedText
+                }
             }
         }
         return outcome
+    }
+
+    /// Whether the server still considers this assistant message open.
+    ///
+    /// Only an explicit `done: false` counts as still running. A message that is
+    /// not stored yet, or a chat that will not fetch, is not evidence that the
+    /// run finished — but neither is it evidence that it is going, so this says
+    /// no and lets the caller settle on what was streamed.
+    private func serverStillOpen(chatID: String, messageID: String) async -> Bool {
+        for attempt in 0..<3 {
+            guard let detail = try? await client.chat(id: chatID) else { return false }
+            guard let stored = detail.messages[messageID] else {
+                // Not written yet. Give the save a moment rather than reading
+                // absence as completion.
+                if attempt < 2 { try? await Task.sleep(for: .milliseconds(500)) }
+                continue
+            }
+            return stored.doneFlag == false
+        }
+        return false
     }
 
     /// Bytes of a file attached to a message, fetched with the app's token.
