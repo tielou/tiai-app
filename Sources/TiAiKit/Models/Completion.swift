@@ -139,6 +139,14 @@ public struct CompletionRequest: Encodable, Sendable {
     public var chatVariables: JSONValue?
     /// Terminal/session to keep using, when the chat has one.
     public var sessionID: String?
+    /// Background jobs the server should run once the answer is in.
+    ///
+    /// This is how the web UI gets a summarised chat title rather than a
+    /// truncated first line: the server does not generate titles on its own, it
+    /// generates them because the completion asked for `title_generation`. Omit
+    /// it and the chat keeps whatever placeholder title it was created with.
+    /// The value only has to be truthy; the web UI sends `{}`.
+    public var tasks: [String: JSONValue]?
 
     public init(
         model: String,
@@ -158,7 +166,8 @@ public struct CompletionRequest: Encodable, Sendable {
         filterIDs: [String]? = nil,
         variables: [String: JSONValue]? = nil,
         chatVariables: JSONValue? = nil,
-        sessionID: String? = nil
+        sessionID: String? = nil,
+        tasks: [String: JSONValue]? = nil
     ) {
         self.model = model
         self.messages = messages
@@ -178,6 +187,7 @@ public struct CompletionRequest: Encodable, Sendable {
         self.variables = variables
         self.chatVariables = chatVariables
         self.sessionID = sessionID
+        self.tasks = tasks
     }
 
     enum Keys: String, CodingKey {
@@ -194,6 +204,7 @@ public struct CompletionRequest: Encodable, Sendable {
         case variables
         case chatVariables = "chat_variables"
         case sessionID = "session_id"
+        case tasks
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -223,6 +234,7 @@ public struct CompletionRequest: Encodable, Sendable {
         if let filterIDs { try c.encode(filterIDs, forKey: .filterIDs) }
         if let variables { try c.encode(variables, forKey: .variables) }
         if let chatVariables { try c.encode(chatVariables, forKey: .chatVariables) }
+        if let tasks { try c.encode(tasks, forKey: .tasks) }
         if let sessionID { try c.encode(sessionID, forKey: .sessionID) }
     }
 }

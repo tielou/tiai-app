@@ -1419,3 +1419,39 @@ enum AskUserFixture {
     #expect(tasks[0] == (false, "book the ticket"))
     #expect(tasks[1] == (true, "pack the bag"))
 }
+
+// The server does not summarise a chat's title on its own — it does it because
+// the completion asked. Omit `tasks` and the chat keeps the truncated first line,
+// which is exactly what made app-created chats look different from browser ones.
+@Test @MainActor func newChatAsksTheServerForAGeneratedTitle() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: nil, models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport),
+        hub: ChatEventHub(server: server))
+    conversation.draft = "which train goes to Salzburg"
+    conversation.send()
+    try await transport.awaitCompletion()
+
+    let body = try #require(transport.completionBody)
+    let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    let tasks = try #require(json["tasks"] as? [String: Any], "the server needs the ask")
+    #expect(tasks["title_generation"] != nil)
+}
+
+@Test @MainActor func anExistingChatDoesNotRegenerateItsTitle() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport),
+        hub: ChatEventHub(server: server))
+    conversation.draft = "and the return?"
+    conversation.send()
+    try await transport.awaitCompletion()
+
+    let body = try #require(transport.completionBody)
+    let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    #expect(json["tasks"] == nil, "a second message must not rename the chat")
+}

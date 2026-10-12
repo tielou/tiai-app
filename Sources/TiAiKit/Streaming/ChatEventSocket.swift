@@ -59,6 +59,16 @@ public final class ChatEventSocket: @unchecked Sendable {
         /// once, against live traffic.
         public var inner: [String: JSONValue]? { data["data"]?.objectValue }
 
+        /// A title the server generated for the chat.
+        ///
+        /// Sent as `chat:title` when the completion asked for the
+        /// `title_generation` task. It is a background job, so it can land after
+        /// the answer is finished — which is why the app also re-reads the chat
+        /// rather than relying on this alone.
+        public var title: String? {
+            kind == "chat:title" ? data["data"]?.stringValue : nil
+        }
+
         /// The inner type tag: `response.output_text.delta`,
         /// `response.reasoning_text.delta`, … Absent on OpenAI chunks.
         public var innerType: String? { inner?["type"]?.stringValue }

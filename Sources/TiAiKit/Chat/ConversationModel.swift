@@ -556,6 +556,10 @@ public final class ConversationModel {
         }
         phase = .waiting
         let chat: String
+        // Whether this exchange creates the chat. Title generation is only
+        // offered by the server on a new chat, so the flag has to be taken
+        // before `ensureChat` fills `chatID` in.
+        let newChat = chatID == nil && !incognito
         do {
             chat = try await ensureChat(named: text)
         } catch {
@@ -615,7 +619,12 @@ public final class ConversationModel {
             // accepts it, not because anything here sets it.
             toolServerIDs: nil,
             chatVariables: chatVariables,
-            sessionID: hub.sessionID)
+            // Ask the server for a summarised title, the way the web UI does.
+            // Without this the chat keeps the placeholder built from the first
+            // line, which is why app-created chats read as truncated messages
+            // while browser-created ones read as titles.
+            sessionID: hub.sessionID,
+            tasks: newChat ? ["title_generation": .object([:])] : nil)
 
         // Blocks for the whole generation and yields no body; what is left for it
         // to do is fail loudly (401, 429) and to close. The task inherits this
@@ -688,6 +697,9 @@ public final class ConversationModel {
             if !outcome.parked, let index = turns.firstIndex(where: { $0.id == assistantID }) {
                 turns[index].calls = Turn.reconciling(turns[index].calls, done: true)
             }
+            // The title is a background job started when the answer landed, so it
+            // is usually a second or two behind the run that triggered it.
+            if newChat, outcome.failure == nil { await awaitGeneratedTitle(chat: chat) }
         }
         // An error that arrived alongside a real answer is noise about how the
         // answer was produced, not a reason to hide it. Only surface it when
@@ -698,6 +710,25 @@ public final class ConversationModel {
         }
         if let failure = outcome.failure { error = failure }
         phase = .ready
+    }
+
+    /// Wait for the server's generated title, up to a few seconds.
+    ///
+    /// The `chat:title` event often arrives mid-run and is picked up there, but
+    /// it is a background task and can land after the stream closed, at which
+    /// point nothing is listening any more. Re-reading the chat record is the
+    /// part that does not depend on timing.
+    private func awaitGeneratedTitle(chat: String) async {
+        let placeholder = title
+        for attempt in 0..<6 {
+            try? await Task.sleep(for: .milliseconds(700 * (attempt + 1)))
+            guard let fresh = try? await client.chat(id: chat) else { return }
+            let generated = fresh.title
+            if !generated.isEmpty, generated != placeholder {
+                title = generated
+                return
+            }
+        }
     }
 
     struct DrainOutcome {
@@ -764,6 +795,8 @@ public final class ConversationModel {
             if let delta = frame.delta { pending?.text += delta }
             if let thinking = frame.reasoningDelta { pending?.reasoning += thinking }
             if let usage = frame.usage { pending?.usage = usage }
+            // The server's own summary for the chat, when it got one mid-run.
+            if let generated = frame.title { title = generated }
             if let problem = frame.errorText {
                 // Not `failure`: an error frame is the server reporting a
                 // problem, not the run ending. Treating it as terminal stopped
