@@ -14,6 +14,11 @@ public struct ConversationView: View {
     private let session: SessionStore
     @State private var conversation: ConversationModel
     @State private var atBottom = true
+    /// How far past the end of the content the reader has dragged, as a negative
+    /// number. Zero whenever there is still content below the fold.
+    @State private var overscroll: CGFloat = 0
+    /// True while a finger is on the scroll view.
+    @State private var interacting = false
     @Environment(\.scenePhase) private var scenePhase
     /// Tools offered by the instance — MCP servers and workspace tools. Loaded
     /// lazily and the section hidden if there are none, so an instance with no
@@ -182,18 +187,42 @@ public struct ConversationView: View {
             // message that is permanent, which is how answers were ending up
             // hidden behind the composer.
             .defaultScrollAnchor(.bottom)
-            .onScrollGeometryChange(for: Bool.self) { geometry in
+            // A brand new chat holds one short message. Without this the whole
+            // thread can be dragged away from the top of the screen, which is
+            // where the void comes from before there is enough content to fill
+            // the page. Once content overflows, bouncing behaves normally.
+            .scrollBounceBehavior(.basedOnSize)
+            .onScrollGeometryChange(for: ScrollFacts.self) { geometry in
+                // Positive: room still to scroll. Negative: dragged past the end.
                 let edge = geometry.contentOffset.y + geometry.containerSize.height
-                return geometry.contentSize.height - edge < 120
-            } action: { _, value in
-                atBottom = value
+                return ScrollFacts(shortfall: geometry.contentSize.height - edge)
+            } action: { _, facts in
+                // The old test was `shortfall < 120`, which is also true when the
+                // shortfall is minus four hundred — so dragging past the end read
+                // as "at the bottom" and every streamed token kept re-scrolling
+                // into the empty space the finger had just revealed.
+                atBottom = facts.shortfall < 120
+                overscroll = min(facts.shortfall, 0)
+            }
+            // Two things this buys. Programmatic scrolls are suppressed while a
+            // finger is down, so a token arriving mid-drag no longer fights the
+            // drag. And a gesture that ends past the end of the content snaps
+            // back to it, instead of leaving the reader in a black void with no
+            // idea the last message is a flick above.
+            .onScrollPhaseChange { _, phase in
+                interacting = (phase == .interacting)
+                guard phase == .idle, overscroll < -24 else { return }
+                withAnimation(.easeOut(duration: 0.18)) {
+                    proxy.scrollTo(BottomAnchor.id, anchor: .bottom)
+                }
             }
             .onChange(of: conversation.turns.last?.text) { _, _ in
-                guard atBottom else { return }
+                guard atBottom, !interacting else { return }
                 // After layout, not during it — see defaultScrollAnchor above.
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(BottomAnchor.id, anchor: .bottom) }
             }
             .onChange(of: conversation.turns.count) { _, _ in
+                guard !interacting else { return }
                 atBottom = true
                 proxy.scrollTo(BottomAnchor.id, anchor: .bottom)
             }
@@ -1034,4 +1063,14 @@ struct RemoteImageView: View {
             #endif
         }
     }
+}
+
+/// What the scroll geometry has to say about where the reader is.
+///
+/// A struct rather than a Bool because `onScrollGeometryChange` compares the
+/// value it computed last time with the value now, and a Bool would only fire on
+/// the at-bottom edge — the amount of overscroll changes constantly and the view
+/// needs to see it change.
+private struct ScrollFacts: Equatable {
+    var shortfall: CGFloat
 }
