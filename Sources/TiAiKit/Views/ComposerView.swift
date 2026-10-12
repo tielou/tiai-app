@@ -200,16 +200,25 @@ struct ComposerView: View {
                 ?? CGImagePropertyOrientation.up.rawValue))
 
         let width = CGFloat(image.width), height = CGFloat(image.height)
-        guard max(width, height) > maxEdge else { return oriented.jpegData(compressionQuality: 0.9) }
-        let scale = maxEdge / max(width, height)
-        let size = CGSize(width: width * scale, height: height * scale)
+        let oversized = max(width, height) > maxEdge
+        // Only the oversized path used to draw, and `jpegData` on a UIImage whose
+        // orientation is a *flag* rather than rotated pixels writes the raw
+        // pixels and drops the flag. So a phone photo that happened to be small
+        // enough went out sideways while a big one came out upright — which is
+        // the "it looked right in the app but the model said it was turned 90
+        // degrees". Anything not already upright gets drawn, whatever its size.
+        guard oversized || oriented.imageOrientation != .up else {
+            return oriented.jpegData(compressionQuality: 0.9)
+        }
+        let scale = oversized ? maxEdge / max(width, height) : 1
+        let size = CGSize(width: (width * scale).rounded(), height: (height * scale).rounded())
         let format = UIGraphicsImageRendererFormat.default()
         format.scale = 1
         // Draws in the orientation, so the output is upright and flag-free.
-        let shrunk = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+        let drawn = UIGraphicsImageRenderer(size: size, format: format).image { _ in
             oriented.draw(in: CGRect(origin: .zero, size: size))
         }
-        return shrunk.jpegData(compressionQuality: 0.85)
+        return drawn.jpegData(compressionQuality: oversized ? 0.85 : 0.9)
     }
 
 #endif

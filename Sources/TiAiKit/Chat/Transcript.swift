@@ -144,6 +144,14 @@ public enum MarkdownBlock: Equatable, Sendable {
     case numbered(index: Int, text: String)
     case quote(text: String)
     case code(language: String?, code: String)
+    /// `---`, `***`, `___` alone on a line.
+    case rule
+    /// A `- [ ]` / `- [x]` row.
+    case task(done: Bool, text: String)
+    /// A pipe table, cells already split. Apple's inline parser has no tables at
+    /// all, and a table left as prose keeps its pipes and reads like a broken
+    /// sentence on every line — so the shape is kept and drawn as a grid.
+    case table(headers: [String], rows: [[String]])
 }
 
 public enum Markdown {
@@ -181,7 +189,21 @@ public enum Markdown {
             code = []
         }
 
-        for line in source.components(separatedBy: "\n") {
+        let lines = source.components(separatedBy: "\n")
+        var index = 0
+        while index < lines.count {
+            let line = lines[index]
+            // A table swallows the lines it spans, so it is recognised here
+            // rather than in `classify`, which only ever sees one line.
+            if let table = Self.table(startingAt: index, in: lines) {
+                flushProse()
+                blocks.append(table.block)
+                index = table.nextIndex
+                continue
+            }
+            // Advanced once, here, so no branch below can forget it and spin. The
+            // table branch above sets it itself, to the line past the table.
+            index += 1
             if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
                 if inFence {
                     flushCode(terminated: true)
@@ -222,6 +244,43 @@ public enum Markdown {
         return blocks
     }
 
+    /// A pipe table at `index`, and the index just past it.
+    ///
+    /// GFM needs a header row, a separator row of dashes, and body rows. The
+    /// separator is what tells a table from a line that happens to contain a
+    /// pipe, so it is required rather than assumed.
+    static func table(startingAt index: Int, in lines: [String]) -> (block: MarkdownBlock, nextIndex: Int)? {
+        let header = lines[index].trimmingCharacters(in: .whitespaces)
+        guard header.contains("|"), index + 1 < lines.count else { return nil }
+        let separator = lines[index + 1].trimmingCharacters(in: .whitespaces)
+        guard isTableSeparator(separator) else { return nil }
+
+        var next = index + 2
+        var rows: [[String]] = []
+        while next < lines.count {
+            let row = lines[next].trimmingCharacters(in: .whitespaces)
+            guard row.contains("|"), !row.isEmpty else { break }
+            rows.append(Self.cells(row))
+            next += 1
+        }
+        return (.table(headers: Self.cells(header), rows: rows), next)
+    }
+
+    /// `|---|:--:|---|`, `|--|--|`, with the colons that carry alignment.
+    static func isTableSeparator(_ line: String) -> Bool {
+        let body = line.replacingOccurrences(of: "|", with: "")
+            .replacingOccurrences(of: " ", with: "")
+        guard !body.isEmpty else { return false }
+        return body.allSatisfy { $0 == "-" || $0 == ":" } && body.contains("-")
+    }
+
+    static func cells(_ row: String) -> [String] {
+        var text = row.trimmingCharacters(in: .whitespaces)
+        if text.hasPrefix("|") { text.removeFirst() }
+        if text.hasSuffix("|") { text.removeLast() }
+        return text.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
     /// A line that starts a block of its own, or nil when it is prose.
     ///
     /// The inline-only markdown parser Apple provides cannot do headings or
@@ -239,7 +298,20 @@ public enum Markdown {
             return .heading(level: hashes, text: String(trimmed.dropFirst(hashes + 1)))
         }
         if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || trimmed.hasPrefix("+ ") {
-            return .bullet(text: String(trimmed.dropFirst(2)))
+            let body = String(trimmed.dropFirst(2))
+            // Checked before the plain bullet, which would otherwise swallow it.
+            if body.hasPrefix("[ ] ") { return .task(done: false, text: String(body.dropFirst(4))) }
+            if body.hasPrefix("[x] ") || body.hasPrefix("[X] ") {
+                return .task(done: true, text: String(body.dropFirst(4)))
+            }
+            return .bullet(text: body)
+        }
+        // `---` on its own line. Three minimum, and nothing but dashes, asterisks
+        // or underscores, so a stray `--` in a sentence stays prose.
+        if trimmed.count >= 3,
+            trimmed.allSatisfy({ $0 == "-" || $0 == "*" || $0 == "_" })
+        {
+            return .rule
         }
         if trimmed.hasPrefix("> ") { return .quote(text: String(trimmed.dropFirst(2))) }
         // `12. deal with it` — digits, a dot, a space.

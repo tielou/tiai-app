@@ -1379,3 +1379,43 @@ enum AskUserFixture {
     // live and the send waits.
     #expect(conversation.canSend)
 }
+
+@Test func pipeTablesBecomeAGrid() {
+    let source = """
+    | Train | Departs | Platform |
+    |---|:---:|---:|
+    | RJ 612 | 09:42 | 3 |
+    | RJ 814 | 10:12 | 1 |
+    """
+    let blocks = Markdown.blocks(source)
+    guard case .table(let headers, let rows)? = blocks.first else {
+        Issue.record("expected a table, got \(blocks)"); return
+    }
+    #expect(headers == ["Train", "Departs", "Platform"])
+    #expect(rows.count == 2)
+    #expect(rows[1] == ["RJ 814", "10:12", "1"])
+}
+
+// A line with a pipe in it is not a table. Without the separator requirement
+// every `a | b` in prose would be drawn as a grid.
+@Test func aLineWithAPipeIsNotATable() {
+    let blocks = Markdown.blocks("either | or\nand then some prose")
+    #expect(!blocks.contains { if case .table = $0 { return true }; return false })
+}
+
+@Test func horizontalRulesAreRules() {
+    if case .rule? = Markdown.blocks("---").first {} else {
+        Issue.record("expected a rule")
+    }
+    #expect(Markdown.blocks("wait-- hold on").first.map {
+        if case .rule = $0 { return false }; return true
+    } ?? false, "dashes inside a sentence stay prose")
+}
+
+@Test func taskListItemsCarryTheirState() {
+    let blocks = Markdown.blocks("- [ ] book the ticket\n- [x] pack the bag")
+    let tasks = blocks.compactMap { if case .task(let done, let text) = $0 { (done, text) } else { nil } }
+    #expect(tasks.count == 2)
+    #expect(tasks[0] == (false, "book the ticket"))
+    #expect(tasks[1] == (true, "pack the bag"))
+}

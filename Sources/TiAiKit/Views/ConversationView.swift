@@ -598,6 +598,42 @@ struct MarkdownBlockView: View {
             }
         case let .code(language, code):
             CodeBlockView(language: language, code: code, streaming: streaming)
+        case .rule:
+            // A rule, not a blank line: without it `---` shows as three dashes
+            // and the reader has no idea a divider was meant.
+            Divider()
+                .padding(.vertical, 4)
+        case let .task(done, text):
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: done ? "checkmark.square.fill" : "square")
+                    .font(.caption)
+                    .foregroundStyle(done ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                Text(Self.attributed(text))
+                    .strikethrough(done, color: .secondary)
+            }
+        case let .table(headers, rows):
+            ScrollView(.horizontal, showsIndicators: false) {
+                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 6) {
+                    GridRow {
+                        ForEach(Array(headers.enumerated()), id: \.offset) { _, cell in
+                            Text(Self.attributed(cell))
+                                .font(.callout.weight(.semibold))
+                        }
+                    }
+                    Divider()
+                    ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                        GridRow {
+                            // A short row must not shift the whole grid sideways,
+                            // so the header's column count wins.
+                            ForEach(0..<max(headers.count, row.count), id: \.self) { column in
+                                Text(Self.attributed(column < row.count ? row[column] : ""))
+                                    .font(.callout)
+                            }
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+            }
         }
     }
 
