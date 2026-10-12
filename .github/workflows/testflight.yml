@@ -139,27 +139,52 @@ jobs:
       # which is where build 4 died. Manual signing with the distribution
       # identity needs no development certificate at all, so the ceiling stops
       # mattering. Without DISTR_P12 the old behaviour stands.
+      # Scope manual signing by editing the generated project instead of passing
+      # CODE_SIGN_STYLE / PROVISIONING_PROFILE_SPECIFIER on the command line.
+      # Command-line settings apply to every target in the build, and the SwiftPM
+      # dependencies refuse to be provisioned at all ("Starscream does not
+      # support provisioning profiles"). The generated project has exactly two
+      # signing blocks and both belong to the app, so patching those reaches the
+      # app and nothing else. A named profile is also required: with Manual style
+      # and no specifier Xcode refuses to invent one.
+      - name: Scope manual signing to the app target
+        if: env.DISTR_P12 != '' && env.DISTR_PROFILE != ''
+        env:
+          DISTR_PROFILE_NAME: ${{ secrets.DISTR_PROFILE_NAME }}
+        run: |
+          python3 - <<'PY'
+          import os
+          path = "TiAi.xcodeproj/project.pbxproj"
+          name = os.environ["DISTR_PROFILE_NAME"]
+          text = open(path).read()
+          patched = text.replace('CODE_SIGN_IDENTITY = "iPhone Developer";',
+                                 'CODE_SIGN_IDENTITY = "iPhone Distribution";')
+          patched = patched.replace('CODE_SIGN_STYLE = Automatic;',
+                                    'CODE_SIGN_STYLE = Manual;\n\t\t\t\t'
+                                    'PROVISIONING_PROFILE_SPECIFIER = "%s";' % name)
+          if patched == text:
+              raise SystemExit("no signing settings found to patch — the project "
+                               "layout changed and this step is now doing nothing")
+          open(path, "w").write(patched)
+          print("app target now signs manually with profile:", name)
+          PY
+
+      # `xcodebuild -exportArchive` takes its distribution behaviour from this
+      # plist alone, so the manual settings have to be stated there too.
+      - name: Point the export at the distribution profile
+        if: env.DISTR_P12 != '' && env.DISTR_PROFILE != ''
+        env:
+          DISTR_PROFILE_NAME: ${{ secrets.DISTR_PROFILE_NAME }}
+        run: |
+          /usr/libexec/PlistBuddy -c "Set :signingStyle manual" export-options.plist
+          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles dict" export-options.plist
+          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:co.wobker.tiai string $DISTR_PROFILE_NAME" export-options.plist
+          plutil -p export-options.plist
+
       - name: Archive
         run: |
           set -o pipefail
           SIGN_ARGS=(DEVELOPMENT_TEAM="$APPLE_TEAM_ID")
-          if [ -n "$DISTR_P12" ] && [ -n "$DISTR_PROFILE" ]; then
-            # No PROVISIONING_PROFILE_SPECIFIER on purpose. Setting one globally
-            # leaks into SwiftPM package targets, which refuse to be provisioned
-            # at all ("Starscream does not support provisioning profiles"), and
-            # it also demands a profile that has to exist beforehand. Leaving it
-            # unset keeps the identity manual — which is the part that stops a
-            # development certificate being minted — and lets Xcode resolve the
-            # App Store profile itself.
-            # A named profile is required: with Manual style and no specifier
-            # Xcode refuses to invent one ("TiAi requires a provisioning
-            # profile"), and it will not create one either.
-            SIGN_ARGS+=(
-              CODE_SIGN_STYLE=Manual
-              CODE_SIGN_IDENTITY="iPhone Distribution"
-              PROVISIONING_PROFILE_SPECIFIER="$DISTR_PROFILE_NAME")
-            echo "Signing manually with iPhone Distribution / profile $DISTR_PROFILE_NAME"
-          fi
           xcodebuild archive \
             -project TiAi.xcodeproj \
             -scheme TiAi \

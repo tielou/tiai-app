@@ -24,17 +24,8 @@
 	<false/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
-		<!-- The server is whatever the user types in, and an OAuth hand-off may
-		leave it for a self-hosted identity provider on plain http. Blocking that
-		makes the sign-in sheet do nothing at all, with no error anywhere. -->
 		<key>NSAllowsArbitraryLoads</key>
-		<true/>
-		<!-- WKWebView ignores NSAllowsArbitraryLoads for the pages it loads;
-		web content has its own switch. Without it an http hop in an OAuth
-		detour is refused with "App Transport Security policy requires the use
-		of a secure connection" and nothing else to go on. -->
-		<key>NSAllowsArbitraryLoadsInWebContent</key>
-		<true/>
+		<false/>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
