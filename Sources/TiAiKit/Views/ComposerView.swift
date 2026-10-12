@@ -68,7 +68,7 @@ struct ComposerView: View {
                 Spacer(minLength: 4)
                 if conversation.uploading { ProgressView().controlSize(.small) }
                 #if os(iOS)
-                micButton
+                micControls
                 #endif
                 sendButton
             }
@@ -241,60 +241,90 @@ struct ComposerView: View {
     /// recording starts on touch-down: waiting to see which gesture it was would
     /// clip the first syllable, and the first syllable is usually the word that
     /// matters.
-    @ViewBuilder private var micButton: some View {
-        micLabel
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { _ in
-                        // The press is always timed, even when it will not start
-                        // a recording: a tap while already recording has to be
-                        // measured too, or the release cannot tell a tap that
-                        // means "stop" from anything else.
-                        guard pressStart == nil, !conversation.phase.isBusy else { return }
-                        pressStart = Date()
-                        startedByPress = !voice.isBusy
-                        if startedByPress {
-                            haptic(.light)
-                            Task { await voice.start() }
-                        }
-                    }
-                    .onEnded { _ in
-                        let held = pressStart.map { Date().timeIntervalSince($0) } ?? 0
-                        pressStart = nil
-                        defer { startedByPress = false }
-                        // Not `isBusy`: that is true while recording, which is
-                        // exactly the state a release has to act on. The first
-                        // version guarded on it and so every release did
-                        // nothing — the recording started on touch-down and
-                        // then ignored the finger leaving.
-                        guard voice.phase != .transcribing, voice.phase != .starting else { return }
-                        // A short tap that started the recording leaves it
-                        // running; everything else — a long hold, or any press
-                        // while already recording — ends it and transcribes.
-                        if startedByPress && held < Self.holdThreshold { return }
-                        haptic(.medium)
-                        Task {
-                            await voice.stop(client: conversation.client) { text in
-                                let existing = conversation.draft.trimmingCharacters(in: .whitespaces)
-                                conversation.draft = existing.isEmpty ? text : existing + " " + text
-                            }
-                        }
-                    }
-            )
-            .overlay(alignment: .top) {
-                if case .failed(let message) = voice.phase {
-                    Text(message)
-                        .font(.caption2).foregroundStyle(.red)
-                        .padding(.horizontal, 8).padding(.vertical, 3)
-                        .background(.regularMaterial, in: .capsule)
-                        .offset(y: -26)
-                        .transition(.opacity)
+    private var micControls: some View {
+        let recording = voice.phase == .recording
+        return HStack(spacing: 6) {
+            // Width reserved even when empty, so nothing in the row shifts when
+            // recording starts. See the note on `micCircle`.
+            micTimer.frame(width: 30, alignment: .trailing)
+            micCircle
+                .gesture(micGesture)
+        }
+        .overlay(alignment: .top) {
+            if case .failed(let message) = voice.phase {
+                Text(message)
+                    .font(.caption2).foregroundStyle(.red)
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(.regularMaterial, in: .capsule)
+                    .offset(y: -26)
+                    .transition(.opacity)
+            }
+        }
+        .animation(.snappy(duration: 0.18), value: recording)
+    }
+
+    /// The button itself, deliberately inert: same frame, same view tree, same
+    /// everything in every state, with only opacity and fill colour differing.
+    ///
+    /// This is not fastidiousness. The first version swapped a circle for a
+    /// wider capsule when recording began, and SwiftUI tore the view down mid
+    /// press and cancelled the drag with it — `onEnded` never fired, so letting
+    /// go did nothing and the only way out was a second tap. A gesture must not
+    /// be attached to a view that changes underneath it.
+    private var micCircle: some View {
+        let recording = voice.phase == .recording
+        let busy = voice.phase == .transcribing || voice.phase == .starting
+        return ZStack {
+            Image(systemName: "mic").opacity(recording || busy ? 0 : 1)
+            Image(systemName: "stop.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .opacity(recording ? 1 : 0)
+            ProgressView().controlSize(.small).opacity(busy ? 1 : 0)
+        }
+        .font(.system(size: 15, weight: .medium))
+        .foregroundStyle(recording ? Color.white : Color.secondary)
+        .frame(width: 34, height: 34)
+        .background(Circle().fill(recording ? AnyShapeStyle(.red) : AnyShapeStyle(.quaternary.opacity(0.7))))
+        .contentShape(.circle)
+        .accessibilityLabel(recording ? "Stop dictation" : "Dictate")
+    }
+
+    /// Elapsed seconds, drawn outside the button so the button never resizes.
+    private var micTimer: some View {
+        Text(voice.phase == .recording ? "\(Int(voice.elapsed))s" : " ")
+            .font(.system(size: 12, weight: .semibold).monospacedDigit())
+            .foregroundStyle(.secondary)
+    }
+
+    private var micGesture: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { _ in
+                // The press is always timed, even when it will not start a
+                // recording: a tap while already recording has to be measured
+                // too, or the release cannot tell a tap that means "stop" from
+                // anything else.
+                guard pressStart == nil, !conversation.phase.isBusy else { return }
+                pressStart = Date()
+                startedByPress = !voice.isBusy
+                if startedByPress {
+                    haptic(.light)
+                    Task { await voice.start() }
                 }
             }
-            .accessibilityLabel(voice.phase == .recording ? "Stop dictation" : "Dictate")
-            .accessibilityAction {
+            .onEnded { _ in
+                let held = pressStart.map { Date().timeIntervalSince($0) } ?? 0
+                pressStart = nil
+                defer { startedByPress = false }
+                // Not `isBusy`: that is true while recording, which is exactly
+                // the state a release has to act on.
+                guard voice.phase != .transcribing, voice.phase != .starting else { return }
+                // A short tap that started the recording leaves it running;
+                // everything else — a long hold, or any press while already
+                // recording — ends it and transcribes.
+                if startedByPress && held < Self.holdThreshold { return }
+                haptic(.medium)
                 Task {
-                    await voice.toggle(client: conversation.client) { text in
+                    await voice.stop(client: conversation.client) { text in
                         let existing = conversation.draft.trimmingCharacters(in: .whitespaces)
                         conversation.draft = existing.isEmpty ? text : existing + " " + text
                     }
@@ -302,44 +332,13 @@ struct ComposerView: View {
             }
     }
 
-    /// Below this a press was a tap, not a hold. Long enough to be deliberate,
-    /// short enough that nobody notices the difference.
+    /// Below this a press was a tap, not a hold.
     static let holdThreshold: TimeInterval = 0.35
 
     private func haptic(_ style: UIImpactFeedbackGenerator.FeedbackStyle) {
         UIImpactFeedbackGenerator(style: style).impactOccurred()
     }
 
-    @ViewBuilder private var micLabel: some View {
-        switch voice.phase {
-        case .recording:
-            // A capsule that grows to fit, not a 34-point circle with a number
-            // squeezed into it: the timer was being truncated to an ellipsis,
-            // so the one piece of live information read as a loading dot.
-            HStack(spacing: 5) {
-                Image(systemName: "stop.fill").font(.system(size: 10, weight: .semibold))
-                Text("\(Int(voice.elapsed))s")
-                    .font(.system(size: 13, weight: .semibold)).monospacedDigit()
-            }
-            .foregroundStyle(.white)
-            .padding(.horizontal, 11)
-            .frame(height: 34)
-            .background(.red, in: .capsule)
-            .fixedSize()
-        case .transcribing, .starting:
-            ProgressView()
-                .controlSize(.small)
-                .frame(width: 34, height: 34)
-                .background(.quaternary.opacity(0.7), in: .circle)
-        default:
-            Image(systemName: "mic")
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(.secondary)
-                .frame(width: 34, height: 34)
-                .background(.quaternary.opacity(0.7), in: .circle)
-                .contentShape(.circle)
-        }
-    }
     #endif
 
     private var sendButton: some View {

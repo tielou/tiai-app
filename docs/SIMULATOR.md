@@ -69,17 +69,40 @@ same simulator boxes every emoji on Wikipedia's emoji page. The runtime ships
 only `AppleColorEmoji-160px.ttc`. Copying the host's font in and rebooting does
 nothing: the runtime volume is sealed read-only APFS. Check emoji on a device.
 
-## Coordinate mapping (re-derived 2026-10-09, the old one was wrong)
+## Coordinate mapping (re-derived 2026-10-12; the 10-09 numbers were also wrong)
 
-The device screen is **not** 1:1 with the window, and the accessibility frame
-AppleScript reports for it (position 909,168 size 390x844) does not match where
-clicks actually land. Two confirmed hits give the real mapping:
+The window frame AppleScript reports is **not** the device screen. The Simulator
+draws a title bar and a device chassis inside the window, so the screen is inset
+by roughly 22pt left, 78pt top, 29pt right and 11pt bottom from the reported
+window box. Using the window origin as the screen origin puts every click ~70pt
+too high, which looks like "the clicks just do nothing".
 
-    screen_x = 910 + pt_x
-    screen_y = 178 + 0.951 * pt_y
+Derive it instead of remembering it. The mapping is affine in device points:
 
-Verify before a session by tapping the `+` button (pt 37,822 -> screen 947,960);
-the "Add to Chat" sheet opening means the mapping is right.
+    mac_x = OX + KX * dev_x        mac_y = OY + KY * dev_y
+
+and two confirmed hits pin it down. As measured on 2026-10-12 (window at
+878,84, size 441x928, iPhone 16e at 100% zoom):
+
+    mac_x = 907.2 + 0.9974 * dev_x
+    mac_y = 166.9 + 0.9941 * dev_y
+
+`dev_*` are **points** (screenshot pixels / 3), and the result is in Mac points —
+`screencapture` returns pixels at 2x, so divide by two before using a landmark
+measured from a full-screen capture.
+
+**Always confirm the mapping before driving anything**, because it changes with
+window position and zoom. Tap a chat row (a ~90pt tall target, so it forgives a
+few points of error) and check the big `Chats` title disappeared:
+
+    cliclick m:1102,352 && sleep 0.3 && cliclick c:1102,352
+    xcrun simctl io <udid> screenshot /tmp/v.png
+    # bright pixels in the title band drop to 0 once you have navigated
+
+If that click does not navigate, the mapping is wrong — re-derive it, do not
+nudge it. Auto-detecting status-bar landmarks is a trap: a bbox over the top
+strip swallows clock, wifi and battery together and yields a nonsense x scale.
+Two clicks with observable effects beat any amount of landmark algebra.
 
 **The composer sits higher than it looks.** The card's content ends at pt ~803,
 not at the bottom of the screen: text field at pt y ~763 (screen ~900), the
@@ -121,7 +144,7 @@ before tapping:
     python3 - <<'PY'   # bright text rows, with the screen y already converted
     for pt_y in range(150, 260, 4):
         hits = [x for x in range(60, 900, 4) if min(px[x, pt_y*3]) > 200]
-        if len(hits) > 3: print(pt_y, round(178 + 0.951*pt_y), len(hits))
+        if len(hits) > 3: print(pt_y, round(166.9 + 0.9941*pt_y), len(hits))
 
 ## Reading the app's own authenticated traffic
 
@@ -136,3 +159,20 @@ The container path changes when the app is reinstalled, so recompute it after
 how the notes timestamp unit and the citation shape were settled — by reading what
 the server actually sent, through the app's own session, instead of guessing or
 asking for a token.
+
+## Driving a press-and-hold
+
+`cliclick c:` is a quick tap and cannot express "held for two seconds". For a
+hold, and for anything whose behaviour depends on press duration:
+
+    cliclick dd:1206,942 && sleep 2.0 && cliclick du:1206,942
+
+Verify by pixel, not by hope: count red pixels in the control's band before and
+after the release, and treat "still red" as a failed release. This is how the
+dictation release was proven broken and then proven fixed.
+
+A gesture must not live on a view that changes while the gesture is in flight.
+Swapping a 34pt circle for a wider capsule when recording began made SwiftUI
+tear the view down mid-press and cancel the drag with it, so `onEnded` never
+fired. The control now keeps one frame and one view tree in every state and
+differs only in opacity and fill; the elapsed timer lives outside it.
