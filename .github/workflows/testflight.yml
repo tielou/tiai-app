@@ -134,11 +134,17 @@ jobs:
           set -o pipefail
           SIGN_ARGS=(DEVELOPMENT_TEAM="$APPLE_TEAM_ID")
           if [ -n "$DISTR_P12" ]; then
+            # No PROVISIONING_PROFILE_SPECIFIER on purpose. Setting one globally
+            # leaks into SwiftPM package targets, which refuse to be provisioned
+            # at all ("Starscream does not support provisioning profiles"), and
+            # it also demands a profile that has to exist beforehand. Leaving it
+            # unset keeps the identity manual — which is the part that stops a
+            # development certificate being minted — and lets Xcode resolve the
+            # App Store profile itself.
             SIGN_ARGS+=(
               CODE_SIGN_STYLE=Manual
-              CODE_SIGN_IDENTITY="iPhone Distribution"
-              PROVISIONING_PROFILE_SPECIFIER="$DISTR_PROFILE_NAME")
-            echo "Signing manually with iPhone Distribution / profile $DISTR_PROFILE_NAME"
+              CODE_SIGN_IDENTITY="iPhone Distribution")
+            echo "Signing manually with iPhone Distribution, profile resolved by Xcode"
           fi
           xcodebuild archive \
             -project TiAi.xcodeproj \
