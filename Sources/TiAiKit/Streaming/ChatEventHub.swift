@@ -27,7 +27,11 @@ public final class ChatEventHub {
     private var installed = false
 
     private struct Subscriber {
-        let chatID: String
+        /// The chat this listener wants, or nil for a listener waiting to find
+        /// out — see `framesAwaitingChatID`.
+        var chatID: String?
+        /// Called once, when a waiting listener learns the chat it belongs to.
+        var onAdopt: ((String) -> Void)?
         let continuation: AsyncStream<ChatEventSocket.Frame>.Continuation
     }
 
@@ -85,6 +89,28 @@ public final class ChatEventHub {
         return stream
     }
 
+    /// A listener for a chat that does not have an id yet.
+    ///
+    /// The server only generates a chat's title when the completion looks like a
+    /// brand new chat, and it decides that from the request: `parent_id` present
+    /// and null, and *no* `chat_id`. A client that allocates the id itself and
+    /// POSTs /chats/new first is, by that test, never new — which is why
+    /// app-created chats kept a truncated first line while browser-created ones
+    /// got a summary. So the first message goes out without an id and the app
+    /// learns the server's from the first frame that carries one.
+    public func framesAwaitingChatID(
+        _ onAdopt: @escaping (String) -> Void
+    ) -> AsyncStream<ChatEventSocket.Frame> {
+        let (stream, continuation) = AsyncStream.makeStream(of: ChatEventSocket.Frame.self)
+        let token = UUID()
+        subscribers[token] = Subscriber(
+            chatID: nil, onAdopt: onAdopt, continuation: continuation)
+        continuation.onTermination = { [weak self] _ in
+            Task { @MainActor in self?.subscribers[token] = nil }
+        }
+        return stream
+    }
+
     /// Ends every listener for a chat. Used when a run is over, and by the
     /// silence watchdog — a stream nobody finishes is a conversation stuck in
     /// "streaming" with a spinner that never stops.
@@ -95,11 +121,30 @@ public final class ChatEventHub {
         }
     }
 
+    /// Ends a listener that never learned its chat, so a failed first message
+    /// cannot leave a spinner running forever.
+    public func expireWaitingListeners() {
+        for (token, subscriber) in subscribers where subscriber.chatID == nil {
+            subscriber.continuation.finish()
+            subscribers[token] = nil
+        }
+    }
+
     /// Delivers a frame to matching listeners. Split out from the socket
     /// callback so tests can feed the hub real frames without a socket.
     func receive(_ frame: ChatEventSocket.Frame) {
-        for subscriber in subscribers.values where subscriber.chatID == frame.chatID {
+        for (token, subscriber) in subscribers {
+            if let wanted = subscriber.chatID {
+                if wanted == frame.chatID { subscriber.continuation.yield(frame) }
+                continue
+            }
+            // Awaiting listener: the first frame with a real chat id names the
+            // chat, and the listener becomes a normal one for everything after.
+            guard let actual = frame.chatID else { continue }
+            subscribers[token]?.chatID = actual
+            let adopt = subscriber.onAdopt
             subscriber.continuation.yield(frame)
+            adopt?(actual)
         }
     }
 

@@ -1455,3 +1455,41 @@ enum AskUserFixture {
     let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
     #expect(json["tasks"] == nil, "a second message must not rename the chat")
 }
+
+// A chat the server creates has no id the app can subscribe with, so the listener
+// has to adopt one from the traffic. Without this the first message of a new chat
+// would stream into nowhere.
+@Test @MainActor func aWaitingListenerAdoptsTheChatItHearsFrom() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    var adopted: String?
+    let stream = hub.framesAwaitingChatID { adopted = $0 }
+    let collector = Task { () -> [String] in
+        var kinds: [String] = []
+        for await frame in stream { kinds.append(frame.kind) }
+        return kinds
+    }
+
+    try await Task.sleep(for: .milliseconds(20))
+    for frame in Frames.run(chat: "server-made", message: "m1", answer: "hi") {
+        hub.receive(frame)
+    }
+    hub.expire(chatID: "server-made")
+    let seen = await collector.value
+
+    #expect(adopted == "server-made", "the listener learned which chat it belongs to")
+    #expect(!seen.isEmpty, "and it received the frames")
+}
+
+// Frames for an unrelated chat must not be adopted, or a background update would
+// capture the new conversation.
+@Test @MainActor func aWaitingListenerIgnoresFramesWithoutAChat() throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    var adopted: String?
+    _ = hub.framesAwaitingChatID { adopted = $0 }
+    // A frame that cannot name its chat adopts nothing.
+    let bare = Frame([
+        "data": ["type": "chat:completion", "data": ["done": false]],
+    ])
+    hub.receive(try #require(bare))
+    #expect(adopted == nil)
+}
