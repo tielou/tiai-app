@@ -246,9 +246,13 @@ struct ComposerView: View {
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { _ in
-                        guard pressStart == nil, !voice.isBusy, !conversation.phase.isBusy else { return }
+                        // The press is always timed, even when it will not start
+                        // a recording: a tap while already recording has to be
+                        // measured too, or the release cannot tell a tap that
+                        // means "stop" from anything else.
+                        guard pressStart == nil, !conversation.phase.isBusy else { return }
                         pressStart = Date()
-                        startedByPress = voice.phase != .recording
+                        startedByPress = !voice.isBusy
                         if startedByPress {
                             haptic(.light)
                             Task { await voice.start() }
@@ -258,7 +262,12 @@ struct ComposerView: View {
                         let held = pressStart.map { Date().timeIntervalSince($0) } ?? 0
                         pressStart = nil
                         defer { startedByPress = false }
-                        guard !voice.isBusy else { return }
+                        // Not `isBusy`: that is true while recording, which is
+                        // exactly the state a release has to act on. The first
+                        // version guarded on it and so every release did
+                        // nothing — the recording started on touch-down and
+                        // then ignored the finger leaving.
+                        guard voice.phase != .transcribing, voice.phase != .starting else { return }
                         // A short tap that started the recording leaves it
                         // running; everything else — a long hold, or any press
                         // while already recording — ends it and transcribes.
@@ -302,27 +311,34 @@ struct ComposerView: View {
     }
 
     @ViewBuilder private var micLabel: some View {
-        Group {
-            switch voice.phase {
-            case .recording:
-                HStack(spacing: 5) {
-                    Image(systemName: "stop.fill")
-                    Text(voice.elapsed.formatted(.number.precision(.fractionLength(0))))
-                        .monospacedDigit()
-                }
-            case .transcribing, .starting:
-                ProgressView().controlSize(.small)
-            default:
-                Image(systemName: "mic")
+        switch voice.phase {
+        case .recording:
+            // A capsule that grows to fit, not a 34-point circle with a number
+            // squeezed into it: the timer was being truncated to an ellipsis,
+            // so the one piece of live information read as a loading dot.
+            HStack(spacing: 5) {
+                Image(systemName: "stop.fill").font(.system(size: 10, weight: .semibold))
+                Text("\(Int(voice.elapsed))s")
+                    .font(.system(size: 13, weight: .semibold)).monospacedDigit()
             }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 11)
+            .frame(height: 34)
+            .background(.red, in: .capsule)
+            .fixedSize()
+        case .transcribing, .starting:
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 34, height: 34)
+                .background(.quaternary.opacity(0.7), in: .circle)
+        default:
+            Image(systemName: "mic")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 34, height: 34)
+                .background(.quaternary.opacity(0.7), in: .circle)
+                .contentShape(.circle)
         }
-        .font(.system(size: 15, weight: .medium))
-        .foregroundStyle(voice.phase == .recording ? .white : .secondary)
-        .frame(width: 34, height: 34)
-        .background(voice.phase == .recording ? AnyShapeStyle(.red)
-                                              : AnyShapeStyle(.quaternary.opacity(0.7)),
-                    in: .circle)
-        .contentShape(.circle)
     }
     #endif
 
