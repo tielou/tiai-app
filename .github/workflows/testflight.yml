@@ -49,6 +49,7 @@ jobs:
       # a secret needed by a condition has to live here to be visible.
       DISTR_P12: ${{ secrets.DISTR_P12 }}
       DISTR_P12_PASSWORD: ${{ secrets.DISTR_P12_PASSWORD }}
+      DISTR_PROFILE_NAME: tiAi CI App Store
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
       ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
@@ -119,9 +120,26 @@ jobs:
       # archive, and with no account in Xcode — there never is one on a runner —
       # it fails with "No Accounts", which reads like a signing-identity problem
       # and is really a missing-authentication one.
+      # With a distribution certificate in the keychain, sign manually with it.
+      #
+      # Automatic signing is not salvageable here: it resolves an *iOS App
+      # Development* profile for the archive, so it mints an Apple Development
+      # certificate on every run whatever else is present — and on a throwaway
+      # runner those accumulate until the account hits its certificate ceiling,
+      # which is where build 4 died. Manual signing with the distribution
+      # identity needs no development certificate at all, so the ceiling stops
+      # mattering. Without DISTR_P12 the old behaviour stands.
       - name: Archive
         run: |
           set -o pipefail
+          SIGN_ARGS=(DEVELOPMENT_TEAM="$APPLE_TEAM_ID")
+          if [ -n "$DISTR_P12" ]; then
+            SIGN_ARGS+=(
+              CODE_SIGN_STYLE=Manual
+              CODE_SIGN_IDENTITY="iPhone Distribution"
+              PROVISIONING_PROFILE_SPECIFIER="$DISTR_PROFILE_NAME")
+            echo "Signing manually with iPhone Distribution / profile $DISTR_PROFILE_NAME"
+          fi
           xcodebuild archive \
             -project TiAi.xcodeproj \
             -scheme TiAi \
@@ -132,7 +150,7 @@ jobs:
             -authenticationKeyPath "$ASC_KEY_PATH" \
             -authenticationKeyID "$ASC_KEY_ID" \
             -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
-            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            "${SIGN_ARGS[@]}" \
             CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
             | tee "$RUNNER_TEMP/archive.log"
 
