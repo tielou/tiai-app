@@ -460,6 +460,18 @@ public struct OWUIClient: Sendable {
     }
 
 
+    /// Edits one memory in place.
+    ///
+    /// Only `content` is sent. The endpoint also accepts `type` and `path`, and
+    /// treats a present key as an instruction to write it — so sending them
+    /// null would not leave them alone, it would change them.
+    public func updateMemory(id: String, content: String) async throws -> Memory {
+        struct Form: Encodable { let content: String }
+        return try await request(
+            "POST", "/memories/\(id)/update",
+            bodyData: try? JSONEncoder().encode(Form(content: content)))
+    }
+
     public func deleteMemory(id: String) async throws {
         try await expectStatus("DELETE", "/memories/\(id)")
     }

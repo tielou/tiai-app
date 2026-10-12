@@ -608,3 +608,19 @@ private func voiceClient(_ transport: RecordingTransport) -> OWUIClient {
         data: Data("x".utf8), filename: "a.m4a", mimeType: "audio/m4a")
     #expect(text == nil, "a few seconds of silence is an outcome, not an error")
 }
+
+@Test func memoryUpdateSendsOnlyContent() async throws {
+    let transport = RecordingTransport()
+    transport.body = Data(#"{"id":"m1","content":"prefers trains","type":"user","updated_at":1}"#.utf8)
+    _ = try await voiceClient(transport).updateMemory(id: "m1", content: "prefers trains")
+
+    let request = try #require(transport.lastRequest)
+    #expect(request.url?.path == "/api/v1/memories/m1/update")
+    let sent = try JSONDecoder().decode([String: JSONValue].self,
+                                        from: try #require(request.httpBody))
+    #expect(sent["content"]?.stringValue == "prefers trains")
+    // The endpoint writes any key it receives, so absent is the only "leave
+    // alone". Sending them null would change them, not preserve them.
+    #expect(sent["type"] == nil)
+    #expect(sent["path"] == nil)
+}
