@@ -489,6 +489,45 @@ public struct OWUIClient: Sendable {
         return try Self.validate(payload, http, as: FileRecord.self)
     }
 
+    // MARK: - audio
+
+    /// Speech to text, using whatever STT the instance has configured.
+    ///
+    /// The endpoint is Open WebUI's own `/audio/transcriptions`, so the app
+    /// never talks to Whisper directly and never needs to know that it exists:
+    /// the instance decides the model, the language detection, the chunking of
+    /// long audio, and whether it is Whisper at all. Adding or swapping the
+    /// backend stays a server-side change rather than an app release.
+    ///
+    /// Returns nil when the audio came back empty, which is a real outcome —
+    /// a few seconds of silence transcribes to nothing — and is different from
+    /// a failure, which throws.
+    public func transcribe(data: Data, filename: String, mimeType: String,
+                           language: String? = nil) async throws -> String? {
+        var body = Data()
+        let boundary = "----tiai-\(UUID().uuidString)"
+        body.append(Data("--\(boundary)\r\n".utf8))
+        body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\r\n".utf8))
+        body.append(Data("Content-Type: \(mimeType)\r\n\r\n".utf8))
+        body.append(data)
+        if let language {
+            body.append(Data("\r\n--\(boundary)\r\n".utf8))
+            body.append(Data("Content-Disposition: form-data; name=\"language\"\r\n\r\n".utf8))
+            body.append(Data(language.utf8))
+        }
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+
+        let (payload, http) = try await perform(
+            "POST", server.api("/audio/transcriptions"),
+            bodyData: body, contentType: "multipart/form-data; boundary=\(boundary)", timeout: 120)
+        // `text` is optional on purpose: a response that decodes but carries no
+        // text is a successful call over silent audio, not a failure.
+        struct Transcript: Decodable { let text: String? }
+        let transcript = try Self.validate(payload, http, as: Transcript.self)
+        let trimmed = (transcript.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     // MARK: - notes
 
     /// Notes are a separate object from chats, with their own list and sharing.

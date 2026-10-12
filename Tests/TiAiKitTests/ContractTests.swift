@@ -574,3 +574,37 @@ private final class NotesTransport: APITransport, @unchecked Sendable {
         fatalError("notes do not stream")
     }
 }
+
+private func voiceClient(_ transport: RecordingTransport) -> OWUIClient {
+    OWUIClient(
+        server: Server(baseURL: URL(string: "https://chat.example.co")!, token: "tok"),
+        transport: transport)
+}
+
+// Dictation posts to Open WebUI's own transcription endpoint rather than to a
+// speech model directly, so swapping Whisper for something else stays a server
+// setting and never an app release.
+@Test func transcribePostsMultipartAndReadsTheText() async throws {
+    let transport = RecordingTransport()
+    transport.body = Data(#"{"text":"  order the router firmware  ","filename":"a.m4a"}"#.utf8)
+    let text = try await voiceClient(transport).transcribe(
+        data: Data("fake-audio".utf8), filename: "a.m4a", mimeType: "audio/m4a")
+
+    #expect(text == "order the router firmware", "whitespace is not content")
+    let request = try #require(transport.lastRequest)
+    #expect(request.url?.path == "/api/v1/audio/transcriptions")
+    #expect(request.httpMethod == "POST")
+    #expect(request.value(forHTTPHeaderField: "Content-Type")?.contains("multipart/form-data") == true)
+    let body = String(data: try #require(request.httpBody), encoding: .utf8) ?? ""
+    #expect(body.contains("name=\"file\"; filename=\"a.m4a\""))
+    #expect(body.contains("Content-Type: audio/m4a"))
+    #expect(body.contains("fake-audio"))
+}
+
+@Test func silentAudioIsNotAFailure() async throws {
+    let transport = RecordingTransport()
+    transport.body = Data(#"{"text":"   "}"#.utf8)
+    let text = try await voiceClient(transport).transcribe(
+        data: Data("x".utf8), filename: "a.m4a", mimeType: "audio/m4a")
+    #expect(text == nil, "a few seconds of silence is an outcome, not an error")
+}

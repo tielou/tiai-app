@@ -32,6 +32,9 @@ struct ComposerView: View {
     @State private var photoItems: [PhotosPickerItem] = []
     @State private var showingFiles = false
     @State private var cameraRequest = false
+    #if os(iOS)
+    @State private var voice = VoiceRecorder()
+    #endif
 
     private enum Sheet: Identifiable {
         case add, models
@@ -62,6 +65,9 @@ struct ComposerView: View {
                 modelChip
                 Spacer(minLength: 4)
                 if conversation.uploading { ProgressView().controlSize(.small) }
+                #if os(iOS)
+                micButton
+                #endif
                 sendButton
             }
         }
@@ -219,6 +225,57 @@ struct ComposerView: View {
             }
         }
     }
+
+    #if os(iOS)
+    /// Dictation. Recording replaces the send button's neighbour rather than
+    /// opening anything, so the gesture is one tap to start and the same tap to
+    /// stop, and the words land in the field where you can still edit them
+    /// before sending.
+    @ViewBuilder private var micButton: some View {
+        Button {
+            Task {
+                await voice.toggle(client: conversation.client) { text in
+                    let existing = conversation.draft.trimmingCharacters(in: .whitespaces)
+                    conversation.draft = existing.isEmpty ? text : existing + " " + text
+                }
+            }
+        } label: {
+            Group {
+                switch voice.phase {
+                case .recording:
+                    HStack(spacing: 5) {
+                        Image(systemName: "stop.fill")
+                        Text(voice.elapsed.formatted(.number.precision(.fractionLength(0))))
+                            .monospacedDigit()
+                    }
+                case .transcribing, .starting:
+                    ProgressView().controlSize(.small)
+                default:
+                    Image(systemName: "mic")
+                }
+            }
+            .font(.system(size: 15, weight: .medium))
+            .foregroundStyle(voice.phase == .recording ? .white : .secondary)
+            .frame(width: 34, height: 34)
+            .background(voice.phase == .recording ? AnyShapeStyle(.red)
+                                                  : AnyShapeStyle(.quaternary.opacity(0.7)),
+                        in: .circle)
+        }
+        .buttonStyle(.plain)
+        .disabled(conversation.phase.isBusy)
+        .accessibilityLabel(voice.phase == .recording ? "Stop dictation" : "Dictate")
+        .overlay(alignment: .top) {
+            if case .failed(let message) = voice.phase {
+                Text(message)
+                    .font(.caption2).foregroundStyle(.red)
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(.regularMaterial, in: .capsule)
+                    .offset(y: -26)
+                    .transition(.opacity)
+            }
+        }
+    }
+    #endif
 
     private var sendButton: some View {
         Button {
