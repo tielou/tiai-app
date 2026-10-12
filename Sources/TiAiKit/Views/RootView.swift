@@ -237,6 +237,18 @@ public struct ChatListView: View {
                     models = fresh
                     DiskCache.save(fresh, key: DiskCache.key("models", host: host))
                 }
+                #if DEBUG
+                // Diagnostics only, and only with the dump directory set. Fetching
+                // the newest chat means its stored payload lands on disk without
+                // anyone having to tap anything — which matters when the thing
+                // under investigation is a message the app rendered wrongly and
+                // the only copy is on the server.
+                if ProcessInfo.processInfo.environment["TIAI_DEBUG_DUMP"] != nil {
+                    for chat in chats.data?.prefix(5) ?? [] {
+                        _ = try? await session.client.chat(id: chat.id)
+                    }
+                }
+                #endif
             }
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
