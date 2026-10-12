@@ -468,6 +468,8 @@ public final class ConversationModel {
         post?.cancel()
         post = nil
         hub.expire(chatID: chatID)
+        // A brand new chat may still be waiting for its id when stop is pressed.
+        hub.expireWaitingListeners()
         if let index = turns.lastIndex(where: \.isAssistant) {
             turns[index].streaming = false
         }
@@ -556,10 +558,6 @@ public final class ConversationModel {
         }
         phase = .waiting
         let chat: String
-        // Whether this exchange creates the chat. Title generation is only
-        // offered by the server on a new chat, so the flag has to be taken
-        // before `ensureChat` fills `chatID` in.
-        let newChat = chatID == nil && !incognito
         do {
             chat = try await ensureChat(named: text)
         } catch {
@@ -595,11 +593,20 @@ public final class ConversationModel {
 
         // Subscribing before the POST matters: frames can arrive while the
         // request is still in flight, and the socket has no replay.
-        let frames = hub.frames(for: chat)
+        let newChat = chat == Self.awaitingChatID
+        // A brand new chat has no id to filter on, so the listener adopts the
+        // first one it hears a frame for.
+        let frames = newChat
+            ? hub.framesAwaitingChatID { [weak self] id in
+                Task { @MainActor in self?.adopt(chatID: id) }
+            }
+            : hub.frames(for: chat)
         let request = CompletionRequest(
             model: model,
             messages: history,
-            chatID: chat,
+            // Absent, not null: the server reads a missing `chat_id` as "this is
+            // a new chat" and only then offers to name it.
+            chatID: newChat ? nil : chat,
             parentID: parentID.map(CompletionRequest.ParentID.message) ?? .root,
             userMessage: CompletionRequest.WireMessage(
                 id: userMessageID, role: "user", content: content,
@@ -699,7 +706,9 @@ public final class ConversationModel {
             }
             // The title is a background job started when the answer landed, so it
             // is usually a second or two behind the run that triggered it.
-            if newChat, outcome.failure == nil { await awaitGeneratedTitle(chat: chat) }
+            if newChat, outcome.failure == nil, let adopted = chatID {
+                await awaitGeneratedTitle(chat: adopted)
+            }
         }
         // An error that arrived alongside a real answer is noise about how the
         // answer was produced, not a reason to hide it. Only surface it when
@@ -1156,10 +1165,23 @@ public final class ConversationModel {
             chatID = temporary
             return temporary
         }
-        let created = try await client.createChat(title: Self.title(from: text))
-        chatID = created.id
-        title = created.title
-        return created.id
+        // The server only names a chat it created itself. Allocating the id here
+        // and POSTing /chats/new first made every app chat look like an existing
+        // one, and that is the exact test the server uses to decide whether to
+        // generate a title — so app chats kept a truncated first line while
+        // browser chats got a summary. The first message now goes out with no id
+        // and the real one is adopted from the stream.
+        title = Self.title(from: text)
+        return Self.awaitingChatID
+    }
+
+    /// Stand-in for "the server has not told us the id yet".
+    static let awaitingChatID = "__awaiting__"
+
+    /// Takes the id the server chose, once.
+    private func adopt(chatID: String) {
+        guard self.chatID == nil else { return }
+        self.chatID = chatID
     }
 
     static func title(from text: String) -> String {

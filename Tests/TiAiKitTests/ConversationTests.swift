@@ -8,10 +8,10 @@ private typealias Frame = ChatEventSocket.Frame
 /// The conversation state machine, driven by a scripted transport and frames fed
 /// into the hub by hand — no network, and no waiting on a model.
 ///
-/// What these lock down is the sequence the probe proved the server requires:
-/// create the chat first, send the assistant message id, read the socket while
-/// the POST is still open, and treat `finish_reason` as the end.
-@Test @MainActor func sendingCreatesTheChatFirstAndCarriesTheAssistantID() async throws {
+/// The sequence the server requires: no chat id on a first message (that is how
+/// it knows to name the chat), the assistant message id, reading the socket while
+/// the POST is still open, and treating `finish_reason` as the end.
+@Test @MainActor func aFirstMessageLetsTheServerCreateAndNameTheChat() async throws {
     let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
     let transport = ScriptedTransport()
     let conversation = ConversationModel(
@@ -25,7 +25,9 @@ private typealias Frame = ChatEventSocket.Frame
     conversation.send()
 
     try await transport.awaitCompletion()
-    #expect(transport.paths.first == "/api/v1/chats/new")
+    // No /chats/new. Pre-creating the chat made the server treat it as an
+    // existing one, which is the gate that switches title generation off.
+    #expect(!transport.paths.contains("/api/v1/chats/new"), "the server creates the chat")
 
     let completion = try #require(transport.completionBody)
     let json = try #require(JSONSerialization.jsonObject(with: completion) as? [String: Any])
@@ -33,7 +35,7 @@ private typealias Frame = ChatEventSocket.Frame
     // answer arrives and then never happened.
     let assistantID = try #require(json["id"] as? String)
     #expect(!assistantID.isEmpty)
-    #expect(json["chat_id"] as? String == "chat-1")
+    #expect(json["chat_id"] == nil, "absent, not null — that is what says 'new chat'")
     #expect(json.hasNullParent)  // a first message has no parent, and null is not the same as absent
     #expect((json["features"] as? [String: Bool])?["web_search"] == true)
 
