@@ -19,6 +19,9 @@ public struct ConversationView: View {
     @State private var overscroll: CGFloat = 0
     /// True while a finger is on the scroll view.
     @State private var interacting = false
+    /// Height of the transcript's container, watched so a keyboard coming or
+    /// going can be reacted to.
+    @State private var containerHeight: CGFloat = 0
     @Environment(\.scenePhase) private var scenePhase
     /// Tools offered by the instance — MCP servers and workspace tools. Loaded
     /// lazily and the section hidden if there are none, so an instance with no
@@ -209,6 +212,19 @@ public struct ConversationView: View {
             // drag. And a gesture that ends past the end of the content snaps
             // back to it, instead of leaving the reader in a black void with no
             // idea the last message is a flick above.
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { _, new in
+                containerHeight = new
+            }
+            // The keyboard leaving is a container that just grew by ~300 points.
+            // Nothing re-anchors the transcript when that happens, so the bottom
+            // of the conversation ends up sitting a keyboard-height above where
+            // it can reach — which is the void, and why one scroll up made it go
+            // away: the scroll forced the layout pass that should have happened
+            // on its own.
+            .onChange(of: containerHeight) { _, _ in
+                guard atBottom, !interacting else { return }
+                proxy.scrollTo(BottomAnchor.id, anchor: .bottom)
+            }
             .onScrollPhaseChange { _, phase in
                 interacting = (phase == .interacting)
                 guard phase == .idle, overscroll < -24 else { return }

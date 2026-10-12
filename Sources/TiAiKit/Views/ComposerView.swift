@@ -27,6 +27,11 @@ struct ComposerView: View {
     /// the tool list and so is the place that can refresh it afterwards.
     var onAuthorize: (URL) -> Void = { _ in }
 
+    /// So sending can put the keyboard away. Left alone it stays up after the
+    /// message goes out, and the transcript underneath is left with a gap the
+    /// size of the keyboard that only a scroll-up makes the app notice.
+    @FocusState private var inputFocused: Bool
+
     @State private var sheet: Sheet?
     @State private var pending: Pending?
     @State private var photoItems: [PhotosPickerItem] = []
@@ -46,13 +51,21 @@ struct ComposerView: View {
     /// Something the `+` sheet asked for, held until this sheet is gone.
     private enum Pending: Equatable { case camera, photos, files, authorize(URL) }
 
+    /// Sending is a deliberate end of typing: the keyboard should go with it, so
+    /// the answer is not being read through a 300-point window.
+    private func send() {
+        inputFocused = false
+        conversation.send()
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if !conversation.attachments.isEmpty { attachmentStrip }
 
             TextField("Message", text: $conversation.draft, axis: .vertical)
                 .lineLimit(1...8)
-                .onSubmit { conversation.send() }
+                .focused($inputFocused)
+                .onSubmit { send() }
 
             #if os(iOS)
             voiceNote
@@ -354,7 +367,7 @@ struct ComposerView: View {
 
     private var sendButton: some View {
         Button {
-            if conversation.phase.isBusy { conversation.stop() } else { conversation.send() }
+            if conversation.phase.isBusy { conversation.stop() } else { send() }
         } label: {
             Image(systemName: conversation.phase.isBusy ? "stop.fill" : "arrow.up")
                 .font(.system(size: 16, weight: .semibold))
