@@ -120,6 +120,10 @@ public struct ChatListView: View {
     @State private var query = ""
     @State private var searchResults: [ChatSummary] = []
     @State private var showingMemory = false
+    /// A chat the user has swiped to delete and is being asked to confirm.
+    @State private var pendingDelete: ChatSummary?
+    @State private var deleting: String?
+    @State private var deleteFailed: String?
 
     public init(session: SessionStore) {
         self.session = session
@@ -157,9 +161,60 @@ public struct ChatListView: View {
                                         .foregroundStyle(.secondary)
                                 }
                             }
+                            .swipeActions(edge: .trailing) {
+                                Button(role: .destructive) {
+                                    pendingDelete = chat
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                            }
                         }
                     }
                     .chatListStyle()
+                    .confirmationDialog(
+                        "Delete this chat?",
+                        isPresented: Binding(
+                            get: { pendingDelete != nil },
+                            set: { if !$0 { pendingDelete = nil } }),
+                        titleVisibility: .visible
+                    ) {
+                        Button("Delete", role: .destructive) {
+                            if let chat = pendingDelete {
+                                pendingDelete = nil
+                                deleting = chat.id
+                                Task {
+                                    do {
+                                        try await session.client.deleteChat(id: chat.id)
+                                        // Refetch rather than splice: the list is
+                                        // the server's, and a locally removed row
+                                        // that the server still has reappears on
+                                        // the next refresh looking like a bug.
+                                        await chats.refresh()
+                                    } catch {
+                                        deleteFailed = error.localizedDescription
+                                    }
+                                    deleting = nil
+                                }
+                            }
+                        }
+                        Button("Keep", role: .cancel) { pendingDelete = nil }
+                    } message: {
+                        Text(pendingDelete.map { "\"\($0.title)\" goes with it." } ?? "")
+                    }
+                    .overlay {
+                        if deleting != nil {
+                            ProgressView().controlSize(.large)
+                                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                        }
+                    }
+                    .alert("Could not delete the chat", isPresented: Binding(
+                        get: { deleteFailed != nil },
+                        set: { if !$0 { deleteFailed = nil } })
+                    ) {
+                        Button("OK", role: .cancel) { deleteFailed = nil }
+                    } message: {
+                        Text(deleteFailed ?? "")
+                    }
                 }
             }
             .navigationTitle("Chats")

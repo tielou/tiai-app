@@ -624,3 +624,14 @@ private func voiceClient(_ transport: RecordingTransport) -> OWUIClient {
     #expect(sent["type"] == nil)
     #expect(sent["path"] == nil)
 }
+
+@Test func deleteChatUsesTheBareResourceRoute() async throws {
+    let transport = RecordingTransport()
+    transport.status = 200
+    transport.body = Data("true".utf8)
+    try await voiceClient(transport).deleteChat(id: "c1")
+
+    let request = try #require(transport.lastRequest)
+    #expect(request.httpMethod == "DELETE")
+    #expect(request.url?.path == "/api/v1/chats/c1")
+}
