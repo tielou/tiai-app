@@ -54,6 +54,10 @@ struct ComposerView: View {
                 .lineLimit(1...8)
                 .onSubmit { conversation.send() }
 
+            #if os(iOS)
+            voiceNote
+            #endif
+
             HStack(spacing: 8) {
                 Button { sheet = .add } label: {
                     Image(systemName: "plus")
@@ -250,16 +254,6 @@ struct ComposerView: View {
             micCircle
                 .gesture(micGesture)
         }
-        .overlay(alignment: .top) {
-            if case .failed(let message) = voice.phase {
-                Text(message)
-                    .font(.caption2).foregroundStyle(.red)
-                    .padding(.horizontal, 8).padding(.vertical, 3)
-                    .background(.regularMaterial, in: .capsule)
-                    .offset(y: -26)
-                    .transition(.opacity)
-            }
-        }
         .animation(.snappy(duration: 0.18), value: recording)
     }
 
@@ -287,6 +281,23 @@ struct ComposerView: View {
         .background(Circle().fill(recording ? AnyShapeStyle(.red) : AnyShapeStyle(.quaternary.opacity(0.7))))
         .contentShape(.circle)
         .accessibilityLabel(recording ? "Stop dictation" : "Dictate")
+    }
+
+    /// What happened to the last recording, on its own line where the sentence
+    /// fits. It used to be a red capsule floating over the text field, which
+    /// truncated "No speech recognised" to "No speech…" and made an ordinary
+    /// empty result look like a crash.
+    @ViewBuilder private var voiceNote: some View {
+        switch voice.phase {
+        case .empty:
+            Label("No speech heard", systemImage: "waveform.slash")
+                .modifier(VoiceNoteStyle(tint: .secondary))
+        case .failed(let message):
+            Label(message, systemImage: "exclamationmark.triangle.fill")
+                .modifier(VoiceNoteStyle(tint: .red))
+        default:
+            EmptyView()
+        }
     }
 
     /// Elapsed seconds, drawn outside the button so the button never resizes.
@@ -751,6 +762,22 @@ private struct ImageBytes: Transferable {
 
     static var transferRepresentation: some TransferRepresentation {
         DataRepresentation(importedContentType: .image) { ImageBytes(data: $0) }
+    }
+}
+#endif
+
+#if os(iOS)
+/// One line of feedback about the last recording: small, left aligned, allowed
+/// to wrap, and never a floating badge over something else.
+private struct VoiceNoteStyle: ViewModifier {
+    var tint: Color
+
+    func body(content: Content) -> some View {
+        content
+            .font(.caption2)
+            .foregroundStyle(tint)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .transition(.opacity)
     }
 }
 #endif

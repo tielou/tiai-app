@@ -21,8 +21,17 @@ public final class VoiceRecorder {
         case starting
         case recording
         case transcribing
+        /// Nothing came back. Not a failure: a few seconds of silence really
+        /// does transcribe to nothing, and telling the user that in an error
+        /// style makes a working feature look broken.
+        case empty
         case failed(String)
     }
+
+    /// Notes about the last attempt fade out on their own. A mic result that
+    /// sits there permanently is worse than one that is missed.
+    static let noteLifetime: Duration = .seconds(2.5)
+    static let errorLifetime: Duration = .seconds(6)
 
     public private(set) var phase: Phase = .idle
     public private(set) var elapsed: TimeInterval = 0
@@ -35,6 +44,7 @@ public final class VoiceRecorder {
     private var recorder: AVAudioRecorder?
     private var url: URL?
     private var ticker: Timer?
+    private var noteTask: Task<Void, Never>?
 
     public var isRecording: Bool { phase == .recording }
     public var isBusy: Bool { phase == .recording || phase == .transcribing || phase == .starting }
@@ -65,7 +75,7 @@ public final class VoiceRecorder {
         guard AVAudioApplication.shared.recordPermission == .granted else {
             let granted = await AVAudioApplication.requestRecordPermission()
             guard granted else {
-                phase = .failed("Microphone access is off. Enable it in Settings.")
+                note(.failed("Microphone access is off — enable it in Settings."))
                 return
             }
             return  // The prompt just appeared; a second tap starts the recording.
@@ -95,7 +105,7 @@ public final class VoiceRecorder {
             let recorder = try AVAudioRecorder(url: file, settings: settings)
             recorder.delegate = nil
             guard recorder.prepareToRecord(), recorder.record() else {
-                phase = .failed("The microphone is in use by another app.")
+                note(.failed("The microphone is in use by another app."))
                 try? session.setActive(false, options: .notifyOthersOnDeactivation)
                 return
             }
@@ -113,7 +123,7 @@ public final class VoiceRecorder {
                 }
             }
         } catch {
-            phase = .failed("Could not start recording: \(error.localizedDescription)")
+            note(.failed("Could not start recording: \(error.localizedDescription)"))
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
         }
     }
@@ -133,10 +143,11 @@ public final class VoiceRecorder {
         defer { try? FileManager.default.removeItem(at: file) }
 
         // Under about a second there is nothing worth a round trip, and Whisper
-        // reliably returns empty or nonsense for it — which reads as a broken
-        // button rather than as "you did not say anything".
+        // reliably returns empty or nonsense for it. It still has to say so: a
+        // button that swallows a short recording without a word back is
+        // indistinguishable from a button that is broken.
         guard seconds >= 1.0, let data = try? Data(contentsOf: file), !data.isEmpty else {
-            phase = .idle
+            note(.empty)
             return
         }
 
@@ -145,16 +156,35 @@ public final class VoiceRecorder {
             let text = try await client.transcribe(
                 data: data, filename: file.lastPathComponent, mimeType: "audio/m4a")
             phase = .idle
-            if let text { onText(text) }
-            else { phase = .failed("No speech recognised.") }
+            if let text { onText(text) } else { note(.empty) }
         } catch {
-            phase = .failed(error.localizedDescription)
+            note(.failed(error.localizedDescription))
+        }
+    }
+
+    /// Show a note that clears itself, so the composer does not accumulate a
+    /// permanent complaint about a two-second recording.
+    private func note(_ next: Phase) {
+        noteTask?.cancel()
+        phase = next
+        let life = switch next {
+        case .failed: Self.errorLifetime
+        default: Self.noteLifetime
+        }
+        noteTask = Task { [weak self] in
+            try? await Task.sleep(for: life)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self, self.phase == next else { return }
+                self.phase = .idle
+            }
         }
     }
 
     /// Called by the view when it goes away mid-recording, so a discarded sheet
     /// does not leave the microphone lit.
     public func cancel() {
+        noteTask?.cancel()
         if let file = url { try? FileManager.default.removeItem(at: file) }
         url = nil
         Task { await stopOnly() }
