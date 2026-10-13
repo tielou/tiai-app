@@ -145,7 +145,11 @@ public struct CompletionRequest: Encodable, Sendable {
     /// truncated first line: the server does not generate titles on its own, it
     /// generates them because the completion asked for `title_generation`. Omit
     /// it and the chat keeps whatever placeholder title it was created with.
-    /// The value only has to be truthy; the web UI sends `{}`.
+    /// The value must be truthy server-side, which is a sharper requirement than it
+    /// sounds: the server tests `if tasks[TASKS.TITLE_GENERATION]:`, so `{}` — a
+    /// natural thing for a client to send — is falsy in Python and generates
+    /// nothing while looking perfectly correct on the wire. The web UI sends
+    /// `true`; so does this.
     public var tasks: [String: JSONValue]?
 
     public init(

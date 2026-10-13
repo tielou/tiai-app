@@ -650,7 +650,7 @@ public final class ConversationModel {
             // line, which is why app-created chats read as truncated messages
             // while browser-created ones read as titles.
             sessionID: hub.sessionID,
-            tasks: newChat ? ["title_generation": .object([:])] : nil)
+            tasks: newChat ? ["title_generation": .bool(true)] : nil)
 
         // Blocks for the whole generation and yields no body; what is left for it
         // to do is fail loudly (401, 429) and to close. The task inherits this

@@ -1446,7 +1446,19 @@ enum AskUserFixture {
     let body = try #require(transport.completionBody)
     let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
     let tasks = try #require(json["tasks"] as? [String: Any], "the server needs the ask")
-    #expect(tasks["title_generation"] != nil)
+    // Truthy, not merely present. The server does `if tasks[TASKS.TITLE_GENERATION]:`,
+    // and an empty object — which is what this used to send — is falsy in Python, so
+    // the request looked correct on the wire and silently generated nothing. Only a
+    // test that reads the value, rather than its existence, catches that.
+    #expect(tasks["title_generation"] as? Bool == true,
+            "must be true, not just present: {} is falsy server-side")
+    // The other half of the contract: the server only honours the ask when it
+    // reads the exchange as a new chat, which it decides from `parent_id` being
+    // present and null with no `chat_id` at all. A pre-created chat, or a missing
+    // `parent_id` key, and the title silently stays the placeholder.
+    #expect(json["chat_id"] == nil, "a chat_id makes the server treat this as an existing chat")
+    #expect(json.keys.contains("parent_id"), "parent_id must be present...")
+    #expect(json["parent_id"] is NSNull, "...and null")
 }
 
 @Test @MainActor func anExistingChatDoesNotRegenerateItsTitle() async throws {
