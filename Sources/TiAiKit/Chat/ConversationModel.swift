@@ -216,7 +216,26 @@ public final class ConversationModel {
             leafID = turns.last?.id
             chatVariables = detail.variables
             if let used = detail.models.first, !used.isEmpty { model = used }
-            phase = .ready
+            // Heal a run the app gave up on. If the newest message is an answer
+            // the server still has open, the run is either still writing or parked
+            // on a question — either way the transcript on screen is incomplete,
+            // and opening the chat is exactly the moment to find that out.
+            //
+            // This is the part that makes the fix durable: however a run got
+            // mis-ended — dead socket, misread frame, app killed mid-answer —
+            // re-entering the chat now converges on what the server has.
+            if let last = turns.last, !last.isUser,
+               let stored = detail.messages[last.id], stored.done != true {
+                phase = .streaming
+                Task {
+                    await self.reconcileUntilClosed(messageID: last.id)
+                    // Only hand the composer back if nothing else took it while
+                    // we were watching — a send started mid-heal owns the phase.
+                    if case .streaming = phase, post == nil { phase = .ready }
+                }
+            } else {
+                phase = .ready
+            }
         } catch {
             self.error = error.localizedDescription
             phase = .ready
@@ -694,7 +713,7 @@ public final class ConversationModel {
             // `refresh` only ever grows a turn, so a good live stream is never
             // made worse by it.
             if outcome.failure == nil && !outcome.parked {
-                await refresh(messageID: assistantID)
+                await reconcileUntilClosed(messageID: assistantID)
                 leafID = assistantID
             }
             // Once the run is genuinely over nothing is parked any more. Not
@@ -1092,10 +1111,15 @@ public final class ConversationModel {
     private func refresh(messageID: String) async {
         guard let chat = chatID,
               let detail = try? await client.chat(id: chat),
-              let message = detail.messages[messageID],
-              let index = turns.firstIndex(where: { $0.id == messageID })
+              let message = detail.messages[messageID]
         else { return }
         self.detail = detail
+        apply(message, to: messageID)
+    }
+
+    /// Copies a stored message onto the turn of the same id, growing only.
+    private func apply(_ message: ChatMessage, to messageID: String) {
+        guard let index = turns.firstIndex(where: { $0.id == messageID }) else { return }
         let fresh = Turn(message)
         var turn = turns[index]
         if fresh.text.count > turn.text.count { turn.text = fresh.text }
@@ -1110,6 +1134,80 @@ public final class ConversationModel {
         if message.done { turn.streaming = false }
         turns[index] = turn
     }
+
+    /// Poll the stored message until the server has closed it.
+    ///
+    /// The stream is an optimisation; the stored message is the truth. A run that
+    /// ends in the app before the server has finished writing is the worst
+    /// failure this client can have: the answer looks finished, the composer
+    /// unlocks, and the rest of it only appears after you leave the chat and
+    /// come back. That report came in repeatedly, and every attempt to fix it by
+    /// interpreting the stream more cleverly has failed, because the frames
+    /// disagree with the record in more ways than one — a run can pause on a
+    /// question, continue after a tool call, or simply outlive the socket.
+    ///
+    /// So this stops interpreting and starts checking. After a run, and whenever
+    /// a chat opens onto a message the server still has open, it re-reads the
+    /// record until one of three things is true:
+    ///
+    ///   * the message is `done` — the run is over;
+    ///   * a tool call is waiting on the user — parked is a correct end state,
+    ///     and polling it away would hide the question again;
+    ///   * the budget runs out, which means the server really did stop.
+    ///
+    /// Two seconds is slow enough to be invisible and fast enough that a
+    /// continuation lands before the user has looked away. Five minutes is
+    /// longer than any run seen here.
+    private func reconcileUntilClosed(messageID: String) async {
+        guard let chat = chatID else { return }
+        // A chat abandoned server-side — browser closed mid-run, worker died —
+        // keeps `done: false` forever. Polling that for five minutes would show a
+        // spinner on a dead chat, which is its own bug. So growth is the signal:
+        // if neither the answer nor the reasoning has moved in half a minute,
+        // nothing is coming.
+        var still = 0
+        var seen = 0
+        for _ in 0..<reconcileBudget {
+            guard let detail = try? await client.chat(id: chat) else {
+                // A failed read says nothing about the run, so it must not end
+                // the reconciliation — the next tick may be fine.
+                try? await Task.sleep(for: reconcileInterval)
+                continue
+            }
+            // Stop if the user started something else while we were waiting.
+            guard phase == .streaming || phase == .stopping else { return }
+            self.detail = detail
+            guard let message = detail.messages[messageID] else { return }
+            apply(message, to: messageID)
+            if message.done { return }
+            if Turn(message).calls.contains(where: \.isAwaitingUser) {
+                // The run is waiting on a tap, not on the server. Show the
+                // question and stop watching.
+                turns.firstIndex(where: { $0.id == messageID }).map {
+                    turns[$0].streaming = false
+                }
+                return
+            }
+            let size = message.content.text.count + message.output.count
+            still = size == seen ? still + 1 : 0
+            seen = max(seen, size)
+            if still >= reconcileStallLimit {
+                // Nothing has moved in half a minute. Leave the answer on screen
+                // and hand the composer back rather than spin over a dead run.
+                turns.firstIndex(where: { $0.id == messageID }).map {
+                    turns[$0].streaming = false
+                }
+                return
+            }
+            try? await Task.sleep(for: reconcileInterval)
+        }
+    }
+
+    /// Tuning for `reconcileUntilClosed`, split out so the stall behaviour is
+    /// testable without a test that waits half a minute.
+    var reconcileInterval: Duration = .seconds(2)
+    var reconcileStallLimit = 15
+    var reconcileBudget = 150
 
     /// A failed POST is reported only if the run has not already ended on its own
     /// terms — a stream closed by `stop()` errors on the way out, and calling

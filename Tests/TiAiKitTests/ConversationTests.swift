@@ -245,6 +245,9 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
 
     /// Replaces what GET /chats/{id} returns, for tests that need a real tree.
     var chatDetailOverride: Data?
+    /// Successive answers for GET /chats/{id}, for tests where the point is that
+    /// the server's answer *changes* between reads.
+    var chatDetailQueue: [Data] = []
 
     var chatDetail: Data {
         Data(
@@ -258,7 +261,11 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
         let path = request.url?.path ?? ""
         paths.append(path)
         if path.hasSuffix("/chats/new") { return (chatDetailOverride ?? chatDetail, response(for: request, 200)) }
-        if request.httpMethod == "GET", path.hasPrefix("/api/v1/chats/") {
+        if request.httpMethod == "GET", path.hasPrefix("/api/v1/chats/"),
+           !path.hasSuffix("/messages") {
+            if !chatDetailQueue.isEmpty {
+                return (chatDetailQueue.removeFirst(), response(for: request, 200))
+            }
             return (chatDetailOverride ?? chatDetail, response(for: request, 200))
         }
         if path.hasSuffix("/resolve") {
@@ -1494,4 +1501,98 @@ enum AskUserFixture {
     ])
     hub.receive(try #require(bare))
     #expect(adopted == nil)
+}
+
+// Real payload from a run that paused on `ask_user` and never resumed. The web UI
+// shows the question card; the app showed none. The questions are in the stored
+// message's `output` array, so this pins whether the app can see them at all.
+@Test func aPendingAskUserLoadedFromTheServerIsVisible() throws {
+    let url = try #require(
+        Bundle.module.url(forResource: "chat-pending-ask-user", withExtension: "json",
+                          subdirectory: "Fixtures"))
+    let detail = try JSONDecoder().decode(ChatDetail.self, from: Data(contentsOf: url))
+    let assistant = detail.messages.values.first { $0.role == "assistant" }
+    let message = try #require(assistant)
+
+    #expect(message.done == false, "the server agrees the run is parked, not finished")
+    let calls = message.toolCalls
+    #expect(!calls.isEmpty, "the stored output array must yield the tool calls")
+    let ask = calls.first { $0.isAskUser }
+    let call = try #require(ask, "the pending ask_user must be recognised")
+    #expect(call.isAwaitingUser, "and it must be offered to the user to answer")
+}
+
+/// Opening a chat the app had given up on used to show the truncated answer and
+/// an unlocked composer, with the rest of the reply appearing only after another
+/// leave-and-return. The stored message says `done: false`, and that is now
+/// treated as "still running" rather than "finished, apparently".
+@Test @MainActor func openingAChatTheServerStillHasOpenKeepsWatchingIt() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(
+            server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"),
+            transport: transport),
+        hub: hub)
+
+    func stored(_ content: String, _ done: String) -> Data {
+        let template = """
+        {"id":"chat-1","title":"T","updated_at":1,"created_at":1,"chat":{"models":["local-personal"],
+         "history":{"currentId":"assistant-1","messages":{
+           "user-1":{"id":"user-1","role":"user","content":"hi","childrenIds":["assistant-1"]},
+           "assistant-1":{"id":"assistant-1","role":"assistant","content":"__TEXT__",
+             "parentId":"user-1","done":__DONE__}}}}}
+        """
+        return Data(template.replacingOccurrences(of: "__TEXT__", with: content)
+                             .replacingOccurrences(of: "__DONE__", with: done).utf8)
+    }
+    // First read: half an answer, still open. Second: the whole thing, closed.
+    transport.chatDetailQueue = [stored("half an answ", "false"),
+                                 stored("half an answer, finished.", "true")]
+    await conversation.load()
+
+    for _ in 0..<200 {
+        if conversation.turns.last?.text == "half an answer, finished." { break }
+        try await Task.sleep(for: .milliseconds(50))
+    }
+
+    #expect(conversation.turns.last?.text == "half an answer, finished.",
+            "an answer the server is still writing must keep growing on screen")
+    #expect(conversation.phase == .ready, "and the composer unlocks when it closes")
+}
+
+/// A chat abandoned server-side keeps `done: false` for ever. Watching that
+/// forever would hang a spinner over a dead chat, so the loop gives up once the
+/// answer stops growing — and leaves the partial answer on screen.
+@Test @MainActor func aRunThatStoppedGrowingIsNotWatchedForever() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(
+            server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"),
+            transport: transport),
+        hub: hub)
+    conversation.reconcileInterval = .milliseconds(1)
+    conversation.reconcileStallLimit = 5
+
+    let stuck = Data("""
+        {"id":"chat-1","title":"T","updated_at":1,"created_at":1,"chat":{"models":["local-personal"],
+         "history":{"currentId":"assistant-1","messages":{
+           "user-1":{"id":"user-1","role":"user","content":"hi","childrenIds":["assistant-1"]},
+           "assistant-1":{"id":"assistant-1","role":"assistant","content":"abandoned here",
+             "parentId":"user-1","done":false}}}}}
+        """.utf8)
+    transport.chatDetailQueue = Array(repeating: stuck, count: 40)
+    await conversation.load()
+
+    for _ in 0..<200 {
+        if conversation.phase == .ready { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(conversation.phase == .ready, "a dead run must not hold the composer hostage")
+    #expect(conversation.turns.last?.text == "abandoned here", "and the partial answer stays")
 }
