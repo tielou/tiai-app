@@ -120,10 +120,30 @@ public struct ChatListView: View {
     @State private var query = ""
     @State private var searchResults: [ChatSummary] = []
     @State private var showingMemory = false
-    /// A chat the user has swiped to delete and is being asked to confirm.
-    @State private var pendingDelete: ChatSummary?
+    /// Set while a delete is in flight, so the list says so rather than sitting
+    /// on a row that is already gone server-side.
     @State private var deleting: String?
     @State private var deleteFailed: String?
+
+    /// Swiping to delete is the confirmation. A dialog on top of it asked the same
+    /// question twice, and the row animating out behind the prompt made the whole
+    /// thing look broken.
+    private func delete(_ chat: ChatSummary) {
+        guard deleting == nil else { return }
+        deleting = chat.id
+        Task {
+            do {
+                try await session.client.deleteChat(id: chat.id)
+                // Refetch rather than splice: the list is the server's, and a
+                // locally removed row that the server still has reappears on the
+                // next refresh looking like a bug.
+                await chats.refresh()
+            } catch {
+                deleteFailed = error.localizedDescription
+            }
+            deleting = nil
+        }
+    }
 
     public init(session: SessionStore) {
         self.session = session
@@ -162,45 +182,22 @@ public struct ChatListView: View {
                                 }
                             }
                             .swipeActions(edge: .trailing) {
-                                Button(role: .destructive) {
-                                    pendingDelete = chat
+                                // Not `role: .destructive`: that makes SwiftUI
+                                // slide the row out the instant it is tapped,
+                                // before the server has agreed to anything, so a
+                                // failed delete left a row that had already
+                                // vanished. The row now leaves when the list comes
+                                // back without it.
+                                Button {
+                                    delete(chat)
                                 } label: {
                                     Label("Delete", systemImage: "trash")
                                 }
+                                .tint(.red)
                             }
                         }
                     }
                     .chatListStyle()
-                    .confirmationDialog(
-                        "Delete this chat?",
-                        isPresented: Binding(
-                            get: { pendingDelete != nil },
-                            set: { if !$0 { pendingDelete = nil } }),
-                        titleVisibility: .visible
-                    ) {
-                        Button("Delete", role: .destructive) {
-                            if let chat = pendingDelete {
-                                pendingDelete = nil
-                                deleting = chat.id
-                                Task {
-                                    do {
-                                        try await session.client.deleteChat(id: chat.id)
-                                        // Refetch rather than splice: the list is
-                                        // the server's, and a locally removed row
-                                        // that the server still has reappears on
-                                        // the next refresh looking like a bug.
-                                        await chats.refresh()
-                                    } catch {
-                                        deleteFailed = error.localizedDescription
-                                    }
-                                    deleting = nil
-                                }
-                            }
-                        }
-                        Button("Keep", role: .cancel) { pendingDelete = nil }
-                    } message: {
-                        Text(pendingDelete.map { "\"\($0.title)\" goes with it." } ?? "")
-                    }
                     .overlay {
                         if deleting != nil {
                             ProgressView().controlSize(.large)
