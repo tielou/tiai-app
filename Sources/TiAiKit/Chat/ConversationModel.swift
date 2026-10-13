@@ -153,7 +153,7 @@ public final class ConversationModel {
     static func seedFeatures(for model: ChatModel?, incognito: Bool = false) -> [String: Bool] {
         guard let model else { return [:] }
         var seeded = Dictionary(
-            uniqueKeysWithValues: (model.defaultFeatureIDs ?? []).map { ($0, true) })
+            uniqueKeysWithValues: model.defaultFeatureIDs.map { ($0, true) })
         // Incognito has to mean something. Remembering what the user just said
         // in a chat that is supposed to vanish is the opposite of the request.
         if model.supports(.memory) && !incognito { seeded[ChatFeature.memory.rawValue] = true }
