@@ -216,6 +216,11 @@ public final class ConversationModel {
             leafID = turns.last?.id
             chatVariables = detail.variables
             if let used = detail.models.first, !used.isEmpty { model = used }
+            // Opening a chat is reading it. The server tracks unread as
+            // `updated_at > last_read_at` and only moves `last_read_at` over the
+            // socket, so without this every conversation had on the phone walked
+            // into the browser still flagged as having an unread reply.
+            hub.markChatRead(chatID)
             // Heal a run the app gave up on. If the newest message is an answer
             // the server still has open, the run is either still writing or parked
             // on a question — either way the transcript on screen is incomplete,
@@ -738,6 +743,10 @@ public final class ConversationModel {
             if got.isEmpty { outcome.failure = reported }
         }
         if let failure = outcome.failure { error = failure }
+        // The answer just written bumped `updated_at`, which is exactly what the
+        // server reads as "unread". Marking read on open is not enough for a chat
+        // the app both asked and answered — nobody else needs to be told about it.
+        if let chat = chatID, outcome.failure == nil { hub.markChatRead(chat) }
         phase = .ready
     }
 

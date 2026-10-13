@@ -77,6 +77,19 @@ public final class ChatEventHub {
         isConnected = false
     }
 
+    /// Tells the server this chat has been read.
+    ///
+    /// Fire-and-forget by design: nothing in the app depends on the answer, and a
+    /// read receipt that blocks a screen is worse than one that is occasionally
+    /// lost. Dropped silently when the socket is down — the next open marks it
+    /// again, and the browser's blue dot is not worth queueing work for.
+    public func markChatRead(_ chatID: String) {
+        socket.emit("events:chat", with: [
+            "chat_id": chatID,
+            "data": ["type": "last_read_at"],
+        ])
+    }
+
     /// Frames belonging to one chat. The stream ends when the caller stops
     /// iterating, when `expire(chatID:)` runs, or when the hub is deallocated.
     public func frames(for chatID: String) -> AsyncStream<ChatEventSocket.Frame> {

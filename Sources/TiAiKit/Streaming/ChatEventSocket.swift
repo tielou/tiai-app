@@ -259,6 +259,18 @@ public final class ChatEventSocket: @unchecked Sendable {
         client.disconnect()
     }
 
+    /// Sends an event to the server.
+    ///
+    /// The socket was receive-only until something had to be sent: the server
+    /// decides a chat is unread from `updated_at > last_read_at`, and the only way
+    /// to move `last_read_at` is the `events:chat` socket event. Reading a chat in
+    /// the app therefore left it unread everywhere else — the blue dot followed
+    /// every conversation you had opened on the phone into the browser.
+    public func emit(_ event: String, with payload: [String: Any]) {
+        guard client.status == .connected else { return }
+        client.emit(event, with: [payload], completion: nil)
+    }
+
     /// Connects and waits for the handshake, so the first completion cannot race
     /// the socket and lose its deltas.
     public func connect(timeout: Duration = .seconds(10)) async throws {
