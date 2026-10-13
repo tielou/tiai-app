@@ -156,7 +156,18 @@ public struct ConversationView: View {
     private var transcript: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 14) {
+                // Not `LazyVStack`. A lazy stack has to guess the height of rows
+                // that are off-screen, and those guesses become the scroll
+                // content's height. Combined with `defaultScrollAnchor(.bottom)`
+                // the app lands at the bottom of a page that is mostly estimate and
+                // no content — a black void, with a scrollbar saying there is a lot
+                // more below, that only collapses back to reality as you scroll and
+                // each row finally gets measured. "Scroll up until the chat fixes
+                // itself" was reported repeatedly and is this.
+                //
+                // A transcript is tens of rows, not thousands, so laying them out
+                // eagerly is the cheap side of that trade.
+                VStack(alignment: .leading, spacing: 14) {
                     if conversation.turns.isEmpty { EmptyTranscript(model: conversation.model) }
                     ForEach(conversation.turns) { turn in
                         MessageRow(
