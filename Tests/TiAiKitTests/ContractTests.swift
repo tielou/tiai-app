@@ -635,3 +635,24 @@ private func voiceClient(_ transport: RecordingTransport) -> OWUIClient {
     #expect(request.httpMethod == "DELETE")
     #expect(request.url?.path == "/api/v1/chats/c1")
 }
+
+// The app names its own chats, the way the web client does. `POST /chats/{id}`
+// merges whatever is sent into the stored chat and copies `title` to its column,
+// so the body must be nested under `chat` — a bare `{"title": ...}` is ignored
+// and the chat keeps reading "New Chat" in the list and in the browser.
+@Test func settingAChatTitleNestsItUnderChat() async throws {
+    let transport = RecordingTransport()
+    let client = OWUIClient(
+        server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"),
+        transport: transport)
+    try await client.setChatTitle(id: "chat-1", title: "Boiling eggs")
+
+    let request = try #require(transport.lastRequest)
+    #expect(request.httpMethod == "POST")
+    #expect(request.url?.path == "/api/v1/chats/chat-1")
+    let body = try #require(
+        JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any])
+    let chat = try #require(body["chat"] as? [String: Any], "title must be nested under `chat`")
+    #expect(chat["title"] as? String == "Boiling eggs")
+    #expect(body["history"] == nil, "sending history would risk clobbering the thread")
+}

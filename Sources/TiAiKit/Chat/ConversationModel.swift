@@ -754,6 +754,7 @@ public final class ConversationModel {
             let generated = fresh.title
             if !generated.isEmpty, generated != placeholder {
                 title = generated
+                titleIsPlaceholder = false
                 return
             }
         }
@@ -824,7 +825,10 @@ public final class ConversationModel {
             if let thinking = frame.reasoningDelta { pending?.reasoning += thinking }
             if let usage = frame.usage { pending?.usage = usage }
             // The server's own summary for the chat, when it got one mid-run.
-            if let generated = frame.title { title = generated }
+            if let generated = frame.title {
+                title = generated
+                titleIsPlaceholder = false
+            }
             if let problem = frame.errorText {
                 // Not `failure`: an error frame is the server reporting a
                 // problem, not the run ending. Treating it as terminal stopped
@@ -1270,8 +1274,14 @@ public final class ConversationModel {
         // browser chats got a summary. The first message now goes out with no id
         // and the real one is adopted from the stream.
         title = Self.title(from: text)
+        titleIsPlaceholder = true
         return Self.awaitingChatID
     }
+
+    /// True while the only name this chat has is the one the app made up from the
+    /// first message. Cleared the moment the server supplies a real one, so a
+    /// generated summary is never overwritten by the placeholder.
+    private var titleIsPlaceholder = false
 
     /// Stand-in for "the server has not told us the id yet".
     static let awaitingChatID = "__awaiting__"
@@ -1280,6 +1290,17 @@ public final class ConversationModel {
     private func adopt(chatID: String) {
         guard self.chatID == nil else { return }
         self.chatID = chatID
+        // The server names a chat it generated a summary for; it is not going to
+        // name this one, and leaving it as "New Chat" is what made app chats look
+        // second-class in a list shared with the browser. The web UI writes its
+        // own truncated title in this same situation, so do the same — and only
+        // this once, before any summary has had the chance to arrive.
+        if titleIsPlaceholder, !incognito {
+            let name = title
+            Task {
+                _ = try? await self.client.setChatTitle(id: chatID, title: name)
+            }
+        }
     }
 
     static func title(from text: String) -> String {

@@ -288,6 +288,18 @@ public struct OWUIClient: Sendable {
         try await expectStatus("DELETE", "/chats/\(id)")
     }
 
+    /// Names a chat.
+    ///
+    /// `POST /chats/{id}` merges whatever is sent into the stored chat and then
+    /// copies `title` out to its own column, so sending only a title leaves the
+    /// history alone. The web UI does the same thing; without it a chat the app
+    /// started stays literally "New Chat" in the list and in the browser, even
+    /// though the app shows a sensible name in its own nav bar.
+    public func setChatTitle(id: String, title: String) async throws {
+        let body = try JSONEncoder().encode(["chat": ["title": title]])
+        _ = try await expectStatus("POST", "/chats/\(id)", bodyData: body)
+    }
+
     public func deleteMessage(chatID: String, messageID: String) async throws -> ChatDetail {
         try await request("DELETE", "/chats/\(chatID)/messages/\(messageID)")
     }
