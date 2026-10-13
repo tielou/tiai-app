@@ -1445,13 +1445,16 @@ enum AskUserFixture {
 
     let body = try #require(transport.completionBody)
     let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
-    let tasks = try #require(json["tasks"] as? [String: Any], "the server needs the ask")
-    // Truthy, not merely present. The server does `if tasks[TASKS.TITLE_GENERATION]:`,
-    // and an empty object — which is what this used to send — is falsy in Python, so
-    // the request looked correct on the wire and silently generated nothing. Only a
-    // test that reads the value, rather than its existence, catches that.
+    // The key is the whole lesson: the server pops `background_tasks` and never
+    // looks at a top-level `tasks`, so an ask filed under the wrong key is ignored
+    // in complete silence.
+    let tasks = try #require(json["background_tasks"] as? [String: Any],
+                             "the server only reads `background_tasks`")
+    // Truthy, not merely present: the server does `if tasks[TASKS.TITLE_GENERATION]:`
+    // and `{}` is falsy in Python.
     #expect(tasks["title_generation"] as? Bool == true,
             "must be true, not just present: {} is falsy server-side")
+    #expect(json["tasks"] == nil, "a stray `tasks` key is dead weight at best")
     // The other half of the contract: the server only honours the ask when it
     // reads the exchange as a new chat, which it decides from `parent_id` being
     // present and null with no `chat_id` at all. A pre-created chat, or a missing

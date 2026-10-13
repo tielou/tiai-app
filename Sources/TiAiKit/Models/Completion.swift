@@ -150,7 +150,22 @@ public struct CompletionRequest: Encodable, Sendable {
     /// natural thing for a client to send — is falsy in Python and generates
     /// nothing while looking perfectly correct on the wire. The web UI sends
     /// `true`; so does this.
-    public var tasks: [String: JSONValue]?
+    /// Background jobs to run once the answer lands, sent as `background_tasks`.
+    ///
+    /// The key matters more than it looks. The server reads
+    /// `form_data.pop('background_tasks', None)`; a top-level `tasks` key is
+    /// simply never looked at, so an ask written there is ignored without a word
+    /// — which is how this client asked for a title for a long time and got one
+    /// never. The web client sends `background_tasks` (Chat.svelte).
+    ///
+    /// Values must be truthy server-side, which is sharper than it sounds: the
+    /// server tests `if tasks[TASKS.TITLE_GENERATION]:`, and `{}` is falsy in
+    /// Python. Send `true`.
+    ///
+    /// This is how a chat gets a summarised title rather than a truncated first
+    /// line: the server does not name chats on its own, it names them because the
+    /// completion asked.
+    public var backgroundTasks: [String: JSONValue]?
 
     public init(
         model: String,
@@ -171,7 +186,7 @@ public struct CompletionRequest: Encodable, Sendable {
         variables: [String: JSONValue]? = nil,
         chatVariables: JSONValue? = nil,
         sessionID: String? = nil,
-        tasks: [String: JSONValue]? = nil
+        backgroundTasks: [String: JSONValue]? = nil
     ) {
         self.model = model
         self.messages = messages
@@ -191,7 +206,7 @@ public struct CompletionRequest: Encodable, Sendable {
         self.variables = variables
         self.chatVariables = chatVariables
         self.sessionID = sessionID
-        self.tasks = tasks
+        self.backgroundTasks = backgroundTasks
     }
 
     enum Keys: String, CodingKey {
@@ -208,7 +223,7 @@ public struct CompletionRequest: Encodable, Sendable {
         case variables
         case chatVariables = "chat_variables"
         case sessionID = "session_id"
-        case tasks
+        case backgroundTasks = "background_tasks"
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -238,7 +253,7 @@ public struct CompletionRequest: Encodable, Sendable {
         if let filterIDs { try c.encode(filterIDs, forKey: .filterIDs) }
         if let variables { try c.encode(variables, forKey: .variables) }
         if let chatVariables { try c.encode(chatVariables, forKey: .chatVariables) }
-        if let tasks { try c.encode(tasks, forKey: .tasks) }
+        if let backgroundTasks { try c.encode(backgroundTasks, forKey: .backgroundTasks) }
         if let sessionID { try c.encode(sessionID, forKey: .sessionID) }
     }
 }

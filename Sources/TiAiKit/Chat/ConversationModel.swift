@@ -645,12 +645,13 @@ public final class ConversationModel {
             // accepts it, not because anything here sets it.
             toolServerIDs: nil,
             chatVariables: chatVariables,
-            // Ask the server for a summarised title, the way the web UI does.
-            // Without this the chat keeps the placeholder built from the first
-            // line, which is why app-created chats read as truncated messages
-            // while browser-created ones read as titles.
+            // Ask the server for a summarised title, the way the web client does.
+            // Tags too, since they show up in the browser and the list is shared.
+            // Not follow-ups: the app has nowhere to put them, and asking would be
+            // a model call whose result nothing reads.
             sessionID: hub.sessionID,
-            tasks: newChat ? ["title_generation": .bool(true)] : nil)
+            backgroundTasks: newChat
+                ? ["title_generation": .bool(true), "tags_generation": .bool(true)] : nil)
 
         // Blocks for the whole generation and yields no body; what is left for it
         // to do is fail loudly (401, 429) and to close. The task inherits this
@@ -748,15 +749,27 @@ public final class ConversationModel {
     /// part that does not depend on timing.
     private func awaitGeneratedTitle(chat: String) async {
         let placeholder = title
-        for attempt in 0..<6 {
+        // A summary is a second model call on a local engine, so it can trail the
+        // run by a good ten seconds. Giving up early is what makes the fallback
+        // fire when it should not have.
+        for attempt in 0..<10 {
             try? await Task.sleep(for: .milliseconds(700 * (attempt + 1)))
             guard let fresh = try? await client.chat(id: chat) else { return }
             let generated = fresh.title
-            if !generated.isEmpty, generated != placeholder {
+            if !generated.isEmpty, generated != placeholder, generated != "New Chat" {
                 title = generated
                 titleIsPlaceholder = false
                 return
             }
+        }
+        // Nothing came. The server names a chat by generating a summary, and when
+        // that does not happen the web client writes a truncated first line so the
+        // chat is at least findable in a list it shares with every other client.
+        // This is the same fallback, and it is deliberately last: writing it here
+        // before the summary has had its chance is how a generated title gets
+        // overwritten by the first 40 characters of a question.
+        if titleIsPlaceholder, !incognito {
+            _ = try? await client.setChatTitle(id: chat, title: placeholder)
         }
     }
 
@@ -1290,17 +1303,12 @@ public final class ConversationModel {
     private func adopt(chatID: String) {
         guard self.chatID == nil else { return }
         self.chatID = chatID
-        // The server names a chat it generated a summary for; it is not going to
-        // name this one, and leaving it as "New Chat" is what made app chats look
-        // second-class in a list shared with the browser. The web UI writes its
-        // own truncated title in this same situation, so do the same — and only
-        // this once, before any summary has had the chance to arrive.
-        if titleIsPlaceholder, !incognito {
-            let name = title
-            Task {
-                _ = try? await self.client.setChatTitle(id: chatID, title: name)
-            }
-        }
+        // Deliberately no title write here. The server is generating a summary for
+        // this chat right now; naming it from the client at this moment is a race
+        // the client loses, and losing means a good title gets replaced by the
+        // first 40 characters of the question. The fallback lives in
+        // `awaitGeneratedTitle`, which only runs once the summary has failed to
+        // turn up.
     }
 
     static func title(from text: String) -> String {
