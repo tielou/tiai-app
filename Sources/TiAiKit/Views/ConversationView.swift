@@ -162,8 +162,14 @@ public struct ConversationView: View {
                 // the app lands at the bottom of a page that is mostly estimate and
                 // no content — a black void, with a scrollbar saying there is a lot
                 // more below, that only collapses back to reality as you scroll and
-                // each row finally gets measured. "Scroll up until the chat fixes
-                // itself" was reported repeatedly and is this.
+                // each row finally gets measured.
+                //
+                // It showed up after sending, which is exactly when the estimate is
+                // worst: a new empty assistant row is appended, the app scrolls to
+                // the bottom anchor, and that anchor is sitting in guessed space.
+                // "Scroll up and it goes back to normal" is the tell — the same
+                // tell as the void when opening a long chat. Reproduced side by side
+                // by reverting this one line to `LazyVStack`.
                 //
                 // A transcript is tens of rows, not thousands, so laying them out
                 // eagerly is the cheap side of that trade.
