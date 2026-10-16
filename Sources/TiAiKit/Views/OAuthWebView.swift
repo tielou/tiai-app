@@ -19,7 +19,11 @@ struct OAuthWebView: View {
     let url: URL
     let token: String
     let domain: String
-    var onFinished: () -> Void
+    /// Called when the browser closes. `true` means the flow came back to the
+    /// Open WebUI host, i.e. it finished; `false` means the user pressed Done and
+    /// may never have signed in. Selecting a tool on a bail-out would put a dead
+    /// tool on the chat, which is the failure this whole path exists to avoid.
+    var onFinished: (Bool) -> Void
 
     @Environment(\.dismiss) private var dismiss
 
@@ -44,7 +48,7 @@ struct OAuthWebView: View {
                     url: url, token: token, domain: domain,
                     onURL: { whereAmI = $0 }, onFailed: { failure = $0 }
                 ) {
-                    onFinished()
+                    onFinished(true)
                     dismiss()
                 }
             }
@@ -68,7 +72,7 @@ struct OAuthWebView: View {
                     // Some providers end on a page that is not the callback —
                     // a consent screen, a "you may close this window". Without a
                     // way out the sheet would be a trap.
-                    Button("Done") { onFinished(); dismiss() }
+                    Button("Done") { onFinished(false); dismiss() }
                 }
                 ToolbarItem(placement: .topBarLeading) {
                     // The way out when the page itself will not cooperate in a web

@@ -23,9 +23,10 @@ struct ComposerView: View {
     /// Tools offered by the instance, passed through to the `+` sheet.
     var chatTools: [ChatTool] = []
     var chatToolsError: String? = nil
-    /// Opens a tool's sign-in page. Handed down from the conversation, which owns
-    /// the tool list and so is the place that can refresh it afterwards.
-    var onAuthorize: (URL) -> Void = { _ in }
+    /// Opens a tool's sign-in page, with a closure to run once it is finished.
+    /// Handed down from the conversation, which owns the tool list and so is the
+    /// place that can refresh it afterwards.
+    var onAuthorize: (URL, @escaping (Bool) -> Void) -> Void = { _, _ in }
 
     /// So sending can put the keyboard away. Left alone it stays up after the
     /// message goes out, and the transcript underneath is left with a gap the
@@ -49,7 +50,19 @@ struct ComposerView: View {
     }
 
     /// Something the `+` sheet asked for, held until this sheet is gone.
-    private enum Pending: Equatable { case camera, photos, files, authorize(URL) }
+    // Not Equatable any more: the authorize case now carries the follow-up to run
+    // once sign-in ends, and a closure cannot be compared.
+    private enum Pending {
+        case camera, photos, files, authorize(URL, (Bool) -> Void)
+
+        // The picker binding only needs to know "is this the photo case", and a
+        // hand-written test beats conforming to Equatable for a case that holds a
+        // closure.
+        var isPhotos: Bool {
+            if case .photos = self { return true }
+            return false
+        }
+    }
 
     /// Sending is a deliberate end of typing: the keyboard should go with it, so
     /// the answer is not being read through a 300-point window.
@@ -84,6 +97,7 @@ struct ComposerView: View {
                 modelChip
                 Spacer(minLength: 4)
                 if conversation.uploading { ProgressView().controlSize(.small) }
+                incognitoChip
                 #if os(iOS)
                 micControls
                 #endif
@@ -102,7 +116,7 @@ struct ComposerView: View {
                 AddToChatSheet(
                     conversation: conversation, models: models, tools: chatTools,
                     toolsError: chatToolsError,
-                    onAuthorize: { hand(.authorize($0)) },
+                    onAuthorize: { url, done in hand(.authorize(url, done)) },
                     onCamera: { hand(.camera) }, onPhotos: { hand(.photos) },
                     onFiles: { hand(.files) })
             case .models:
@@ -110,7 +124,7 @@ struct ComposerView: View {
             }
         }
         #if os(iOS)
-        .photosPicker(isPresented: Binding(get: { pending == .photos }, set: { if !$0 { pending = nil } }), selection: $photoItems, matching: .images)
+        .photosPicker(isPresented: Binding(get: { pending?.isPhotos == true }, set: { if !$0 { pending = nil } }), selection: $photoItems, matching: .images)
         .sheet(isPresented: $cameraRequest) {
             CameraPicker { data, name, mime in conversation.attach(data: data, name: name, mimeType: mime) }
         }
@@ -242,13 +256,13 @@ struct ComposerView: View {
             case .files:
                 showingFiles = true
                 pending = nil
-            case let .authorize(url):
+            case let .authorize(url, done):
                 // Same reason as the pickers: the sign-in browser is presented by
                 // the conversation behind this sheet, and asking for it while the
                 // `+` sheet is still on screen means it waits until that sheet
                 // happens to close — which is what made the browser look like it
                 // only appeared after dismissing the menu by hand.
-                onAuthorize(url)
+                onAuthorize(url, done)
                 pending = nil
             }
         }
@@ -392,6 +406,39 @@ struct ComposerView: View {
         .accessibilityLabel(conversation.phase.isBusy ? "Stop" : "Send")
     }
 
+    /// Incognito, where you can actually see it.
+    ///
+    /// It used to live only inside the `+` sheet, which is a strange place to hide
+    /// the one setting that decides whether the conversation is saved at all — you
+    /// either never notice it or go looking for it mid-chat. A mask next to the
+    /// model chip is visible at a glance and one tap from the keyboard.
+    private var incognitoChip: some View {
+        Button { conversation.incognito.toggle() } label: {
+            // `mask` is not an SF Symbol (it is `facemask`), so the earlier version
+            // of this drew an empty circle. `eye.slash` is older, always present,
+            // and says "this is not being watched or kept", which is the setting.
+            Image(systemName: conversation.incognito ? "eye.slash.fill" : "eye.slash")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(conversation.incognito ? Color.primary : Color.secondary)
+                .frame(width: 34, height: 34)
+                .background(
+                    conversation.incognito
+                        ? AnyShapeStyle(.quaternary.opacity(0.95))
+                        : AnyShapeStyle(.quaternary.opacity(0.4)),
+                    in: .circle)
+        }
+        .buttonStyle(.plain)
+        // Turning it on halfway through a saved chat cannot undo the messages
+        // already written, and turning it off cannot bring a discarded chat back.
+        // So it is a choice for the start of a conversation, which is also how the
+        // web UI treats it.
+        .disabled(!conversation.canChangeIncognito)
+        .accessibilityLabel(
+            conversation.incognito
+                ? "Incognito is on. This chat is not saved to your history."
+                : "Incognito is off. Tap to stop saving this chat to your history.")
+    }
+
     /// The model, always visible, and the way into the model sheet.
     private var modelChip: some View {
         Button { sheet = .models } label: {
@@ -482,7 +529,7 @@ struct AddToChatSheet: View {
     /// "Tools" heading with nothing under it reads as a bug, not as "none".
     var tools: [ChatTool] = []
     var toolsError: String? = nil
-    var onAuthorize: (URL) -> Void = { _ in }
+    var onAuthorize: (URL, @escaping (Bool) -> Void) -> Void = { _, _ in }
     var onCamera: () -> Void
     var onPhotos: () -> Void
     var onFiles: () -> Void
@@ -512,7 +559,7 @@ struct AddToChatSheet: View {
                 if !tools.isEmpty {
                     Section {
                         ForEach(tools) { tool in
-                            Toggle(isOn: toolBinding(tool)) {
+                            HStack(alignment: .firstTextBaseline) {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(tool.name)
                                     // The id is noise for an MCP server ("server:mcp:1"),
@@ -522,12 +569,22 @@ struct AddToChatSheet: View {
                                             .lineLimit(2)
                                     }
                                     if tool.authenticated == false {
-                                        // Says it, because the alternative is a tool that
-                                        // is switched on and silently does nothing.
-                                        Label("Not signed in", systemImage: "lock")
-                                            .font(.caption).foregroundStyle(.orange)
+                                        // Not just a caption under the switch: an
+                                        // explicit way to sign in. Leaving it as a
+                                        // side effect of the toggle meant the only
+                                        // way to start sign-in was to switch on a tool
+                                        // you could not yet use, which reads as a bug
+                                        // and is easy to never discover.
+                                        Button { startSignIn(tool) } label: {
+                                            Label("Sign in to use", systemImage: "lock")
+                                                .font(.caption).foregroundStyle(.orange)
+                                        }
+                                        .buttonStyle(.plain)
                                     }
                                 }
+                                Spacer(minLength: 12)
+                                Toggle("", isOn: toolBinding(tool))
+                                    .labelsHidden().fixedSize()
                             }
                             .disabled(!tool.available)
                         }
@@ -556,29 +613,10 @@ struct AddToChatSheet: View {
                         .disabled(currentModel.map { !$0.supports(feature) } ?? false)
                     }
                 }
-
-                Section {
-                    Toggle(isOn: $conversation.incognito) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Label("Incognito", systemImage: "mask")
-                            Text(conversation.incognito
-                                ? "This chat is not saved to your history."
-                                : "Don't save this chat to my history")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                    // Turning it on halfway through a saved chat cannot undo the
-                    // messages already written, and turning it off cannot bring a
-                    // discarded chat back. So it is a choice for the start of a
-                    // conversation, which is also how the web UI treats it.
-                    .disabled(!conversation.canChangeIncognito)
-                    if !conversation.canChangeIncognito {
-                        Text("Incognito is set when a chat starts.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                } header: {
-                    Text("Privacy")
-                }
+                // Incognito used to have a section here. It moved to the composer,
+                // beside the model chip, where it is visible instead of two taps
+                // deep — and one control for one setting beats two that have to be
+                // kept in sync.
             }
             .inlineTitle("Add to Chat")
             .toolbar {
@@ -598,6 +636,24 @@ struct AddToChatSheet: View {
 
     private var currentModel: ChatModel? { models.first { $0.id == conversation.model } }
 
+    /// Starts a tool's OAuth sign-in and, if it completes, selects the tool.
+    ///
+    /// Signing in and then having to flip the switch a second time is the part
+    /// that made this feel broken: the browser closed, the row still said "not
+    /// signed in", and the tool was still off. So the tap that started the
+    /// sign-in is remembered and completes itself when the browser returns.
+    private func startSignIn(_ tool: ChatTool) {
+        guard let url = tool.authorizeURL(base: conversation.serverURL) else { return }
+        let picked = tool.id
+        send {
+            onAuthorize(url) { finished in
+                if finished, !conversation.tools.contains(picked) {
+                    conversation.tools.append(picked)
+                }
+            }
+        }()
+    }
+
     private func toolBinding(_ tool: ChatTool) -> Binding<Bool> {
         Binding(
             get: { conversation.tools.contains(tool.id) },
@@ -610,8 +666,8 @@ struct AddToChatSheet: View {
                 // it on starts the sign-in instead of pretending it is enabled.
                 // Before this the row went green while the tool was still dead,
                 // and the chat quietly had no tool at all.
-                if let url = tool.authorizeURL(base: conversation.serverURL) {
-                    send { onAuthorize(url) }()
+                if tool.authorizeURL(base: conversation.serverURL) != nil {
+                    startSignIn(tool)
                     return
                 }
                 conversation.tools.append(tool.id)

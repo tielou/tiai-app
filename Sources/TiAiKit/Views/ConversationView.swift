@@ -34,6 +34,10 @@ public struct ConversationView: View {
     /// A tool waiting on a sign-in. The browser lives here because the tool list
     /// does, and the list has to be read again the moment the browser closes.
     @State private var authorizing: AuthorizeRequest?
+    /// What to run when the sign-in browser closes, set when it opens. The tool
+    /// that asked to be signed into is the one that should end up selected, and
+    /// the composer is the only place that knows which one it was.
+    @State private var authFinished: ((Bool) -> Void)?
 
     struct AuthorizeRequest: Identifiable, Hashable {
         let url: URL
@@ -83,7 +87,10 @@ public struct ConversationView: View {
             ComposerView(
                 conversation: conversation, models: models,
                 chatTools: chatTools, chatToolsError: chatToolsError,
-                onAuthorize: { authorizing = AuthorizeRequest(url: $0) })
+                onAuthorize: { url, done in
+                    authFinished = done
+                    authorizing = AuthorizeRequest(url: url)
+                })
         }
         // A chat that is not being saved has to say so where you are looking,
         // not only in a sheet you set once at the start and never opened again.
@@ -93,13 +100,15 @@ public struct ConversationView: View {
             OAuthWebView(
                 url: request.url, token: conversation.authToken,
                 domain: conversation.serverHost
-            ) {
+            ) { completed in
                 // The point of signing in is that the row stops saying "not
                 // signed in", so the list is read again immediately rather than
                 // waiting for a foreground change that may never come.
                 Task {
                     chatTools = (try? await session.client.chatTools()) ?? chatTools
                 }
+                authFinished?(completed)
+                authFinished = nil
             }
         }
         #endif
@@ -179,7 +188,9 @@ public struct ConversationView: View {
                 // A transcript is tens of rows, not thousands, so laying them out
                 // eagerly is the cheap side of that trade.
                 VStack(alignment: .leading, spacing: 14) {
-                    if conversation.turns.isEmpty { EmptyTranscript(model: conversation.model) }
+                    if conversation.turns.isEmpty {
+                        EmptyTranscript(greeting: Greeting.line(for: session.user?.name))
+                    }
                     ForEach(conversation.turns) { turn in
                         MessageRow(
                             turn: turn,
@@ -304,15 +315,24 @@ public struct ConversationView: View {
 private enum BottomAnchor { static let id = "transcript-bottom" }
 
 private struct EmptyTranscript: View {
-    var model: String
+    /// "Good afternoon, Thilo" — the user, not the model. The model is already
+    /// on the composer chip; what an empty screen should answer is "who is this
+    /// for", not "which engine is loaded".
+    var greeting: String
+
     var body: some View {
-        ContentUnavailableView {
-            Label("Nothing here yet", systemImage: "bubble.left")
-        } description: {
-            Text(model.isEmpty ? "Pick a model and ask." : "Ask \(model) something.")
+        VStack(spacing: 18) {
+            GreetingCat(size: 118)
+            Text(greeting)
+                .font(.title2.weight(.regular))
+                .foregroundStyle(.primary)
         }
+        // Not `containerRelativeFrame`: inside this ScrollView it filled the
+        // viewport and the transcript came out blank. A generous fixed offset
+        // puts the greeting where the eye lands and cannot fight the scroll view.
         .frame(maxWidth: .infinity)
-        .padding(.top, 80)
+        .padding(.top, 140)
+        .padding(.bottom, 60)
     }
 }
 

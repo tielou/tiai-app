@@ -125,6 +125,35 @@ public struct ChatListView: View {
     @State private var deleting: String?
     @State private var deleteFailed: String?
 
+    /// When set, tapping a chat calls this instead of pushing a conversation.
+    /// The app opens on a chat rather than on a list, so the list is presented
+    /// over the top and picking one has to hand the choice back and close.
+    /// Nil keeps the old pushed-onto-a-stack behaviour for any other host.
+    var onPick: ((String?) -> Void)? = nil
+
+    @Environment(\.dismiss) private var dismiss
+
+    /// The row's content, shared by the pushed and the picking presentations.
+    @ViewBuilder private func rowLabel(_ chat: ChatSummary) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(chat.title).lineLimit(1)
+                if chat.pinned {
+                    Image(systemName: "pin.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Text(chat.updatedAt, style: .relative)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        // A Button in a List row only reacts to its text otherwise; the whole row
+        // has to be the hit target, as it is for a NavigationLink.
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+
     /// Swiping to delete is the confirmation. A dialog on top of it asked the same
     /// question twice, and the row animating out behind the prompt made the whole
     /// thing look broken.
@@ -145,8 +174,9 @@ public struct ChatListView: View {
         }
     }
 
-    public init(session: SessionStore) {
+    public init(session: SessionStore, onPick: ((String?) -> Void)? = nil) {
         self.session = session
+        self.onPick = onPick
         _chats = State(initialValue: Resource(load: { try await session.client.chatList() }))
     }
 
@@ -166,19 +196,12 @@ public struct ChatListView: View {
                 } else {
                     List {
                         ForEach(visible) { chat in
-                            NavigationLink(value: chat.id) {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    HStack {
-                                        Text(chat.title).lineLimit(1)
-                                        if chat.pinned {
-                                            Image(systemName: "pin.fill")
-                                                .font(.caption2)
-                                                .foregroundStyle(.secondary)
-                                        }
-                                    }
-                                    Text(chat.updatedAt, style: .relative)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                            Group {
+                                if let onPick {
+                                    Button { onPick(chat.id) } label: { rowLabel(chat) }
+                                        .buttonStyle(.plain)
+                                } else {
+                                    NavigationLink(value: chat.id) { rowLabel(chat) }
                                 }
                             }
                             .swipeActions(edge: .trailing) {
@@ -198,6 +221,10 @@ public struct ChatListView: View {
                         }
                     }
                     .chatListStyle()
+                    // iOS 26 floats the search field over the bottom of the list
+                    // and does not inset the content for it, so the last chat sat
+                    // permanently under the field. Reserve the space by hand.
+                    .contentMargins(.bottom, 64, for: .scrollContent)
                     .overlay {
                         if deleting != nil {
                             ProgressView().controlSize(.large)
@@ -218,7 +245,26 @@ public struct ChatListView: View {
             .navigationDestination(for: String.self) { id in
                 ConversationView(session: session, chatID: id, models: models)
             }
-            .searchable(text: $query)
+            // `.toolbar` rather than `.automatic`: on iOS 26 the automatic
+            // placement floats the field over the bottom of the list, which on a
+            // list shown in a sheet covers the last chat with no inset to clear it.
+            .searchable(text: $query, placement: .toolbar)
+            // The search field existed but nothing ever filled `searchResults`, so
+            // typing anything produced an empty list — a control that only ever
+            // answered "nothing found". Debounced, because one request per
+            // keystroke against a home server is rude and the results are the same.
+            .task(id: query) {
+                guard !query.isEmpty else {
+                    searchResults = []
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+                guard !Task.isCancelled else { return }
+                let text = query
+                if let found = try? await session.client.searchChats(text), !Task.isCancelled {
+                    searchResults = found
+                }
+            }
             .refreshable { await chats.refresh() }
             .task {
                 // Cached first, network second: the list and the model name come
@@ -248,11 +294,28 @@ public struct ChatListView: View {
                 #endif
             }
             .toolbar {
+                // Presented over a chat, the list needs a way back that is not a
+                // swipe gesture nobody thinks to try.
+                if onPick != nil {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Done") { dismiss() }
+                    }
+                }
                 ToolbarItem(placement: .primaryAction) {
-                    NavigationLink {
-                        ConversationView(session: session, chatID: nil, models: models)
-                    } label: {
-                        Label("New chat", systemImage: "square.and.pencil")
+                    if let onPick {
+                        Button {
+                            // nil means "start another one"; the home view treats
+                            // it as a fresh chat.
+                            onPick(nil)
+                        } label: {
+                            Label("New chat", systemImage: "square.and.pencil")
+                        }
+                    } else {
+                        NavigationLink {
+                            ConversationView(session: session, chatID: nil, models: models)
+                        } label: {
+                            Label("New chat", systemImage: "square.and.pencil")
+                        }
                     }
                 }
                 // `.navigation` rather than `.topBarLeading`: the kit builds for
@@ -292,6 +355,65 @@ public struct ChatListView: View {
 }
 
 /// The app's root: connect, or the list.
+/// The app's home is a chat, not a list of them.
+///
+/// The list was the front door, which made the app feel like a file manager you
+/// had to open before you could say anything. Now the app opens on an empty chat
+/// with a greeting, and the list is one tap away — which is how the Claude client
+/// works, and the reason the user asked for it in those terms.
+///
+/// `chatID` is nil for "a chat that has not been created yet". `ConversationView`
+/// is re-created on change via `.id`, because its whole model is built at init and
+/// reloading in place would mean threading a reset through every piece of state it
+/// holds — the composer draft, parked tool calls, scroll position. Recreating it
+/// is blunter and much harder to get subtly wrong.
+public struct ChatHomeView: View {
+    @Bindable private var session: SessionStore
+    @State private var models: [ChatModel] = []
+    @State private var chatID: String?
+    @State private var showingChats = false
+
+    private var host: String { session.client.server.baseURL.host ?? "local" }
+
+    public init(session: SessionStore) {
+        self.session = session
+    }
+
+    public var body: some View {
+        NavigationStack {
+            ConversationView(session: session, chatID: chatID, models: models)
+                .id(chatID ?? "__new__")
+                .toolbar {
+                    ToolbarItem(placement: .navigation) {
+                        Button { showingChats = true } label: {
+                            Label("Chats", systemImage: "line.3.horizontal")
+                        }
+                    }
+                }
+                .sheet(isPresented: $showingChats) {
+                    // No NavigationStack here: ChatListView brings its own, and
+                    // nesting one inside another put its search field at the
+                    // bottom of the screen instead of under the title.
+                    ChatListView(session: session) { picked in
+                        chatID = picked
+                        showingChats = false
+                    }
+                }
+        }
+        .task {
+            // Cached first so the model chip is right on the first frame; the
+            // network copy follows and corrects it.
+            if let cached = DiskCache.load([ChatModel].self, key: DiskCache.key("models", host: host)) {
+                models = cached
+            }
+            if let fresh = try? await session.client.models(), !fresh.isEmpty {
+                models = fresh
+                DiskCache.save(fresh, key: DiskCache.key("models", host: host))
+            }
+        }
+    }
+}
+
 public struct RootView: View {
     @Bindable private var session: SessionStore
 
@@ -302,7 +424,7 @@ public struct RootView: View {
     public var body: some View {
         Group {
             if session.isSignedIn {
-                ChatListView(session: session)
+                ChatHomeView(session: session)
             } else {
                 ConnectView(session: session)
             }

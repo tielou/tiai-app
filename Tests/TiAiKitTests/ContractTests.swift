@@ -656,3 +656,26 @@ private func voiceClient(_ transport: RecordingTransport) -> OWUIClient {
     #expect(chat["title"] as? String == "Boiling eggs")
     #expect(body["history"] == nil, "sending history would risk clobbering the thread")
 }
+
+// The greeting is the first thing the app says, and the server stores most
+// accounts' `name` as their email — so "Good afternoon, thilo@wobker.co" was the
+// alternative to deriving a name.
+@Test func greetingUsesAHumanFirstWord() {
+    #expect(Greeting.firstName(from: "thilo@wobker.co") == "Thilo")
+    #expect(Greeting.firstName(from: "rebecca.wobker@x.co") == "Rebecca")
+    #expect(Greeting.firstName(from: "Thilo Wobker") == "Thilo")
+    #expect(Greeting.firstName(from: "thilo") == "Thilo")
+    #expect(Greeting.firstName(from: "") == nil)
+    #expect(Greeting.firstName(from: nil) == nil)
+
+    #expect(Greeting.timeOfDay(hour: 7) == "Good morning")
+    #expect(Greeting.timeOfDay(hour: 15) == "Good afternoon")
+    #expect(Greeting.timeOfDay(hour: 20) == "Good evening")
+    #expect(Greeting.timeOfDay(hour: 1) == "Still up")
+
+    var components = DateComponents(); components.hour = 15; components.minute = 10
+    let afternoon = Calendar.current.date(from: components)!
+    #expect(Greeting.line(for: "thilo@wobker.co", at: afternoon) == "Good afternoon, Thilo")
+    // No name is not an error state; it just stops short.
+    #expect(Greeting.line(for: nil, at: afternoon) == "Good afternoon")
+}
