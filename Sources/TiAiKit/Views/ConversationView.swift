@@ -71,7 +71,9 @@ public struct ConversationView: View {
 
     public var body: some View {
         VStack(spacing: 0) {
-            Divider()
+            // No divider under the nav bar. The composer already has its own
+            // outlined card, and a hairline across the top of the transcript just
+            // cut the screen in two for no reason.
             transcript
             if let error = conversation.error {
                 HStack(spacing: 10) {

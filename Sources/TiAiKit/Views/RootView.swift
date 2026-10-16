@@ -142,7 +142,7 @@ public struct ChatListView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            Text(chat.updatedAt, style: .relative)
+            Text(since(chat.updatedAt))
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -150,6 +150,19 @@ public struct ChatListView: View {
         // has to be the hit target, as it is for a NavigationLink.
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
+    }
+
+    /// "4 hrs, 15 min" is a lot of noise under every row. The only thing the
+    /// timestamp answers is roughly how old, so it says that and stops.
+    private func since(_ date: Date) -> String {
+        let s = max(0, Int(Date().timeIntervalSince(date)))
+        switch s {
+        case ..<60: return "just now"
+        case ..<3_600: return "\(s / 60)m"
+        case ..<86_400: return "\(s / 3_600)h"
+        case ..<604_800: return "\(s / 86_400)d"
+        default: return "\(s / 604_800)w"
+        }
     }
 
     /// Swiping to delete is the confirmation. A dialog on top of it asked the same
@@ -192,36 +205,53 @@ public struct ChatListView: View {
                 }
             } else {
                 List {
-                    ForEach(visible) { chat in
-                        Group {
-                            if let onPick {
-                                Button { onPick(chat.id) } label: { rowLabel(chat) }
-                                    .buttonStyle(.plain)
-                            } else {
-                                NavigationLink(value: chat.id) { rowLabel(chat) }
-                            }
+                    // Where the things that are not chats live. They used to be
+                    // icons in the drawer's title bar, which left a row of
+                    // unlabelled glyphs and gave the panel no hierarchy at all.
+                    Section {
+                        NavigationLink {
+                            NotesView(client: session.client)
+                        } label: {
+                            Label("Notes", systemImage: "note.text")
                         }
-                        .swipeActions(edge: .trailing) {
-                            // Not `role: .destructive`: that makes SwiftUI
-                            // slide the row out the instant it is tapped,
-                            // before the server has agreed to anything, so a
-                            // failed delete left a row that had already
-                            // vanished. The row now leaves when the list comes
-                            // back without it.
-                            Button {
-                                delete(chat)
-                            } label: {
-                                Label("Delete", systemImage: "trash")
+                        Button { showingMemory = true } label: {
+                            Label("Memory", systemImage: "brain")
+                        }
+                    }
+
+                    Section("Recents") {
+                        ForEach(visible) { chat in
+                            Group {
+                                if let onPick {
+                                    Button { onPick(chat.id) } label: { rowLabel(chat) }
+                                        .buttonStyle(.plain)
+                                } else {
+                                    NavigationLink(value: chat.id) { rowLabel(chat) }
+                                }
                             }
-                            .tint(.red)
+                            .swipeActions(edge: .trailing) {
+                                // Not `role: .destructive`: that makes SwiftUI
+                                // slide the row out the instant it is tapped,
+                                // before the server has agreed to anything, so a
+                                // failed delete left a row that had already
+                                // vanished. The row now leaves when the list comes
+                                // back without it.
+                                Button {
+                                    delete(chat)
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                                .tint(.red)
+                            }
                         }
                     }
                 }
                 .chatListStyle()
                 // iOS 26 floats the search field over the bottom of the list
                 // and does not inset the content for it, so the last chat sat
-                // permanently under the field. Reserve the space by hand.
-                .contentMargins(.bottom, 64, for: .scrollContent)
+                // permanently under the field. Reserve the space by hand — the
+                // field plus its shadow is taller than it looks.
+                .contentMargins(.bottom, 96, for: .scrollContent)
                 .overlay {
                     if deleting != nil {
                         ProgressView().controlSize(.large)
@@ -238,7 +268,7 @@ public struct ChatListView: View {
                 }
             }
         }
-        .inlineTitle("Chats")
+        .navigationTitle("Chats")
         .navigationDestination(for: String.self) { id in
             ConversationView(session: session, chatID: id, models: models)
         }
@@ -292,8 +322,14 @@ public struct ChatListView: View {
             #endif
         }
         .toolbar {
-            // No explicit close button: the list is pushed now, so the navigation
-            // bar already carries a way back.
+            // Two controls, not five. Notes and memory moved into the list where
+            // they have labels; a strip of unlabelled glyphs above a menu is the
+            // part that made this look unfinished.
+            // `.navigation` rather than `.topBarLeading`: the kit builds for
+            // macOS too, where the latter does not exist.
+            ToolbarItem(placement: .navigation) {
+                AppearancePicker()
+            }
             ToolbarItem(placement: .primaryAction) {
                 if let onPick {
                     Button {
@@ -309,23 +345,6 @@ public struct ChatListView: View {
                     } label: {
                         Label("New chat", systemImage: "square.and.pencil")
                     }
-                }
-            }
-            // `.navigation` rather than `.topBarLeading`: the kit builds for
-            // macOS too, where the latter does not exist.
-            ToolbarItem(placement: .navigation) {
-                AppearancePicker()
-            }
-            ToolbarItem(placement: .primaryAction) {
-                NavigationLink {
-                    NotesView(client: session.client)
-                } label: {
-                    Label("Notes", systemImage: "note.text")
-                }
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Button { showingMemory = true } label: {
-                    Label("Memory", systemImage: "brain")
                 }
             }
         }
@@ -384,31 +403,83 @@ public struct ChatHomeView: View {
         draft += 1
     }
 
+    private func closeChats() {
+        withAnimation(.snappy(duration: 0.28)) { showingChats = false }
+    }
+
     public var body: some View {
-        NavigationStack {
-            ConversationView(
-                session: session, chatID: chatID, models: models,
-                onNewChat: { startNewChat() })
-                .id("\(chatID ?? "new")-\(draft)")
-                .toolbar {
-                    ToolbarItem(placement: .navigation) {
-                        Button { showingChats = true } label: {
-                            Label("Chats", systemImage: "line.3.horizontal")
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                NavigationStack {
+                    ConversationView(
+                        session: session, chatID: chatID, models: models,
+                        onNewChat: { startNewChat() })
+                        .id("\(chatID ?? "new")-\(draft)")
+                        .toolbar {
+                            ToolbarItem(placement: .navigation) {
+                                Button { withAnimation(.snappy(duration: 0.28)) { showingChats = true } } label: {
+                                    Label("Chats", systemImage: "line.3.horizontal")
+                                }
+                            }
+                        }
+                }
+
+                if showingChats {
+                    // The rest of the screen, dimmed, and a tap on it closes.
+                    Color.black.opacity(0.45)
+                        .ignoresSafeArea()
+                        .contentShape(Rectangle())
+                        .onTapGesture { closeChats() }
+                        .transition(.opacity)
+
+                    // A drawer, not a push. The button that opens it is on the
+                    // left, so it has to arrive from the left: a list sliding in
+                    // from the right to answer a button in the opposite corner
+                    // reads as a mistake, and a sheet from below read as one too.
+                    // The conversation stays partly visible behind it, which is
+                    // what tells you this is an overlay and not another screen.
+                    NavigationStack {
+                        ChatListView(session: session) { picked in
+                            chatID = picked
+                            if picked == nil { startNewChat() }
+                            closeChats()
                         }
                     }
+                    .frame(width: proxy.size.width * 0.84)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .opaqueBackground()
+                    .shadow(color: .black.opacity(0.35), radius: 16, x: 6)
+                    .transition(.move(edge: .leading))
+                    // Drag it back shut the way you opened it; there is no nav bar
+                    // chevron here and a panel that only closes by finding the
+                    // dim strip on the right is annoying.
+                    .gesture(
+                        DragGesture()
+                            .onEnded { value in
+                                if value.translation.width < -50
+                                    || value.predictedEndTranslation.width < -160 {
+                                    closeChats()
+                                }
+                            }
+                    )
                 }
-                .navigationDestination(isPresented: $showingChats) {
-                    // Pushed rather than presented from below: the button that
-                    // opens it is top-left, and a list rising from the bottom to
-                    // answer a button in the corner reads as the wrong gesture
-                    // in the wrong direction. Sliding in from the right is what
-                    // "go to the other screen" means on this platform.
-                    ChatListView(session: session) { picked in
-                        chatID = picked
-                        if picked == nil { startNewChat() }
-                        showingChats = false
+            }
+            .animation(.snappy(duration: 0.28), value: showingChats)
+            // Swipe right from the left edge to open, the way every other drawer
+            // on the platform works. A simultaneous gesture rather than a
+            // high-priority one, so a vertical scroll inside the transcript still
+            // wins and the horizontal case is the only one that fires.
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 16)
+                    .onEnded { value in
+                        guard !showingChats,
+                            value.startLocation.x < 40,
+                            value.translation.width > 70,
+                            abs(value.translation.height) < 70
+                        else { return }
+                        withAnimation(.snappy(duration: 0.28)) { showingChats = true }
                     }
-                }
+            )
         }
         .task {
             // Cached first so the model chip is right on the first frame; the

@@ -8,6 +8,19 @@ import SwiftUI
 /// nav bar — and macOS simply does not. Everything else stays unguarded on
 /// purpose: if a modifier is available on both, use it on both.
 extension View {
+    /// An opaque background that follows the appearance on both platforms.
+    ///
+    /// Needed by the chat drawer, which floats over the conversation and must not
+    /// let it show through. `.background` and `.regularMaterial` are both
+    /// translucent, which looked like a rendering fault rather than a panel.
+    func opaqueBackground() -> some View {
+        #if os(iOS)
+        background(Color(uiColor: .systemBackground))
+        #else
+        background(Color(nsColor: .windowBackgroundColor))
+        #endif
+    }
+
     func inlineTitle(_ title: String) -> some View {
         #if os(iOS)
         navigationTitle(title).navigationBarTitleDisplayMode(.inline)
@@ -38,8 +51,12 @@ extension View {
     }
 
     func chatListStyle() -> some View {
+        // `.plain`, not `.insetGrouped`. The chat list lives in a drawer that is
+        // already a floating panel; putting a second rounded card inside it made
+        // the panel look like a rendering artefact rather than a menu, and the
+        // inset left a dead band down the right edge.
         #if os(iOS)
-        listStyle(.insetGrouped)
+        listStyle(.plain)
         #else
         listStyle(.inset)
         #endif
