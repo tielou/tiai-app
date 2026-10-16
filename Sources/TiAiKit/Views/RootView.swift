@@ -371,6 +371,12 @@ public struct ChatHomeView: View {
     @Bindable private var session: SessionStore
     @State private var models: [ChatModel] = []
     @State private var chatID: String?
+    /// Bumped every time a fresh chat is asked for. A new chat has no id, so
+    /// `chatID` alone cannot tell "a chat that has not been created yet" apart
+    /// from *that same* unsaved chat — and asking for another one while sitting in
+    /// one left the identity unchanged, so nothing was rebuilt and the screen just
+    /// kept showing the conversation you were already looking at.
+    @State private var draft = 0
     @State private var showingChats = false
 
     private var host: String { session.client.server.baseURL.host ?? "local" }
@@ -382,7 +388,7 @@ public struct ChatHomeView: View {
     public var body: some View {
         NavigationStack {
             ConversationView(session: session, chatID: chatID, models: models)
-                .id(chatID ?? "__new__")
+                .id("\(chatID ?? "new")-\(draft)")
                 .toolbar {
                     ToolbarItem(placement: .navigation) {
                         Button { showingChats = true } label: {
@@ -396,6 +402,9 @@ public struct ChatHomeView: View {
                     // bottom of the screen instead of under the title.
                     ChatListView(session: session) { picked in
                         chatID = picked
+                        // nil means "start another one", and on an unsaved chat
+                        // that is the only change there is to make — so make it.
+                        if picked == nil { draft += 1 }
                         showingChats = false
                     }
                 }
