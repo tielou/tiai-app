@@ -48,8 +48,17 @@ public struct ConversationView: View {
     /// model can do. Dropping this is how the model sheet renders empty.
     @State private var models: [ChatModel]
 
-    public init(session: SessionStore, chatID: String?, title: String = "New Chat", models: [ChatModel] = []) {
+    /// Starts another chat. Set when this view is the app's home rather than a
+    /// pushed screen; the alternative was opening the chat list and finding the
+    /// compose button in there, which is three taps to do the most common thing.
+    var onNewChat: (() -> Void)? = nil
+
+    public init(
+        session: SessionStore, chatID: String?, title: String = "New Chat",
+        models: [ChatModel] = [], onNewChat: (() -> Void)? = nil
+    ) {
         self.session = session
+        self.onNewChat = onNewChat
         self._models = State(initialValue: models)
         _conversation = State(
             initialValue: ConversationModel(
@@ -317,6 +326,14 @@ public struct ConversationView: View {
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
+            if let onNewChat {
+                Button(action: onNewChat) {
+                    Label("New chat", systemImage: "square.and.pencil")
+                }
+                // Already staring at an empty chat: the button would only clear a
+                // draft nobody asked to lose.
+                .disabled(conversation.turns.isEmpty && conversation.draft.isEmpty)
+            }
             if conversation.phase.isBusy {
                 Button {
                     conversation.stop()

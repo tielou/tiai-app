@@ -386,9 +386,18 @@ public struct ChatHomeView: View {
         self.session = session
     }
 
+    /// A fresh chat. `chatID` is already nil on one that has not been saved yet,
+    /// so the draft counter is what actually makes the view rebuild.
+    private func startNewChat() {
+        chatID = nil
+        draft += 1
+    }
+
     public var body: some View {
         NavigationStack {
-            ConversationView(session: session, chatID: chatID, models: models)
+            ConversationView(
+                session: session, chatID: chatID, models: models,
+                onNewChat: { startNewChat() })
                 .id("\(chatID ?? "new")-\(draft)")
                 .toolbar {
                     ToolbarItem(placement: .navigation) {
@@ -403,9 +412,7 @@ public struct ChatHomeView: View {
                     // bottom of the screen instead of under the title.
                     ChatListView(session: session) { picked in
                         chatID = picked
-                        // nil means "start another one", and on an unsaved chat
-                        // that is the only change there is to make — so make it.
-                        if picked == nil { draft += 1 }
+                        if picked == nil { startNewChat() }
                         showingChats = false
                     }
                 }
