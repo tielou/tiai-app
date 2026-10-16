@@ -132,22 +132,27 @@ public struct ConversationView: View {
             catch { chatToolsError = error.localizedDescription }
         }
         .onChange(of: scenePhase) { _, phase in
-            // iOS kills the socket on background anyway; saying so locally beats
-            // coming back to a spinner that has been dead for ten minutes.
-            if phase != .active { conversation.abandon() }
-            else {
-                Task {
-                    // The socket is gone after a background sojourn and nothing
-                    // else would notice until a send quietly streamed into the
-                    // void. Cheap when it is already up.
-                    await conversation.connect()
-                    // Coming back from a browser sign-in is the normal way this
-                    // changes: the tool said "not signed in", you signed in, and
-                    // the row should know that without a relaunch.
-                    if let tools = try? await session.client.chatTools() {
-                        chatTools = tools
-                        DiskCache.save(tools, key: DiskCache.key("tools", host: host))
-                    }
+            // Only act on coming back. `.inactive` is Control Centre, a pulled-down
+            // notification, or a glance at the app switcher — none of which kill the
+            // socket — and cancelling the run there is exactly what made the app
+            // shout "the server sent nothing" about a run that was still being
+            // written, leaving no option but to leave the chat and come back.
+            //
+            // `.background` is not handled either, on purpose. iOS may kill the
+            // socket, but the server keeps writing regardless, and the run's own
+            // reconciliation catches up on the record when the app returns.
+            guard phase == .active else { return }
+            Task {
+                // The socket is gone after a background sojourn and nothing
+                // else would notice until a send quietly streamed into the
+                // void. Cheap when it is already up.
+                await conversation.connect()
+                // Coming back from a browser sign-in is the normal way this
+                // changes: the tool said "not signed in", you signed in, and
+                // the row should know that without a relaunch.
+                if let tools = try? await session.client.chatTools() {
+                    chatTools = tools
+                    DiskCache.save(tools, key: DiskCache.key("tools", host: host))
                 }
             }
         }

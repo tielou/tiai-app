@@ -692,10 +692,17 @@ public final class ConversationModel {
                 // a broken one. The partial answer is the answer they got.
                 leafID = assistantID
             } else {
-                // No terminal frame at all: usually a socket blip rather than a
-                // failed run, so look before claiming "the server sent nothing"
-                // while it sent everything.
-                await refresh(messageID: assistantID)
+                // No terminal frame at all. Pulling down Control Centre for a
+                // second, or a quick app switch, kills the socket while the server
+                // carries on writing — and a single look at the record at that
+                // moment finds an empty message, which used to be reported as
+                // "the server sent nothing" while it was mid-sentence. That is the
+                // report of having to leave the chat and come back.
+                //
+                // So keep watching instead of guessing: this returns when the
+                // server closes the message, parks on a question, or the answer
+                // genuinely stops growing.
+                await reconcileUntilClosed(messageID: assistantID)
                 if turns.first(where: { $0.id == assistantID })?.text.isEmpty ?? true {
                     // The server's own reason beats our guess. "The server sent
                     // nothing" is true but useless next to "Empty reply from
