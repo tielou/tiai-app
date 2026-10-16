@@ -245,9 +245,10 @@ public struct ChatListView: View {
             .navigationDestination(for: String.self) { id in
                 ConversationView(session: session, chatID: id, models: models)
             }
-            // `.toolbar` rather than `.automatic`: on iOS 26 the automatic
-            // placement floats the field over the bottom of the list, which on a
-            // list shown in a sheet covers the last chat with no inset to clear it.
+            // Asked for the bar placement. iOS 26 still floats the field over
+            // the bottom of a list shown in a sheet regardless, so the list also
+            // reserves the space itself below; this is the intent, that is the
+            // workaround.
             .searchable(text: $query, placement: .toolbar)
             // The search field existed but nothing ever filled `searchResults`, so
             // typing anything produced an empty list — a control that only ever
