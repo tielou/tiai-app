@@ -287,6 +287,30 @@ public struct ConversationView: View {
                     proxy.scrollTo(BottomAnchor.id, anchor: .bottom)
                 }
             }
+            .overlay(alignment: .bottom) {
+                // Scrolled up to re-read something, there is no obvious way back:
+                // the newest message can be a screen and a half below the fold and
+                // nothing on screen says so. The dot only exists while it is true.
+                if !atBottom && !conversation.turns.isEmpty {
+                    Button {
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            proxy.scrollTo(BottomAnchor.id, anchor: .bottom)
+                        }
+                        atBottom = true
+                    } label: {
+                    Image(systemName: "arrow.down")
+                        .font(.system(size: 14, weight: .semibold))
+                        .frame(width: 36, height: 36)
+                        .background(.thinMaterial, in: .circle)
+                        .overlay(Circle().stroke(.quaternary))
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.bottom, 12)
+                    .accessibilityLabel("Scroll to the latest message")
+                    .transition(.opacity.combined(with: .scale(scale: 0.85)))
+                }
+            }
+            .animation(.snappy(duration: 0.18), value: atBottom)
         }
     }
 

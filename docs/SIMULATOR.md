@@ -5,43 +5,61 @@ obvious way to do it does not work, and the failure looks like a bug in the app.
 
 ## Coordinates
 
-The device screen is 390×844 pt; `simctl io screenshot` returns 1170×2532 (3×).
-The Simulator window adds chrome, so a screenshot pixel is not a screen pixel.
+Do not derive them from the window frame. Ask the Simulator where the device
+screen actually is — it is a group inside the window, and its origin already
+accounts for the chrome:
 
 ```bash
-osascript -e 'tell application "System Events" to tell process "Simulator" to get position of window 1'
-# → 878, 84   (measured once per session; the window moves between runs)
+osascript -e 'tell application "System Events" to tell process "Simulator" to get position of group 1 of window 1'
+# → 909, 168   (measured once per session; it moves between runs)
+
+screen_x = group_x + device_pt_x
+screen_y = group_y + device_pt_y
 ```
 
-With that window origin, the device screen starts at `origin + (31, 76)`:
+The device screen is 390×844 pt and the group is reported at exactly that size,
+so the scale is 1:1 and there is nothing else to work out. `simctl io
+screenshot` returns 1170×2532, so a screenshot pixel is `pt × 3`.
 
-```
-screen_x = win_x + 31 + device_pt_x
-screen_y = win_y + 76 + device_pt_y
-```
+The earlier recipe here used `window origin + (31, 76)`. That was close enough
+for a 44 pt button near the top and wrong by enough to miss the composer row
+repeatedly, which reads exactly like a dead button.
 
-Do not trust remembered coordinates. Measure the element in the screenshot and
-convert:
+Measure the element in the screenshot and convert rather than remembering
+numbers:
 
 ```python
-# knob centre of a toggle, in device points
-run = [x for x in range(850, 1160, 2) if min(px[x, y]) > 230]
+# The send button is the only saturated blue thing in the bottom band.
+xs = [x for ... if b > 200 and r < 100]
+centre_pt = (sum(xs) // len(xs) // 3, ...)
+```
+
+## Focus
+
+Clicks do nothing at all if the Simulator is not the frontmost app, and nothing
+says so. Before a sequence of taps:
+
+```bash
+osascript -e 'tell application "Simulator" to activate'
 ```
 
 ## Taps
 
-`cliclick c:x,y` sends a down and an up with no delay. **Buttons respond to it;
-`Toggle` switches do not.** A toggle silently ignores the tap, which looks
-exactly like a broken binding — several hours went into diagnosing a `Toggle`
-that was fine.
+`cliclick c:x,y` sends a down and an up with no delay. **Some controls respond
+to it and many do not** — toolbar buttons usually do, and sheet buttons, `Toggle`
+switches and gesture recognisers usually do not, silently, which looks exactly
+like a broken binding. Several hours went into diagnosing a `Toggle` that was
+fine.
 
-For anything that is not a plain button:
+Use press-and-release for everything:
 
 ```bash
-cliclick dd:x,y && sleep 0.25 && cliclick du:x,y
+cliclick m:x,y && sleep 0.3 && cliclick dd:x,y && sleep 0.3 && cliclick du:x,y
 ```
 
-Scroll with a drag: `dd:` → a few `dm:` steps → `du:`.
+Scrolling with `dd:` → `dm:` steps → `du:` did **not** work in a SwiftUI
+`ScrollView` in the last session that tried it: the content never moved. Assume
+scroll-driven states cannot be driven from the CLI and verify them another way.
 
 ## Text
 
@@ -51,7 +69,8 @@ Scroll with a drag: `dd:` → a few `dm:` steps → `du:`.
 xcrun simctl pbcopy $UDID < /tmp/text   # then Cmd+V
 ```
 
-Clear it afterwards — the pasteboard is shared with the host.
+The field has to have focus first, so tap it before pasting. Clear the
+pasteboard afterwards — it is shared with the host.
 
 ## When taps stop working entirely
 

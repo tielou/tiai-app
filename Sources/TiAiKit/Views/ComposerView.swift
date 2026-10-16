@@ -78,6 +78,10 @@ struct ComposerView: View {
             TextField("Message", text: $conversation.draft, axis: .vertical)
                 .lineLimit(1...8)
                 .focused($inputFocused)
+                // The key next to the draft should say what it does. With a
+                // hardware keyboard attached the plain Return also sends, which is
+                // what every other chat app on the platform does.
+                .submitLabel(.send)
                 .onSubmit { send() }
 
             #if os(iOS)

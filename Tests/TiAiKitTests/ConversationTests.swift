@@ -1421,6 +1421,21 @@ enum AskUserFixture {
     } ?? false, "dashes inside a sentence stay prose")
 }
 
+@Test func spacedRulesAreRulesToo() {
+    // `* * *` is the form models emit most often. It used to arrive as a bullet
+    // reading "* *", because the bullet test ran first and only matched the
+    // leading "* ".
+    func isRule(_ text: String) -> Bool {
+        Markdown.blocks(text).contains { if case .rule = $0 { return true }; return false }
+    }
+    for form in ["***", "* * *", "- - -", "___", "  ---  "] {
+        #expect(isRule(form), "\(form) should be a rule")
+    }
+    // Emphasis is not a rule, and a bullet is still a bullet.
+    #expect(!isRule("***bold***"))
+    #expect(!isRule("* just a point"))
+}
+
 @Test func taskListItemsCarryTheirState() {
     let blocks = Markdown.blocks("- [ ] book the ticket\n- [x] pack the bag")
     let tasks = blocks.compactMap { if case .task(let done, let text) = $0 { (done, text) } else { nil } }

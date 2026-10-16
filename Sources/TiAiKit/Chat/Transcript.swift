@@ -297,6 +297,15 @@ public enum Markdown {
         if hashes > 0, hashes <= 6, trimmed.dropFirst(hashes).hasPrefix(" ") {
             return .heading(level: hashes, text: String(trimmed.dropFirst(hashes + 1)))
         }
+        // `---`, `***`, `- - -` on their own line. Checked before the bullet, and
+        // spaces are ignored, because `* * *` is the form models emit most often
+        // and it otherwise arrived on screen as a bullet reading "* *".
+        // Three minimum, and nothing but dashes, asterisks or underscores, so a
+        // stray `--` in a sentence stays prose.
+        let squashed = trimmed.unicodeScalars.filter { !$0.properties.isWhitespace }
+        if squashed.count >= 3, squashed.allSatisfy({ $0 == "-" || $0 == "*" || $0 == "_" }) {
+            return .rule
+        }
         if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || trimmed.hasPrefix("+ ") {
             let body = String(trimmed.dropFirst(2))
             // Checked before the plain bullet, which would otherwise swallow it.
@@ -305,13 +314,6 @@ public enum Markdown {
                 return .task(done: true, text: String(body.dropFirst(4)))
             }
             return .bullet(text: body)
-        }
-        // `---` on its own line. Three minimum, and nothing but dashes, asterisks
-        // or underscores, so a stray `--` in a sentence stays prose.
-        if trimmed.count >= 3,
-            trimmed.allSatisfy({ $0 == "-" || $0 == "*" || $0 == "_" })
-        {
-            return .rule
         }
         if trimmed.hasPrefix("> ") { return .quote(text: String(trimmed.dropFirst(2))) }
         // `12. deal with it` — digits, a dot, a space.

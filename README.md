@@ -11,20 +11,26 @@ sign-in all work against a live server. See
 
 ## What is in it
 
+The app opens on a chat, not on a list of them: an empty one with a greeting, with
+your older conversations a tap away in a sheet that searches. Markdown renders
+headings, lists, quotes, rules, task lists and tables, and a web-search answer
+carries its sources, numbered to match the `[1]` markers in the text.
+
 Conversations stream token by token, with reasoning in a collapsed *Thoughts*
-section and a drawn cat while a slow model warms up. Markdown renders headings,
-lists, quotes and code, and a web-search answer carries its sources, numbered to
-match the `[1]` markers in the text.
+section and a drawn cat while a slow model warms up. Dictation records on the
+phone and transcribes on your server, so which model does that work stays a
+server setting. Long answers that end in a question from the model pause for an
+answer and then carry on.
 
 Attachments go both ways: camera, photo library and files from the phone, and a
-picture attached in the web UI renders here too. Messages can be edited and
-resent, regenerated answers become siblings you page through, and answers can be
-rated.
+picture attached in the web UI renders here too, full-screen on tap. Messages can
+be edited and resent, regenerated answers become siblings you page through, and
+answers can be rated.
 
 Tools come from the server rather than being compiled in — whatever MCP servers
 the instance has are listed, and one that needs signing in opens the sign-in in
-app. Notes are the server's notes: list, read, edit, create, delete, shared with
-the web UI. Memory is read from the server too.
+app and switches itself on when it succeeds. Notes and memory are the server's:
+list, read, edit, create and delete from either side, shared with the web UI.
 
 Dark mode, iPad and iPhone, and no telemetry of any kind.
 

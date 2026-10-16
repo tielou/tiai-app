@@ -72,13 +72,22 @@ public final class VoiceRecorder {
     // MARK: - recording
 
     private func begin() async {
-        guard AVAudioApplication.shared.recordPermission == .granted else {
+        // Said out loud while the permission prompt is up. Without it the button
+        // sat inert for the second or two the system dialog takes, which reads as
+        // a tap that did nothing.
+        phase = .starting
+        defer { if phase == .starting { phase = .idle } }
+
+        if AVAudioApplication.shared.recordPermission != .granted {
             let granted = await AVAudioApplication.requestRecordPermission()
             guard granted else {
+                phase = .idle
                 note(.failed("Microphone access is off — enable it in Settings."))
                 return
             }
-            return  // The prompt just appeared; a second tap starts the recording.
+            // Started straight away. Making the user tap a second time after
+            // saying yes felt broken: the first tap appeared to do nothing, and
+            // there was nothing on screen to say why a second one was needed.
         }
         await startRecording()
     }

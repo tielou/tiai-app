@@ -88,14 +88,21 @@ public struct Note: Codable, Equatable, Sendable, Identifiable {
         data?["content"]?["md"]?.stringValue ?? ""
     }
 
-    /// A one-line preview for the list, first non-empty line of the body.
+    /// A one-line preview for the list: the first line of the body that says
+    /// something the title did not already say.
+    ///
+    /// Notes usually open by repeating their own title as a heading, which made
+    /// every row read the same thing twice.
     public var preview: String {
-        markdown
+        let lines = markdown
             .split(separator: "\n", omittingEmptySubsequences: true)
-            .drop(while: { $0.trimmingCharacters(in: .whitespaces).isEmpty })
-            .first
             .map { $0.replacingOccurrences(of: "#", with: "").trimmingCharacters(in: .whitespaces) }
-            ?? "Empty note"
+            .filter { !$0.isEmpty && $0 != "***" && $0 != "---" }
+        let heading = title.trimmingCharacters(in: .whitespaces)
+        if let first = lines.first, first == heading {
+            return lines.dropFirst().first ?? "Empty note"
+        }
+        return lines.first ?? "Empty note"
     }
 
     /// The payload for a save: only `content.md`, so the rich-editor document the
