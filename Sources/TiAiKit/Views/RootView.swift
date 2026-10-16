@@ -131,8 +131,6 @@ public struct ChatListView: View {
     /// Nil keeps the old pushed-onto-a-stack behaviour for any other host.
     var onPick: ((String?) -> Void)? = nil
 
-    @Environment(\.dismiss) private var dismiss
-
     /// The row's content, shared by the pushed and the picking presentations.
     @ViewBuilder private func rowLabel(_ chat: ChatSummary) -> some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -181,171 +179,164 @@ public struct ChatListView: View {
     }
 
     public var body: some View {
-        NavigationStack {
-            Group {
-                if chats.isLoading && chats.data == nil {
-                    ContentUnavailableView("Loading…", systemImage: "ellipsis")
-                } else if let error = chats.error, chats.data == nil {
-                    ContentUnavailableView {
-                        Label("Could not load your chats", systemImage: "wifi.exclamationmark")
-                    } description: {
-                        Text(error.localizedDescription)
-                    } actions: {
-                        Button("Retry") { Task { await chats.refresh() } }
+        Group {
+            if chats.isLoading && chats.data == nil {
+                ContentUnavailableView("Loading…", systemImage: "ellipsis")
+            } else if let error = chats.error, chats.data == nil {
+                ContentUnavailableView {
+                    Label("Could not load your chats", systemImage: "wifi.exclamationmark")
+                } description: {
+                    Text(error.localizedDescription)
+                } actions: {
+                    Button("Retry") { Task { await chats.refresh() } }
+                }
+            } else {
+                List {
+                    ForEach(visible) { chat in
+                        Group {
+                            if let onPick {
+                                Button { onPick(chat.id) } label: { rowLabel(chat) }
+                                    .buttonStyle(.plain)
+                            } else {
+                                NavigationLink(value: chat.id) { rowLabel(chat) }
+                            }
+                        }
+                        .swipeActions(edge: .trailing) {
+                            // Not `role: .destructive`: that makes SwiftUI
+                            // slide the row out the instant it is tapped,
+                            // before the server has agreed to anything, so a
+                            // failed delete left a row that had already
+                            // vanished. The row now leaves when the list comes
+                            // back without it.
+                            Button {
+                                delete(chat)
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                            .tint(.red)
+                        }
+                    }
+                }
+                .chatListStyle()
+                // iOS 26 floats the search field over the bottom of the list
+                // and does not inset the content for it, so the last chat sat
+                // permanently under the field. Reserve the space by hand.
+                .contentMargins(.bottom, 64, for: .scrollContent)
+                .overlay {
+                    if deleting != nil {
+                        ProgressView().controlSize(.large)
+                            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    }
+                }
+                .alert("Could not delete the chat", isPresented: Binding(
+                    get: { deleteFailed != nil },
+                    set: { if !$0 { deleteFailed = nil } })
+                ) {
+                    Button("OK", role: .cancel) { deleteFailed = nil }
+                } message: {
+                    Text(deleteFailed ?? "")
+                }
+            }
+        }
+        .inlineTitle("Chats")
+        .navigationDestination(for: String.self) { id in
+            ConversationView(session: session, chatID: id, models: models)
+        }
+        // Left at the system placement on purpose. Asking for `.toolbar` did not
+        // move the field on iOS 26 — it floats over the bottom of the list either
+        // way — but it did reserve a band of empty space under the title for a bar
+        // that was not going to appear there.
+        .searchable(text: $query)
+        // The search field existed but nothing ever filled `searchResults`, so
+        // typing anything produced an empty list — a control that only ever
+        // answered "nothing found". Debounced, because one request per
+        // keystroke against a home server is rude and the results are the same.
+        .task(id: query) {
+            guard !query.isEmpty else {
+                searchResults = []
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            let text = query
+            if let found = try? await session.client.searchChats(text), !Task.isCancelled {
+                searchResults = found
+            }
+        }
+        .refreshable { await chats.refresh() }
+        .task {
+            // Cached first, network second: the list and the model name come
+            // up at once and correct themselves a moment later, instead of
+            // the app looking broken while a slow server thinks.
+            if models.isEmpty,
+               let cached = DiskCache.load([ChatModel].self,
+                                           key: DiskCache.key("models", host: host)) {
+                models = cached
+            }
+            await chats.refresh()
+            if let fresh = try? await session.client.models(), !fresh.isEmpty {
+                models = fresh
+                DiskCache.save(fresh, key: DiskCache.key("models", host: host))
+            }
+            #if DEBUG
+            // Diagnostics only, and only with the dump directory set. Fetching
+            // the newest chat means its stored payload lands on disk without
+            // anyone having to tap anything — which matters when the thing
+            // under investigation is a message the app rendered wrongly and
+            // the only copy is on the server.
+            if ProcessInfo.processInfo.environment["TIAI_DEBUG_DUMP"] != nil {
+                for chat in chats.data?.prefix(5) ?? [] {
+                    _ = try? await session.client.chat(id: chat.id)
+                }
+            }
+            #endif
+        }
+        .toolbar {
+            // No explicit close button: the list is pushed now, so the navigation
+            // bar already carries a way back.
+            ToolbarItem(placement: .primaryAction) {
+                if let onPick {
+                    Button {
+                        // nil means "start another one"; the home view treats
+                        // it as a fresh chat.
+                        onPick(nil)
+                    } label: {
+                        Label("New chat", systemImage: "square.and.pencil")
                     }
                 } else {
-                    List {
-                        ForEach(visible) { chat in
-                            Group {
-                                if let onPick {
-                                    Button { onPick(chat.id) } label: { rowLabel(chat) }
-                                        .buttonStyle(.plain)
-                                } else {
-                                    NavigationLink(value: chat.id) { rowLabel(chat) }
-                                }
-                            }
-                            .swipeActions(edge: .trailing) {
-                                // Not `role: .destructive`: that makes SwiftUI
-                                // slide the row out the instant it is tapped,
-                                // before the server has agreed to anything, so a
-                                // failed delete left a row that had already
-                                // vanished. The row now leaves when the list comes
-                                // back without it.
-                                Button {
-                                    delete(chat)
-                                } label: {
-                                    Label("Delete", systemImage: "trash")
-                                }
-                                .tint(.red)
-                            }
-                        }
-                    }
-                    .chatListStyle()
-                    // iOS 26 floats the search field over the bottom of the list
-                    // and does not inset the content for it, so the last chat sat
-                    // permanently under the field. Reserve the space by hand.
-                    .contentMargins(.bottom, 64, for: .scrollContent)
-                    .overlay {
-                        if deleting != nil {
-                            ProgressView().controlSize(.large)
-                                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
-                        }
-                    }
-                    .alert("Could not delete the chat", isPresented: Binding(
-                        get: { deleteFailed != nil },
-                        set: { if !$0 { deleteFailed = nil } })
-                    ) {
-                        Button("OK", role: .cancel) { deleteFailed = nil }
-                    } message: {
-                        Text(deleteFailed ?? "")
-                    }
-                }
-            }
-            .navigationTitle("Chats")
-            .navigationDestination(for: String.self) { id in
-                ConversationView(session: session, chatID: id, models: models)
-            }
-            // Asked for the bar placement. iOS 26 still floats the field over
-            // the bottom of a list shown in a sheet regardless, so the list also
-            // reserves the space itself below; this is the intent, that is the
-            // workaround.
-            .searchable(text: $query, placement: .toolbar)
-            // The search field existed but nothing ever filled `searchResults`, so
-            // typing anything produced an empty list — a control that only ever
-            // answered "nothing found". Debounced, because one request per
-            // keystroke against a home server is rude and the results are the same.
-            .task(id: query) {
-                guard !query.isEmpty else {
-                    searchResults = []
-                    return
-                }
-                try? await Task.sleep(for: .milliseconds(250))
-                guard !Task.isCancelled else { return }
-                let text = query
-                if let found = try? await session.client.searchChats(text), !Task.isCancelled {
-                    searchResults = found
-                }
-            }
-            .refreshable { await chats.refresh() }
-            .task {
-                // Cached first, network second: the list and the model name come
-                // up at once and correct themselves a moment later, instead of
-                // the app looking broken while a slow server thinks.
-                if models.isEmpty,
-                   let cached = DiskCache.load([ChatModel].self,
-                                               key: DiskCache.key("models", host: host)) {
-                    models = cached
-                }
-                await chats.refresh()
-                if let fresh = try? await session.client.models(), !fresh.isEmpty {
-                    models = fresh
-                    DiskCache.save(fresh, key: DiskCache.key("models", host: host))
-                }
-                #if DEBUG
-                // Diagnostics only, and only with the dump directory set. Fetching
-                // the newest chat means its stored payload lands on disk without
-                // anyone having to tap anything — which matters when the thing
-                // under investigation is a message the app rendered wrongly and
-                // the only copy is on the server.
-                if ProcessInfo.processInfo.environment["TIAI_DEBUG_DUMP"] != nil {
-                    for chat in chats.data?.prefix(5) ?? [] {
-                        _ = try? await session.client.chat(id: chat.id)
-                    }
-                }
-                #endif
-            }
-            .toolbar {
-                // Presented over a chat, the list needs a way back that is not a
-                // swipe gesture nobody thinks to try.
-                if onPick != nil {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Done") { dismiss() }
-                    }
-                }
-                ToolbarItem(placement: .primaryAction) {
-                    if let onPick {
-                        Button {
-                            // nil means "start another one"; the home view treats
-                            // it as a fresh chat.
-                            onPick(nil)
-                        } label: {
-                            Label("New chat", systemImage: "square.and.pencil")
-                        }
-                    } else {
-                        NavigationLink {
-                            ConversationView(session: session, chatID: nil, models: models)
-                        } label: {
-                            Label("New chat", systemImage: "square.and.pencil")
-                        }
-                    }
-                }
-                // `.navigation` rather than `.topBarLeading`: the kit builds for
-                // macOS too, where the latter does not exist.
-                ToolbarItem(placement: .navigation) {
-                    AppearancePicker()
-                }
-                ToolbarItem(placement: .primaryAction) {
                     NavigationLink {
-                        NotesView(client: session.client)
+                        ConversationView(session: session, chatID: nil, models: models)
                     } label: {
-                        Label("Notes", systemImage: "note.text")
-                    }
-                }
-                ToolbarItem(placement: .primaryAction) {
-                    Button { showingMemory = true } label: {
-                        Label("Memory", systemImage: "brain")
+                        Label("New chat", systemImage: "square.and.pencil")
                     }
                 }
             }
-            .sheet(isPresented: $showingMemory) {
-                MemorySheet(client: session.client)
+            // `.navigation` rather than `.topBarLeading`: the kit builds for
+            // macOS too, where the latter does not exist.
+            ToolbarItem(placement: .navigation) {
+                AppearancePicker()
             }
-            .overlay {
-                if chats.unauthorized {
-                    ContentUnavailableView(
-                        "Signed out", systemImage: "lock",
-                        description: Text("The server no longer recognises this device."))
+            ToolbarItem(placement: .primaryAction) {
+                NavigationLink {
+                    NotesView(client: session.client)
+                } label: {
+                    Label("Notes", systemImage: "note.text")
                 }
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button { showingMemory = true } label: {
+                    Label("Memory", systemImage: "brain")
+                }
+            }
+        }
+        .sheet(isPresented: $showingMemory) {
+            MemorySheet(client: session.client)
+        }
+        .overlay {
+            if chats.unauthorized {
+                ContentUnavailableView(
+                    "Signed out", systemImage: "lock",
+                    description: Text("The server no longer recognises this device."))
             }
         }
     }
@@ -406,10 +397,12 @@ public struct ChatHomeView: View {
                         }
                     }
                 }
-                .sheet(isPresented: $showingChats) {
-                    // No NavigationStack here: ChatListView brings its own, and
-                    // nesting one inside another put its search field at the
-                    // bottom of the screen instead of under the title.
+                .navigationDestination(isPresented: $showingChats) {
+                    // Pushed rather than presented from below: the button that
+                    // opens it is top-left, and a list rising from the bottom to
+                    // answer a button in the corner reads as the wrong gesture
+                    // in the wrong direction. Sliding in from the right is what
+                    // "go to the other screen" means on this platform.
                     ChatListView(session: session) { picked in
                         chatID = picked
                         if picked == nil { startNewChat() }

@@ -211,6 +211,9 @@ public struct ConversationView: View {
                                 ? { conversation.edit(messageID: turn.id, text: $0) } : nil,
                             onRate: turn.isAssistant && !turn.streaming
                                 ? { conversation.rate(messageID: turn.id, rating: $0) } : nil,
+                            onRegenerate: turn.isAssistant && !turn.streaming
+                                && conversation.turns.last?.id == turn.id
+                                ? { conversation.regenerate() } : nil,
                             rating: conversation.ratings[turn.id],
                             sibling: conversation.siblingPage(of: turn.id),
                             onSibling: { conversation.selectSibling(of: turn.id, direction: $0) },
@@ -334,6 +337,23 @@ public struct ConversationView: View {
                 // draft nobody asked to lose.
                 .disabled(conversation.turns.isEmpty && conversation.draft.isEmpty)
             }
+            // The one setting that decides whether this conversation is kept at
+            // all. It spent a while inside the `+` sheet and then in the composer
+            // row; both put it where you only look for it after the fact.
+            Button { conversation.incognito.toggle() } label: {
+                Label(
+                    "Incognito",
+                    systemImage: conversation.incognito ? "eye.slash.fill" : "eye.slash")
+            }
+            // Turning it on halfway through a saved chat cannot undo the messages
+            // already written, and turning it off cannot bring a discarded chat
+            // back. So it is a choice for the start of a conversation, which is
+            // also how the web UI treats it.
+            .disabled(!conversation.canChangeIncognito)
+            .accessibilityLabel(
+                conversation.incognito
+                    ? "Incognito is on. This chat is not saved to your history."
+                    : "Incognito is off. Tap to stop saving this chat to your history.")
             if conversation.phase.isBusy {
                 Button {
                     conversation.stop()
@@ -341,13 +361,6 @@ public struct ConversationView: View {
                     Label("Stop", systemImage: "stop.circle.fill")
                 }
                 .tint(.red)
-            } else {
-                Button {
-                    conversation.regenerate()
-                } label: {
-                    Label("Regenerate", systemImage: "arrow.clockwise")
-                }
-                .disabled(!conversation.turns.contains(where: \.isUser))
             }
         }
     }
@@ -390,6 +403,12 @@ struct MessageRow: View {
     var onEdit: ((String) -> Void)? = nil
     /// Thumbs this answer up or down.
     var onRate: ((Int) -> Void)? = nil
+    /// Runs the question again. Only the last answer can be re-run — anything
+    /// earlier would silently orphan everything below it — so this is nil on most
+    /// rows. It lives here rather than in the top bar because it belongs to the
+    /// answer it replaces, and a bar button that only works on the newest reply
+    /// is a coin flip.
+    var onRegenerate: (() -> Void)? = nil
     var rating: Int? = nil
     /// Which sibling answer this branch is on, when there is more than one.
     var sibling: (index: Int, total: Int)? = nil
@@ -623,6 +642,14 @@ struct MessageRow: View {
                 }
                 Spacer()
                 if onRate != nil, !turn.text.isEmpty { ratingRow }
+                if let onRegenerate {
+                    Button(action: onRegenerate) {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.tertiary)
+                    .accessibilityLabel("Try again")
+                }
                 Button {
                     #if os(iOS)
                     UIPasteboard.general.string = turn.text

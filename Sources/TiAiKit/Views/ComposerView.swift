@@ -101,7 +101,6 @@ struct ComposerView: View {
                 modelChip
                 Spacer(minLength: 4)
                 if conversation.uploading { ProgressView().controlSize(.small) }
-                incognitoChip
                 #if os(iOS)
                 micControls
                 #endif
@@ -408,39 +407,6 @@ struct ComposerView: View {
         .buttonStyle(.plain)
         .disabled(!conversation.phase.isBusy && !conversation.canSend)
         .accessibilityLabel(conversation.phase.isBusy ? "Stop" : "Send")
-    }
-
-    /// Incognito, where you can actually see it.
-    ///
-    /// It used to live only inside the `+` sheet, which is a strange place to hide
-    /// the one setting that decides whether the conversation is saved at all — you
-    /// either never notice it or go looking for it mid-chat. A mask next to the
-    /// model chip is visible at a glance and one tap from the keyboard.
-    private var incognitoChip: some View {
-        Button { conversation.incognito.toggle() } label: {
-            // `mask` is not an SF Symbol (it is `facemask`), so the earlier version
-            // of this drew an empty circle. `eye.slash` is older, always present,
-            // and says "this is not being watched or kept", which is the setting.
-            Image(systemName: conversation.incognito ? "eye.slash.fill" : "eye.slash")
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(conversation.incognito ? Color.primary : Color.secondary)
-                .frame(width: 34, height: 34)
-                .background(
-                    conversation.incognito
-                        ? AnyShapeStyle(.quaternary.opacity(0.95))
-                        : AnyShapeStyle(.quaternary.opacity(0.4)),
-                    in: .circle)
-        }
-        .buttonStyle(.plain)
-        // Turning it on halfway through a saved chat cannot undo the messages
-        // already written, and turning it off cannot bring a discarded chat back.
-        // So it is a choice for the start of a conversation, which is also how the
-        // web UI treats it.
-        .disabled(!conversation.canChangeIncognito)
-        .accessibilityLabel(
-            conversation.incognito
-                ? "Incognito is on. This chat is not saved to your history."
-                : "Incognito is off. Tap to stop saving this chat to your history.")
     }
 
     /// The model, always visible, and the way into the model sheet.
