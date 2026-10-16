@@ -445,14 +445,13 @@ public struct ChatHomeView: View {
                             closeChats()
                         }
                     }
-                    .frame(width: proxy.size.width * 0.84)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    // Background and shadow before the width frames, not after.
+                    // Applied to the full-width positioning frame they painted the
+                    // panel across the entire screen: the dim strip was covered,
+                    // and the tap that should have closed the drawer landed on the
+                    // drawer's own background instead of the scrim behind it.
                     .opaqueBackground()
                     .shadow(color: .black.opacity(0.35), radius: 16, x: 6)
-                    .transition(.move(edge: .leading))
-                    // Drag it back shut the way you opened it; there is no nav bar
-                    // chevron here and a panel that only closes by finding the
-                    // dim strip on the right is annoying.
                     .gesture(
                         DragGesture()
                             .onEnded { value in
@@ -462,6 +461,9 @@ public struct ChatHomeView: View {
                                 }
                             }
                     )
+                    .frame(width: proxy.size.width * 0.84)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .transition(.move(edge: .leading))
                 }
             }
             .animation(.snappy(duration: 0.28), value: showingChats)
