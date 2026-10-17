@@ -134,6 +134,12 @@ public struct ChatListView: View {
     /// When set, a "Chats" row in the list opens the whole thing full screen.
     var onExpand: (() -> Void)? = nil
 
+    /// Whether the Notes and Memory rows belong here.
+    ///
+    /// Off in the full-screen chat list: you tapped "Chats" to look at chats, and
+    /// being handed the menu again in a bigger font is not what you asked for.
+    var showsLibrary = true
+
     /// Bumped by the host to ask for a refresh. A chat started on this phone does
     /// not exist in the list until something asks again, and the drawer is now
     /// permanently mounted so its own `.task` only ever runs once.
@@ -206,12 +212,14 @@ public struct ChatListView: View {
         onOpenNotes: (() -> Void)? = nil,
         onExpand: (() -> Void)? = nil,
         refreshBadge: Int = 0,
+        showsLibrary: Bool = true,
         onPick: ((String?) -> Void)? = nil
     ) {
         self.session = session
         self.onOpenNotes = onOpenNotes
         self.onExpand = onExpand
         self.refreshBadge = refreshBadge
+        self.showsLibrary = showsLibrary
         self.onPick = onPick
         #if os(iOS)
         // The system's 34pt large title is sized for a title labelling a whole
@@ -249,28 +257,30 @@ public struct ChatListView: View {
                     // the rows were better: two labels with icons in a list is
                     // what every iOS sidebar does, and the pills drew more
                     // attention to themselves than to what they open.
-                    Section {
-                        // Only offered where it is not self-referential: in the
-                        // full-screen list this row would open the screen you are
-                        // already on.
-                        if let onExpand {
-                            Button(action: onExpand) {
-                                Label("Chats", systemImage: "bubble.left.and.bubble.right")
+                    if showsLibrary {
+                        Section {
+                            // Only offered where it is not self-referential: in the
+                            // full-screen list this row would open the screen you are
+                            // already on.
+                            if let onExpand {
+                                Button(action: onExpand) {
+                                    Label("Chats", systemImage: "bubble.left.and.bubble.right")
+                                }
                             }
-                        }
-                        if let onOpenNotes {
-                            Button(action: onOpenNotes) {
-                                Label("Notes", systemImage: "note.text")
+                            if let onOpenNotes {
+                                Button(action: onOpenNotes) {
+                                    Label("Notes", systemImage: "note.text")
+                                }
+                            } else {
+                                NavigationLink {
+                                    NotesView(client: session.client)
+                                } label: {
+                                    Label("Notes", systemImage: "note.text")
+                                }
                             }
-                        } else {
-                            NavigationLink {
-                                NotesView(client: session.client)
-                            } label: {
-                                Label("Notes", systemImage: "note.text")
+                            Button { showingMemory = true } label: {
+                                Label("Memory", systemImage: "brain.head.profile")
                             }
-                        }
-                        Button { showingMemory = true } label: {
-                            Label("Memory", systemImage: "brain.head.profile")
                         }
                     }
 
@@ -323,7 +333,7 @@ public struct ChatListView: View {
                 }
             }
         }
-        .navigationTitle("tiAi")
+        .navigationTitle(showsLibrary ? "tiAi" : "Chats")
         .navigationDestination(for: String.self) { id in
             ConversationView(session: session, chatID: id, models: models)
         }
@@ -577,7 +587,8 @@ public struct ChatHomeView: View {
                             ChatListView(
                                 session: session,
                                 onOpenNotes: { fullscreen = .notes },
-                                refreshBadge: refreshBadge
+                                refreshBadge: refreshBadge,
+                                showsLibrary: false
                             ) { picked in
                                 chatID = picked
                                 if picked == nil { startNewChat() }
