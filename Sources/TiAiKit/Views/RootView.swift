@@ -145,6 +145,13 @@ public struct ChatListView: View {
     /// permanently mounted so its own `.task` only ever runs once.
     var refreshBadge: Int = 0
 
+    /// Called after the server has agreed to a delete, with the id.
+    ///
+    /// Deleting the conversation you are standing in used to leave you standing in
+    /// it: the row vanished from the list, the transcript stayed on screen, and
+    /// sending into it wrote to a chat that no longer existed.
+    var onDeleted: ((String) -> Void)? = nil
+
     /// Declared last so the trailing closure at every call site still lands here.
     ///
     /// When set, tapping a chat calls this instead of pushing a conversation.
@@ -200,6 +207,7 @@ public struct ChatListView: View {
                 // locally removed row that the server still has reappears on the
                 // next refresh looking like a bug.
                 await chats.refresh()
+                onDeleted?(chat.id)
             } catch {
                 deleteFailed = error.localizedDescription
             }
@@ -213,6 +221,7 @@ public struct ChatListView: View {
         onExpand: (() -> Void)? = nil,
         refreshBadge: Int = 0,
         showsLibrary: Bool = true,
+        onDeleted: ((String) -> Void)? = nil,
         onPick: ((String?) -> Void)? = nil
     ) {
         self.session = session
@@ -220,6 +229,7 @@ public struct ChatListView: View {
         self.onExpand = onExpand
         self.refreshBadge = refreshBadge
         self.showsLibrary = showsLibrary
+        self.onDeleted = onDeleted
         self.onPick = onPick
         #if os(iOS)
         // The system's 34pt large title is sized for a title labelling a whole
@@ -503,6 +513,16 @@ public struct ChatHomeView: View {
         refreshBadge += 1
     }
 
+    /// A chat the server has just removed. If it is the one on screen, leave it —
+    /// staying in a deleted conversation means the next message goes somewhere
+    /// that no longer exists, and the transcript on screen is a copy of nothing.
+    private func chatWasDeleted(_ id: String) {
+        guard id == chatID else { return }
+        startNewChat()
+        fullscreen = nil
+        closeChats()
+    }
+
     public var body: some View {
         GeometryReader { proxy in
             let panelWidth = proxy.size.width * 0.84
@@ -544,7 +564,8 @@ public struct ChatHomeView: View {
                         session: session,
                         onOpenNotes: { fullscreen = .notes },
                         onExpand: { fullscreen = .chats },
-                        refreshBadge: refreshBadge
+                        refreshBadge: refreshBadge,
+                        onDeleted: { chatWasDeleted($0) }
                     ) { picked in
                         chatID = picked
                         if picked == nil { startNewChat() }
@@ -588,7 +609,8 @@ public struct ChatHomeView: View {
                                 session: session,
                                 onOpenNotes: { fullscreen = .notes },
                                 refreshBadge: refreshBadge,
-                                showsLibrary: false
+                                showsLibrary: false,
+                                onDeleted: { chatWasDeleted($0) }
                             ) { picked in
                                 chatID = picked
                                 if picked == nil { startNewChat() }
