@@ -29,6 +29,17 @@ struct OAuthWebView: View {
 
     @State private var whereAmI: String?
     @State private var failure: String?
+    /// The host the hand-off is currently sitting on, when that is not the server
+    /// you configured. See the banner below.
+    @State private var foreign: String?
+
+    /// The host the browser is on, if it is not the configured server. `onURL`
+    /// hands over `host/path`, which is what the status strip shows.
+    private static func foreignHost(_ shown: String, configured: String) -> String? {
+        guard let host = shown.split(separator: "/").first.map(String.init),
+              !host.isEmpty, host != configured else { return nil }
+        return host
+    }
 
     var body: some View {
         NavigationStack {
@@ -44,9 +55,26 @@ struct OAuthWebView: View {
                         .padding(.horizontal, 12).padding(.vertical, 6)
                         .background(.orange.opacity(0.12))
                 }
+                // A tool served by an MCP gateway needs a sign-in at *that*
+                // gateway, not at Open WebUI, and nothing on the page says so —
+                // it just shows someone else's login form and looks like a broken
+                // button. Naming the host turns a mystery into a task.
+                if let foreign {
+                    Label(
+                        "This tool is served by \(foreign), which asks for its own "
+                        + "sign-in — not your \(domain) password.",
+                        systemImage: "person.badge.key"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(.quaternary.opacity(0.5))
+                }
                 SessionBrowser(
                     url: url, token: token, domain: domain,
-                    onURL: { whereAmI = $0 }, onFailed: { failure = $0 }
+                    onURL: { whereAmI = $0; foreign = Self.foreignHost($0, configured: domain) },
+                    onFailed: { failure = $0 }
                 ) {
                     onFinished(true)
                     dismiss()
