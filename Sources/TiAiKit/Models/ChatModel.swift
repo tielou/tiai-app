@@ -69,6 +69,11 @@ public struct ChatModel: Codable, Equatable, Sendable, Identifiable {
     public var supportsWebSearch: Bool { supports("web_search") }
     public var supportsMemory: Bool { supports("memory") }
     public var supportsCodeInterpreter: Bool { supports("code_interpreter") }
+    /// The capability that actually means "this model can be given a terminal".
+    /// `code_interpreter` is a different, Jupyter-shaped thing and the models
+    /// here report it false while still being the ones the web UI runs shell
+    /// commands with — `terminal` is the honest flag.
+    public var supportsTerminal: Bool { supports("terminal") }
     public var supportsImageGeneration: Bool { supports("image_generation") }
     public var supportsFileUpload: Bool { supports("file_upload") }
     /// Whether the server will emit status events for this model at all.
@@ -85,7 +90,10 @@ public struct ChatModel: Codable, Equatable, Sendable, Identifiable {
         return switch feature {
         case .webSearch: supportsWebSearch
         case .memory: supportsMemory
-        case .codeInterpreter: supportsCodeInterpreter
+        // The toggle enables the terminal sandbox, so it is offered wherever the
+        // model can have one. Checking only `code_interpreter` hid it from
+        // `local-personal`, which reports that false and runs commands all day.
+        case .codeInterpreter: supportsTerminal || supportsCodeInterpreter
         case .imageGeneration: supportsImageGeneration
         }
     }
@@ -137,7 +145,7 @@ public enum ChatFeature: String, CaseIterable, Codable, Sendable {
         switch self {
         case .webSearch: "Web search"
         case .memory: "Memory"
-        case .codeInterpreter: "Code interpreter"
+        case .codeInterpreter: "Code execution"
         case .imageGeneration: "Image generation"
         }
     }

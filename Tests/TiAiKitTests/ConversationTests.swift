@@ -1668,3 +1668,22 @@ enum AskUserFixture {
     #expect(seeded["code_interpreter"] == nil)
     #expect(seeded["memory"] == nil)
 }
+
+/// `local-personal` reports `code_interpreter: false` and `terminal: true`, and
+/// it is the model the web UI runs shell commands with. Gating the toggle on
+/// `code_interpreter` alone told the user code execution was unavailable for a
+/// model that had been using it all along.
+@Test @MainActor func terminalCapabilityIsWhatOffersCodeExecution() {
+    let model = ChatModel.stub(
+        "local-personal",
+        caps: ["terminal": true, "code_interpreter": false, "memory": true])
+    #expect(model.supports(.codeInterpreter))
+    #expect(ConversationModel.seedFeatures(for: model)[ChatFeature.codeInterpreter.rawValue] == true)
+}
+
+/// A model that reports neither flag gets no toggle.
+@Test @MainActor func noTerminalMeansNoCodeExecutionToggle() {
+    let model = ChatModel.stub("local-fast", caps: ["terminal": false, "code_interpreter": false])
+    #expect(!model.supports(.codeInterpreter))
+    #expect(ConversationModel.seedFeatures(for: model)[ChatFeature.codeInterpreter.rawValue] == nil)
+}
