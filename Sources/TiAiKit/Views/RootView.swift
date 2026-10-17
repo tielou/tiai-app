@@ -120,10 +120,6 @@ public struct ChatListView: View {
     @State private var query = ""
     @State private var searchResults: [ChatSummary] = []
     @State private var showingMemory = false
-    /// Notes opens through a destination rather than a NavigationLink: the link
-    /// draws its own disclosure chevron wherever it likes, and between two pills
-    /// it looked like a third, broken control.
-    @State private var showingNotes = false
     @Environment(\.scenePhase) private var scenePhase
     /// Set while a delete is in flight, so the list says so rather than sitting
     /// on a row that is already gone server-side.
@@ -137,18 +133,6 @@ public struct ChatListView: View {
     var onPick: ((String?) -> Void)? = nil
 
     /// The row's content, shared by the pushed and the picking presentations.
-    /// A pill for the two things in the drawer that are not chats.
-    private func drawerChip(_ symbol: String, _ title: String) -> some View {
-        Label(title, systemImage: symbol)
-            .font(.subheadline.weight(.medium))
-            .foregroundStyle(.primary)
-            .lineLimit(1)
-            .minimumScaleFactor(0.8)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 9)
-            .background(Color(.tertiarySystemFill), in: Capsule())
-    }
-
     @ViewBuilder private func rowLabel(_ chat: ChatSummary) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
@@ -205,6 +189,14 @@ public struct ChatListView: View {
     public init(session: SessionStore, onPick: ((String?) -> Void)? = nil) {
         self.session = session
         self.onPick = onPick
+        #if os(iOS)
+        // The system's 34pt large title is sized for a title labelling a whole
+        // screen of content. This one labels a drawer, and at full size it
+        // outweighed the list under it.
+        UINavigationBar.appearance().largeTitleTextAttributes = [
+            .font: UIFont.systemFont(ofSize: 27, weight: .bold),
+        ]
+        #endif
         // Writing through to the disk on every successful refresh means the next
         // launch has a list to show before the network has answered at all.
         let key = DiskCache.key("chats", host: session.client.server.baseURL.host ?? "local")
@@ -229,23 +221,19 @@ public struct ChatListView: View {
                 }
             } else {
                 List {
-                    // Where the things that are not chats live. As full-width
-                    // rows with chevrons they were being read as two chats with
-                    // odd names — a row says "open this", which is exactly what
-                    // every chat row says. Pills say "tool" instead.
+                    // Where the things that are not chats live. Tried pills, and
+                    // the rows were better: two labels with icons in a list is
+                    // what every iOS sidebar does, and the pills drew more
+                    // attention to themselves than to what they open.
                     Section {
-                        HStack(spacing: 10) {
-                            Button { showingNotes = true } label: {
-                                drawerChip("note.text", "Notes")
-                            }
-                            .buttonStyle(.plain)
-                            Button { showingMemory = true } label: {
-                                drawerChip("brain.head.profile", "Memory")
-                            }
-                            .buttonStyle(.plain)
+                        NavigationLink {
+                            NotesView(client: session.client)
+                        } label: {
+                            Label("Notes", systemImage: "note.text")
                         }
-                        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
-                        .listRowSeparator(.hidden)
+                        Button { showingMemory = true } label: {
+                            Label("Memory", systemImage: "brain.head.profile")
+                        }
                     }
 
                     Section("Recents") {
@@ -297,12 +285,9 @@ public struct ChatListView: View {
                 }
             }
         }
-        .navigationTitle("Chats")
+        .navigationTitle("tiAi")
         .navigationDestination(for: String.self) { id in
             ConversationView(session: session, chatID: id, models: models)
-        }
-        .navigationDestination(isPresented: $showingNotes) {
-            NotesView(client: session.client)
         }
         // Left at the system placement on purpose. Asking for `.toolbar` did not
         // move the field on iOS 26 — it floats over the bottom of the list either
