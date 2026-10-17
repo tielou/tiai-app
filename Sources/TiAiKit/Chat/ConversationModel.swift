@@ -196,6 +196,11 @@ public final class ConversationModel {
         catch let problem { error = "Live streaming is unavailable: \(problem.localizedDescription)" }
     }
 
+    /// Bring the socket back after the app has been away, without making the
+    /// screen wait for it or showing a banner about it. The hub retries on its
+    /// own; a chat that opens on a dead radio should still show its messages.
+    public func reconnect() { hub.reconnectIfNeeded() }
+
     // MARK: - loading
 
     public func load() async {
@@ -207,15 +212,23 @@ public final class ConversationModel {
             phase = .ready
             return
         }
-        phase = .loading
+        let cacheKey = DiskCache.key("chat-\(chatID)",
+                                     host: client.server.baseURL.host ?? "local")
+        // Cached first. Opening a chat used to be a blank screen for the length
+        // of a round trip, which is the single thing that most makes the app feel
+        // slow — the transcript is already on the phone from the last time you
+        // read it. The network then replaces it, and a failure leaves the cached
+        // transcript on screen instead of trading it for an error banner.
+        if let cached = DiskCache.load(ChatDetail.self, key: cacheKey) {
+            apply(cached)
+            phase = .ready
+        } else {
+            phase = .loading
+        }
         do {
             let detail = try await client.chat(id: chatID)
-            self.detail = detail
-            title = detail.title
-            turns = detail.thread.map(Turn.init)
-            leafID = turns.last?.id
-            chatVariables = detail.variables
-            if let used = detail.models.first, !used.isEmpty { model = used }
+            apply(detail)
+            DiskCache.save(detail, key: cacheKey)
             // Opening a chat is reading it. The server tracks unread as
             // `updated_at > last_read_at` and only moves `last_read_at` over the
             // socket, so without this every conversation had on the phone walked
@@ -242,9 +255,22 @@ public final class ConversationModel {
                 phase = .ready
             }
         } catch {
-            self.error = error.localizedDescription
+            // Only worth complaining about when there is nothing to show. With a
+            // cached transcript on screen, a dead network should keep the screen
+            // as it is, not replace readable messages with a red banner.
+            if detail == nil { self.error = error.localizedDescription }
             phase = .ready
         }
+    }
+
+    /// Put a fetched — or cached — record onto the screen.
+    private func apply(_ detail: ChatDetail) {
+        self.detail = detail
+        title = detail.title
+        turns = detail.thread.map(Turn.init)
+        leafID = turns.last?.id
+        chatVariables = detail.variables
+        if let used = detail.models.first, !used.isEmpty { model = used }
     }
 
     // MARK: - sending

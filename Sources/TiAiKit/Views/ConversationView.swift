@@ -165,8 +165,11 @@ public struct ConversationView: View {
             Task {
                 // The socket is gone after a background sojourn and nothing
                 // else would notice until a send quietly streamed into the
-                // void. Cheap when it is already up.
-                await conversation.connect()
+                // void. Retried in the background rather than awaited: the
+                // radio is often still coming back at this exact moment, and
+                // making the chat wait for it — or banner about it — is worse
+                // than connecting a second later.
+                conversation.reconnect()
                 // Coming back from a browser sign-in is the normal way this
                 // changes: the tool said "not signed in", you signed in, and
                 // the row should know that without a relaunch.

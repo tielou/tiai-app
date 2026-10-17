@@ -16,6 +16,9 @@ import Foundation
 @Observable
 public final class ChatEventHub {
     public private(set) var isConnected = false
+    /// Set while a retry loop is running, so a foreground change in the middle of
+    /// one does not start a second loop beside it.
+    private var reconnecting = false
     public private(set) var lastError: String?
 
     /// See `ChatEventSocket.sessionID`. Sent as the completion's `session_id`,
@@ -57,18 +60,35 @@ public final class ChatEventHub {
         }
     }
 
-    /// Kicks a reconnect without waiting for it.
+    /// Kicks a reconnect without waiting for it, and keeps trying for a while.
     ///
-    /// Used on the send path, where holding the message hostage to a dead
-    /// network is worse than sending without it: the socket comes back on its
-    /// own, and a run whose frames were missed is recovered by the refetch the
-    /// conversation already does. `connect()` is what you call when you can
-    /// afford to wait — opening a chat, returning to the foreground.
+    /// A single attempt was not enough. The common case is unlocking the phone:
+    /// the radio is still coming back, the first attempt fails for a reason that
+    /// fixes itself a second later, and nothing tried again — so the app sat
+    /// showing a dead socket until the next thing you did. Backoff rather than a
+    /// hammer, and it stops rather than retrying a server that is genuinely down:
+    /// a send still works without the socket, and the refetch a run already does
+    /// recovers any frames that were missed.
     public func reconnectIfNeeded() {
-        guard !isConnected else { return }
-        Task {
-            do { try await socket.connect(); isConnected = true }
-            catch { lastError = error.localizedDescription }
+        guard !isConnected, !reconnecting else { return }
+        reconnecting = true
+        Task { [weak self] in
+            guard let self else { return }
+            var delay: TimeInterval = 0.5
+            for _ in 0..<6 {
+                if isConnected { break }
+                do {
+                    try await self.socket.connect()
+                    self.isConnected = true
+                    self.lastError = nil
+                    break
+                } catch {
+                    self.lastError = error.localizedDescription
+                }
+                try? await Task.sleep(for: .seconds(delay))
+                delay = min(delay * 2, 8)
+            }
+            self.reconnecting = false
         }
     }
 

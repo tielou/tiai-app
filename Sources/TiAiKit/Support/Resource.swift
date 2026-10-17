@@ -29,6 +29,18 @@ public final class Resource<T: Sendable> {
         self.isLoading = true
     }
 
+    /// Seed the resource from a cache before the network answers.
+    ///
+    /// Only ever fills an empty resource: a refresh that has already landed must
+    /// not be overwritten by something older off the disk.
+    public func seed(_ value: T) {
+        guard !hasData else { return }
+        data = value
+        hasData = true
+        isLoading = false
+        lastUpdated = .now
+    }
+
     public func refresh() async {
         if hasData { isStale = true } else { isLoading = true }
         do {

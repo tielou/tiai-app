@@ -120,6 +120,7 @@ public struct ChatListView: View {
     @State private var query = ""
     @State private var searchResults: [ChatSummary] = []
     @State private var showingMemory = false
+    @Environment(\.scenePhase) private var scenePhase
     /// Set while a delete is in flight, so the list says so rather than sitting
     /// on a row that is already gone server-side.
     @State private var deleting: String?
@@ -188,7 +189,14 @@ public struct ChatListView: View {
     public init(session: SessionStore, onPick: ((String?) -> Void)? = nil) {
         self.session = session
         self.onPick = onPick
-        _chats = State(initialValue: Resource(load: { try await session.client.chatList() }))
+        // Writing through to the disk on every successful refresh means the next
+        // launch has a list to show before the network has answered at all.
+        let key = DiskCache.key("chats", host: session.client.server.baseURL.host ?? "local")
+        _chats = State(initialValue: Resource(load: {
+            let list = try await session.client.chatList()
+            DiskCache.save(list, key: key)
+            return list
+        }))
     }
 
     public var body: some View {
@@ -294,10 +302,22 @@ public struct ChatListView: View {
             }
         }
         .refreshable { await chats.refresh() }
+        .onChange(of: scenePhase) { _, phase in
+            // Coming back to the app is when the list has most likely gone stale —
+            // a chat started in the browser, one deleted elsewhere — and it is
+            // already open on screen, so the refresh is invisible rather than a
+            // spinner in front of an empty drawer.
+            guard phase == .active else { return }
+            Task { await chats.refresh() }
+        }
         .task {
             // Cached first, network second: the list and the model name come
             // up at once and correct themselves a moment later, instead of
             // the app looking broken while a slow server thinks.
+            if let cached = DiskCache.load([ChatSummary].self,
+                                           key: DiskCache.key("chats", host: host)) {
+                chats.seed(cached)
+            }
             if models.isEmpty,
                let cached = DiskCache.load([ChatModel].self,
                                            key: DiskCache.key("models", host: host)) {
