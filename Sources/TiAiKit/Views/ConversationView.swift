@@ -1,4 +1,7 @@
 import SwiftUI
+#if os(iOS)
+import QuickLook
+#endif
 
 /// The conversation screen.
 ///
@@ -207,8 +210,12 @@ public struct ConversationView: View {
         }
         #endif
         #if os(iOS)
-        .sheet(item: $shareFile) { item in
-            ShareSheet(items: [item.url])
+        // A preview, not the share sheet: QuickLook renders a PDF properly and
+        // already carries share, save, copy and print in its own bar, so putting
+        // the share sheet first made the reader choose before they had seen the
+        // file. Presented full screen because a page needs the room.
+        .fullScreenCoverIOS(item: $shareFile) { item in
+            QuickLookPreview(url: item.url)
         }
         #endif
         .toolbar { toolbar }
@@ -270,6 +277,22 @@ public struct ConversationView: View {
             // path on launch. Synthetic clicks stopped registering in the simulator,
             // and what is worth checking — which `features` actually go on the wire —
             // is only knowable by really sending.
+            // Diagnostics: `TIAI_PREVIEW=<chat>|<selector>|<path>` fetches a
+            // sandbox file and presents the preview, so QuickLook can be checked
+            // without a tap — synthetic clicks do not register in this simulator.
+            if let probe = ProcessInfo.processInfo.environment["TIAI_PREVIEW"] {
+                let parts = probe.split(separator: "|", omittingEmptySubsequences: false)
+                if parts.count == 2 {
+                    Task {
+                        try? await Task.sleep(for: .seconds(2))
+                        openTerminalFile(
+                            TerminalFile(
+                                selector: String(parts[0]), path: String(parts[1]),
+                                name: (parts[1].split(separator: "/").last.map(String.init) ?? "file"),
+                                mimeType: "application/pdf"))
+                    }
+                }
+            }
             if let text = ProcessInfo.processInfo.environment["TIAI_SEND"] {
                 Task {
                     // Wait for models and tools to land, or the send picks a model
@@ -1608,23 +1631,73 @@ extension View {
 }
 
     /// A file the model made in its terminal sandbox, offered for download.
-/// A file written to disk and ready for the share sheet.
+/// A file written to disk and ready to be previewed.
 struct SharedFile: Identifiable {
     let url: URL
     var id: String { url.absoluteString }
 }
 
 #if os(iOS)
-/// The platform share sheet, so a sandbox file can go to Files, Books, Mail, or
-/// a printer without the app having to guess what the reader wants to do with it.
-struct ShareSheet: UIViewControllerRepresentable {
-    let items: [Any]
+/// QuickLook, wrapped. It renders PDFs, images, plain text, iWork and Office
+/// documents natively — page thumbnails, pinch-zoom, text selection and printing
+/// included — which is a great deal of work not to do, and the reason the app
+/// does not try to draw a document itself.
+///
+/// The controller does not dismiss itself when the reader is done, so the
+/// coordinator forwards that to the environment dismiss, without which the only
+/// way out is a swipe nobody looks for.
+struct QuickLookPreview: UIViewControllerRepresentable {
+    let url: URL
+    @Environment(\.dismiss) private var dismiss
 
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    func makeUIViewController(context: Context) -> UIViewController {
+        let controller = QLPreviewController()
+        controller.dataSource = context.coordinator
+        controller.delegate = context.coordinator
+        // Embedded deliberately. QuickLook puts its Done button and its action
+        // menu (share, save, copy, print) in a navigation bar, and it only draws
+        // that bar when it is inside a navigation controller — dropped straight
+        // into a SwiftUI cover it renders the document with no way out and no
+        // way to share.
+        let nav = UINavigationController(rootViewController: controller)
+        // And a way out, because the bar it draws has no Done button of its own
+        // when it arrives this way: a preview you cannot leave is a dead end.
+        controller.navigationItem.leftBarButtonItem = UIBarButtonItem(
+            barButtonSystemItem: .done, target: context.coordinator,
+            action: #selector(Coordinator.close))
+        return nav
     }
 
-    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+    func updateUIViewController(_ controller: UIViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(url: url, dismiss: dismiss) }
+
+    /// Not `@MainActor`: UIKit declares these delegate protocols as nonisolated,
+    /// so conforming from main-actor code is what Swift 6 rejects. The one thing
+    /// that needs the main actor is the dismiss, so that is where the hop goes.
+    final class Coordinator: NSObject, QLPreviewControllerDataSource, @preconcurrency QLPreviewControllerDelegate {
+        private let url: URL
+        private let dismiss: DismissAction
+        init(url: URL, dismiss: DismissAction) {
+            self.url = url
+            self.dismiss = dismiss
+        }
+
+        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+
+        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
+            // `URL` already is a `QLPreviewItem`; the file has to be a real path
+            // on disk, which is why the bytes are written out before previewing.
+            url as QLPreviewItem
+        }
+
+        func previewControllerDidDismiss(_ controller: QLPreviewController) { close() }
+
+        @objc func close() {
+            let dismiss = dismiss
+            Task { @MainActor in dismiss() }
+        }
+    }
 }
 #endif
 
@@ -1647,7 +1720,7 @@ struct TerminalFileCard: View {
                             .lineLimit(1)
                         Text(busy ? "Opening…"
                             : failed ? "Could not fetch it — is the terminal gone?"
-                            : "\(file.extension.uppercased()) file · tap to open")
+                            : "\(file.extension.uppercased()) file · tap to preview")
                             .font(.caption)
                             .foregroundStyle(failed ? .orange : .secondary)
                             .lineLimit(1)
@@ -1709,7 +1782,7 @@ struct FileLinkCard: View {
                         .lineLimit(1)
                     Text(busy ? "Opening\u{2026}"
                         : failed ? "Could not fetch it"
-                        : "Tap to open or save")
+                        : "Tap to preview")
                         .font(.caption)
                         .foregroundStyle(failed ? .orange : .secondary)
                         .lineLimit(1)
