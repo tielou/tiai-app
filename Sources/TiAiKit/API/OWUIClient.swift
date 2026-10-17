@@ -80,6 +80,25 @@ public struct OWUIClient: Sendable {
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         try? data.write(to: URL(fileURLWithPath: dir).appendingPathComponent(name + ".json"))
     }
+
+    /// DEBUG-only: appends a line to the dump directory.
+    ///
+    /// stdout is not reliably readable from a launched simulator process, and the
+    /// OAuth hand-off is exactly the kind of failure that is invisible on screen —
+    /// a web view that redirects somewhere and shows nothing.
+    static func debugLog(_ line: String) {
+        guard let dir = ProcessInfo.processInfo.environment["TIAI_DEBUG_DUMP"] else { return }
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let url = URL(fileURLWithPath: dir).appendingPathComponent("debug.log")
+        let stamp = ISO8601DateFormatter().string(from: .now)
+        guard let handle = try? FileHandle(forWritingTo: url) else {
+            try? "\(stamp) \(line)\n".data(using: .utf8)?.write(to: url)
+            return
+        }
+        defer { try? handle.close() }
+        handle.seekToEndOfFile()
+        handle.write("\(stamp) \(line)\n".data(using: .utf8) ?? Data())
+    }
     #endif
 
     private func request<T: Decodable>(

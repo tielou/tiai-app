@@ -126,6 +126,21 @@ public struct ChatListView: View {
     @State private var deleting: String?
     @State private var deleteFailed: String?
 
+    /// When set, the Notes row calls this instead of pushing inside this view's
+    /// own navigation stack. The drawer is 84% of the screen wide, and Notes is a
+    /// document, not a menu — reading it in a strip was the wrong shape.
+    var onOpenNotes: (() -> Void)? = nil
+
+    /// When set, a toolbar button opens the whole list full screen.
+    var onExpand: (() -> Void)? = nil
+
+    /// Bumped by the host to ask for a refresh. A chat started on this phone does
+    /// not exist in the list until something asks again, and the drawer is now
+    /// permanently mounted so its own `.task` only ever runs once.
+    var refreshBadge: Int = 0
+
+    /// Declared last so the trailing closure at every call site still lands here.
+    ///
     /// When set, tapping a chat calls this instead of pushing a conversation.
     /// The app opens on a chat rather than on a list, so the list is presented
     /// over the top and picking one has to hand the choice back and close.
@@ -186,8 +201,17 @@ public struct ChatListView: View {
         }
     }
 
-    public init(session: SessionStore, onPick: ((String?) -> Void)? = nil) {
+    public init(
+        session: SessionStore,
+        onOpenNotes: (() -> Void)? = nil,
+        onExpand: (() -> Void)? = nil,
+        refreshBadge: Int = 0,
+        onPick: ((String?) -> Void)? = nil
+    ) {
         self.session = session
+        self.onOpenNotes = onOpenNotes
+        self.onExpand = onExpand
+        self.refreshBadge = refreshBadge
         self.onPick = onPick
         #if os(iOS)
         // The system's 34pt large title is sized for a title labelling a whole
@@ -226,10 +250,16 @@ public struct ChatListView: View {
                     // what every iOS sidebar does, and the pills drew more
                     // attention to themselves than to what they open.
                     Section {
-                        NavigationLink {
-                            NotesView(client: session.client)
-                        } label: {
-                            Label("Notes", systemImage: "note.text")
+                        if let onOpenNotes {
+                            Button(action: onOpenNotes) {
+                                Label("Notes", systemImage: "note.text")
+                            }
+                        } else {
+                            NavigationLink {
+                                NotesView(client: session.client)
+                            } label: {
+                                Label("Notes", systemImage: "note.text")
+                            }
                         }
                         Button { showingMemory = true } label: {
                             Label("Memory", systemImage: "brain.head.profile")
@@ -319,7 +349,7 @@ public struct ChatListView: View {
             guard phase == .active else { return }
             Task { await chats.refresh() }
         }
-        .task {
+        .task(id: refreshBadge) {
             // Cached first, network second: the list and the model name come
             // up at once and correct themselves a moment later, instead of
             // the app looking broken while a slow server thinks.
@@ -376,6 +406,16 @@ public struct ChatListView: View {
                     }
                 }
             }
+            // Its own item, not a second button in the compose item: two buttons
+            // in one ToolbarItem render as one, and the compose control simply
+            // disappeared.
+            if let onExpand {
+                ToolbarItem(placement: .primaryAction) {
+                    Button(action: onExpand) {
+                        Label("Open full screen", systemImage: "arrow.up.left.and.arrow.down.right")
+                    }
+                }
+            }
         }
         .sheet(isPresented: $showingMemory) {
             MemorySheet(client: session.client)
@@ -418,6 +458,14 @@ public struct ChatHomeView: View {
     /// kept showing the conversation you were already looking at.
     @State private var draft = 0
     @State private var showingChats = false
+    /// Something shown over the whole screen rather than inside the drawer: the
+    /// full chat list, or Notes. Both are things you read, and a document in a
+    /// 330-point strip is the wrong shape.
+    enum Fullscreen: String, Identifiable { case chats, notes; var id: String { rawValue } }
+    @State private var fullscreen: Fullscreen?
+    /// Bumped every time the drawer opens, so the list asks the server again.
+    /// A chat started on this phone did not exist the last time it looked.
+    @State private var refreshBadge = 0
     /// Live drag offset while closing the drawer by hand. Negative, in points.
     @State private var drag: CGFloat = 0
 
@@ -439,6 +487,14 @@ public struct ChatHomeView: View {
         showingChats = false
     }
 
+    /// Opening the drawer is the moment to re-ask: it is what you do when you
+    /// expect the list to have changed, and the cached rows are already on screen
+    /// so the refresh is invisible rather than a spinner.
+    private func openChats() {
+        showingChats = true
+        refreshBadge += 1
+    }
+
     public var body: some View {
         GeometryReader { proxy in
             let panelWidth = proxy.size.width * 0.84
@@ -456,7 +512,7 @@ public struct ChatHomeView: View {
                         .id("\(chatID ?? "new")-\(draft)")
                         .toolbar {
                             ToolbarItem(placement: .navigation) {
-                                Button { showingChats = true } label: {
+                                Button { openChats() } label: {
                                     Label("Chats", systemImage: "line.3.horizontal")
                                 }
                             }
@@ -476,7 +532,12 @@ public struct ChatHomeView: View {
                 // visible behind it, which is what tells you this is an overlay
                 // and not another screen.
                 NavigationStack {
-                    ChatListView(session: session) { picked in
+                    ChatListView(
+                        session: session,
+                        onOpenNotes: { fullscreen = .notes },
+                        onExpand: { fullscreen = .chats },
+                        refreshBadge: refreshBadge
+                    ) { picked in
                         chatID = picked
                         if picked == nil { startNewChat() }
                         closeChats()
@@ -508,6 +569,34 @@ public struct ChatHomeView: View {
             }
             .animation(.spring(response: 0.3, dampingFraction: 0.9), value: showingChats)
             .animation(.interactiveSpring(response: 0.2, dampingFraction: 0.9), value: drag)
+            // Both of these are things you read, so they get the whole screen and
+            // the drawer steps aside behind them.
+            .fullScreenCoverIOS(item: $fullscreen) { which in
+                NavigationStack {
+                    Group {
+                        switch which {
+                        case .chats:
+                            ChatListView(
+                                session: session,
+                                onOpenNotes: { fullscreen = .notes },
+                                refreshBadge: refreshBadge
+                            ) { picked in
+                                chatID = picked
+                                if picked == nil { startNewChat() }
+                                fullscreen = nil
+                                closeChats()
+                            }
+                        case .notes:
+                            NotesView(client: session.client)
+                        }
+                    }
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { fullscreen = nil }
+                        }
+                    }
+                }
+            }
             // Swipe right from the left edge to open, the way every other drawer
             // on the platform works. A simultaneous gesture rather than a
             // high-priority one, so a vertical scroll inside the transcript still

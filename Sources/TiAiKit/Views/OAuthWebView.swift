@@ -212,7 +212,36 @@ private struct SessionBrowser: UIViewControllerRepresentable {
         }
 
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            #if DEBUG
+            OWUIClient.debugLog("oauth commit \(webView.url?.absoluteString ?? "nil")")
+            #endif
             onURL(webView.url.map(Self.describe) ?? "")
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            didReceive challenge: URLAuthenticationChallenge,
+            completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+        ) {
+            #if DEBUG
+            OWUIClient.debugLog("oauth challenge \(challenge.protectionSpace.host) "
+                + "\(challenge.protectionSpace.protocol ?? "nil") "
+                + "method=\(challenge.protectionSpace.authenticationMethod)")
+            #endif
+            completionHandler(.performDefaultHandling, nil)
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            didReceive response: URLResponse,
+            completionHandler: @escaping (URLResponse?) -> Void
+        ) {
+            #if DEBUG
+            if let http = response as? HTTPURLResponse {
+                OWUIClient.debugLog("oauth \(http.statusCode) \(http.url?.absoluteString ?? "?")")
+            }
+            #endif
+            completionHandler(response)
         }
 
         func webView(
@@ -220,7 +249,22 @@ private struct SessionBrowser: UIViewControllerRepresentable {
             didFailProvisionalNavigation navigation: WKNavigation!,
             withError error: Error
         ) {
+            #if DEBUG
+            OWUIClient.debugLog("oauth provisional failure \(error.localizedDescription) "
+                + "host=\(self.host)")
+            #endif
             // ATS refusals and unreachable hosts used to leave a blank sheet.
+            onFailed((error as? LocalizedError)?.localizedDescription ?? error.localizedDescription)
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            didFail navigation: WKNavigation!,
+            withError error: Error
+        ) {
+            #if DEBUG
+            OWUIClient.debugLog("oauth navigation failure \(error.localizedDescription)")
+            #endif
             onFailed((error as? LocalizedError)?.localizedDescription ?? error.localizedDescription)
         }
 
@@ -229,6 +273,9 @@ private struct SessionBrowser: UIViewControllerRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            #if DEBUG
+            OWUIClient.debugLog("oauth done \(webView.url?.absoluteString ?? "nil")")
+            #endif
             // Allowed to complete first: the callback request is what makes the
             // server exchange the code for a token. Cancelling the navigation to
             // close earlier would end the dance one step short of it working.
@@ -256,6 +303,9 @@ private struct SessionBrowser: UIViewControllerRepresentable {
             windowFeatures: WKWindowFeatures
         ) -> WKWebView? {
             if navigationAction.targetFrame?.isMainFrame != true {
+                #if DEBUG
+                OWUIClient.debugLog("oauth popup \(navigationAction.request.url?.absoluteString ?? "nil")")
+                #endif
                 webView.load(navigationAction.request)
             }
             return nil

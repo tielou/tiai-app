@@ -150,6 +150,15 @@ public struct ConversationView: View {
             // indistinguishable from an instance that has no tools, and the
             // second one is normal while the first is a bug.
             catch { chatToolsError = error.localizedDescription }
+            #if DEBUG
+            // Diagnostics. The sheet that normally starts a sign-in cannot be
+            // driven with synthetic clicks, so this starts the first tool that
+            // needs one on launch: TIAI_OAUTH_PROBE=1.
+            if ProcessInfo.processInfo.environment["TIAI_OAUTH_PROBE"] != nil,
+               conversation.chatID == nil {
+                probeOAuth()
+            }
+            #endif
         }
         .onChange(of: scenePhase) { _, phase in
             // Only act on coming back. `.inactive` is Control Centre, a pulled-down
@@ -330,6 +339,25 @@ public struct ConversationView: View {
             .animation(.snappy(duration: 0.18), value: atBottom)
         }
     }
+
+    #if DEBUG
+    /// Diagnostics only: start the first tool sign-in the instance offers, so the
+    /// OAuth hand-off can be watched end to end without driving the sheet that
+    /// normally triggers it.
+    private func probeOAuth() {
+        Task {
+            let tools = (try? await session.client.chatTools()) ?? chatTools
+            chatTools = tools
+            guard let tool = tools.first(where: { $0.authorizeURL(base: conversation.serverURL) != nil }),
+                  let url = tool.authorizeURL(base: conversation.serverURL) else {
+                OWUIClient.debugLog("oauth probe: no tool is waiting on a sign-in")
+                return
+            }
+            OWUIClient.debugLog("oauth probe: \(tool.name) -> \(url)")
+            authorizing = AuthorizeRequest(url: url)
+        }
+    }
+    #endif
 
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
