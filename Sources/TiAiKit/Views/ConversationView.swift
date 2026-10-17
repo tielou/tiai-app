@@ -29,6 +29,45 @@ public struct ConversationView: View {
     @State private var chatTools: [ChatTool] = []
     @State private var chatToolsError: String?
 
+    /// Sandbox files: which one is downloading, which failed, and the one handed
+    /// to the share sheet.
+    @State private var busyFile: String?
+    @State private var failedFile: String?
+    @State private var shareFile: SharedFile?
+
+    /// Fetch a file the model left in its terminal sandbox and hand it to the
+    /// share sheet, which is how you get it into Files, Books, or a print job.
+    ///
+    /// The sandbox is addressed by chat, so a chat that has not been saved yet
+    /// cannot have one — the server would not know whose terminal to look in.
+    private func openTerminalFile(_ file: TerminalFile) {
+        guard let chat = conversation.chatID else {
+            failedFile = file.id
+            return
+        }
+        busyFile = file.id
+        failedFile = nil
+        Task {
+            defer { busyFile = nil }
+            guard let data = try? await session.client.terminalFile(
+                selector: file.selector, path: file.path, sessionID: chat), !data.isEmpty
+            else {
+                failedFile = file.id
+                return
+            }
+            // Written to a real URL: the share sheet wants a file it can hand to
+            // another app, and a PDF sitting in memory is not that.
+            let out = FileManager.default.temporaryDirectory
+                .appendingPathComponent(file.name)
+            try? FileManager.default.removeItem(at: out)
+            guard (try? data.write(to: out)) != nil else {
+                failedFile = file.id
+                return
+            }
+            shareFile = SharedFile(url: out)
+        }
+    }
+
     /// Cache keys are per server, so two instances on one phone never trade data.
     private var host: String { session.client.server.baseURL.host ?? "local" }
     /// A tool waiting on a sign-in. The browser lives here because the tool list
@@ -123,6 +162,11 @@ public struct ConversationView: View {
             }
         }
         #endif
+        #if os(iOS)
+        .sheet(item: $shareFile) { item in
+            ShareSheet(items: [item.url])
+        }
+        #endif
         .toolbar { toolbar }
         .task {
             await conversation.connect()
@@ -151,6 +195,22 @@ public struct ConversationView: View {
             // second one is normal while the first is a bug.
             catch { chatToolsError = error.localizedDescription }
             #if DEBUG
+            // Diagnostics: `TIAI_DUMP_CHAT=<id>` reads one chat record into the
+            // dump directory using the app's own session, so a payload can be
+            // inspected without anyone pasting a token into a terminal.
+            if let probe = ProcessInfo.processInfo.environment["TIAI_DUMP_CHAT"] {
+                Task {
+                    // A leading slash means "this exact path", so a route can be
+                    // probed with the app's session; a bare id is a chat.
+                    let path = probe.hasPrefix("/") ? String(probe.dropFirst()) : "chats/\(probe)"
+                    do {
+                        let json = try await session.client.rawJSON(path)
+                        let data = try JSONEncoder().encode(json)
+                        OWUIClient.dump(url: URL(string: "https://dump/\(path)")!,
+                                        method: "PROBE", data: data)
+                    } catch { OWUIClient.debugLog("probe \(path) failed: \(error)") }
+                }
+            }
             // Diagnostics. The sheet that normally starts a sign-in cannot be
             // driven with synthetic clicks, so this starts the first tool that
             // needs one on launch: TIAI_OAUTH_PROBE=1.
@@ -231,7 +291,10 @@ public struct ConversationView: View {
                             rating: conversation.ratings[turn.id],
                             sibling: conversation.siblingPage(of: turn.id),
                             onSibling: { conversation.selectSibling(of: turn.id, direction: $0) },
-                            fileLoader: { await conversation.fileData(id: $0) }
+                            fileLoader: { await conversation.fileData(id: $0) },
+                            onOpenFile: openTerminalFile,
+                            fileBusy: busyFile,
+                            fileFailed: failedFile
                         )
                             .id(turn.id)
                     }
@@ -557,6 +620,13 @@ struct MessageRow: View {
                 ForEach(Array(Markdown.blocks(TextSanitizer.clean(turn.text)).enumerated()), id: \.offset) { _, block in
                     MarkdownBlockView(block: block, streaming: turn.streaming)
                 }
+                if !turn.terminalFiles.isEmpty {
+                    ForEach(turn.terminalFiles) { file in
+                        TerminalFileCard(file: file, busy: fileBusy == file.id,
+                                         failed: fileFailed == file.id)
+                        { onOpenFile?(file) }
+                    }
+                }
                 if let error = turn.error {
                     Label(error, systemImage: "exclamationmark.octagon.fill")
                         .font(.callout)
@@ -568,6 +638,15 @@ struct MessageRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
+
+    /// Called when the reader taps a file the model produced in its terminal
+    /// sandbox. The row cannot fetch it itself: the sandbox is found by chat, and
+    /// the row does not know which chat it is in.
+    var onOpenFile: ((TerminalFile) -> Void)? = nil
+    /// Which sandbox file is downloading, and which failed. Owned by the screen,
+    /// because the screen is the one doing the fetching.
+    var fileBusy: String? = nil
+    var fileFailed: String? = nil
 
     /// Thinking is collapsed by default and clearly marked as not-the-answer.
     /// It is also the only sign that a slow model is working rather than stuck.
@@ -1409,3 +1488,82 @@ extension View {
         #endif
     }
 }
+
+    /// A file the model made in its terminal sandbox, offered for download.
+/// A file written to disk and ready for the share sheet.
+struct SharedFile: Identifiable {
+    let url: URL
+    var id: String { url.absoluteString }
+}
+
+#if os(iOS)
+/// The platform share sheet, so a sandbox file can go to Files, Books, Mail, or
+/// a printer without the app having to guess what the reader wants to do with it.
+struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+#endif
+
+struct TerminalFileCard: View {
+        let file: TerminalFile
+        let busy: Bool
+        let failed: Bool
+        let open: () -> Void
+
+        var body: some View {
+            Button(action: open) {
+                HStack(spacing: 10) {
+                    Image(systemName: icon)
+                        .font(.title3)
+                        .foregroundStyle(.tint)
+                        .frame(width: 26)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(file.name)
+                            .font(.callout.weight(.medium))
+                            .lineLimit(1)
+                        Text(busy ? "Opening…"
+                            : failed ? "Could not fetch it — is the terminal gone?"
+                            : "\(file.extension.uppercased()) file · tap to open")
+                            .font(.caption)
+                            .foregroundStyle(failed ? .orange : .secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 8)
+                    if busy {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.down.circle")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(11)
+                .background(cardBackground, in: .rect(cornerRadius: 10))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .strokeBorder(.separator, lineWidth: 0.5)
+                )
+            }
+            .buttonStyle(.plain)
+            // The tap has to be a button, not a gesture: inside a scrollable row a
+            // bare `onTapGesture` loses to the scroll view and does nothing.
+            .contentShape(Rectangle())
+        }
+
+        private var icon: String {
+            switch file.extension {
+            case "pdf": "doc.richtext"
+            case "png", "jpg", "jpeg", "gif", "webp", "heic": "photo"
+            case "csv", "xlsx", "json": "tablecells"
+            case "zip", "gz", "tar": "doc.zipper"
+            case "py", "sh", "js", "html": "chevron.left.forwardslash.chevron.right"
+            default: "doc"
+            }
+        }
+    }
+

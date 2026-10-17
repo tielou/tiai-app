@@ -37,6 +37,9 @@ public struct Turn: Identifiable, Equatable, Sendable {
     public var sources: [MessageSource]
     /// Files the user attached. Images are drawn inline; anything else is a chip.
     public var attachments: [MessageAttachment]
+    /// Files the model produced in its terminal sandbox and offered with
+    /// `display_file`. Fetched by path, not by file id — see `TerminalFile`.
+    public var terminalFiles: [TerminalFile] = []
     public var createdAt: Date
 
     public init(
@@ -100,6 +103,7 @@ public struct Turn: Identifiable, Equatable, Sendable {
         calls = Turn.reconciling(message.toolCalls, done: message.done)
         sources = message.citedSources
         attachments = message.messageAttachments
+        terminalFiles = message.terminalFiles
         createdAt = message.timestamp ?? .now
     }
 

@@ -32,6 +32,15 @@ extension View {
         #endif
     }
 
+    /// A background one step off the page colour, for cards sitting on a chat.
+    var cardBackground: Color {
+        #if os(iOS)
+        Color(uiColor: .secondarySystemBackground)
+        #else
+        Color(nsColor: .underPageBackgroundColor)
+        #endif
+    }
+
     func inlineTitle(_ title: String) -> some View {
         #if os(iOS)
         navigationTitle(title).navigationBarTitleDisplayMode(.inline)

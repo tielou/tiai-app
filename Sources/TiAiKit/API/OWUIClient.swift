@@ -105,14 +105,13 @@ public struct OWUIClient: Sendable {
         _ method: String, _ path: String, query: [String: String] = [:],
         bodyData: Data? = nil, timeout: TimeInterval = 30
     ) async throws -> T {
-        // GETs are idempotent, so a blip is absorbed silently: three tries with
-        // a short backoff covers a phone switching wifi or a home server
-        // restarting mid-poll.
-        //
-        // POSTs are never retried here. A second completion request is a second
-        // copy of the user's message, and a retry that duplicates what someone
-        // typed is worse than an error with a button on it.
-        let attempts = method == "GET" ? 3 : 1
+        // GETs are idempotent, so a blip is absorbed silently. The ladder is
+        // deliberately long-tailed: the case that actually hurts is a self-hosted
+        // server restarting, which takes half a minute, and three tries inside two
+        // seconds just means the app gives up while the backend is still booting.
+        // Cached content stays on screen through it, so waiting costs nothing the
+        // user can see.
+        let attempts = method == "GET" ? 6 : 1
         var last: Error = APIError.unreachable("no attempt made")
         for attempt in 0..<attempts {
             do {
@@ -123,13 +122,16 @@ public struct OWUIClient: Sendable {
                 last = error
                 let transient = (error as? APIError)?.isTransient ?? false
                 guard transient, attempt + 1 < attempts else { throw error }
-                // Small and exponential: long enough for a route to converge,
-                // short enough that a spinner never looks broken.
-                try? await Task.sleep(for: .milliseconds(250 * (1 << attempt)))
+                try? await Task.sleep(for: .seconds(Self.retryDelays[attempt]))
             }
         }
         throw last
     }
+
+    /// Waits between GET retries. Roughly 25 seconds in total: long enough to
+    /// ride out a container restart, short enough that a genuinely wrong URL
+    /// still reports itself within a screenful of patience.
+    static let retryDelays: [TimeInterval] = [0.3, 0.9, 2.0, 5.0, 9.0]
 
     /// Same, for the few routes outside the versioned router.
     private func rawRequest<T: Decodable>(_ method: String, _ path: String, timeout: TimeInterval = 15) async throws -> T {
@@ -622,6 +624,34 @@ public struct OWUIClient: Sendable {
     public func fileContent(id: String) async throws -> Data {
         let (data, http) = try await perform(
             "GET", server.api("/files/\(id)/content"), bodyData: nil, timeout: 60)
+        switch http.statusCode {
+        case 200..<300: return data
+        case 401: throw APIError.unauthorized
+        default: throw APIError.http(status: http.statusCode, message: "\(http.statusCode)")
+        }
+    }
+
+    /// Bytes for a file the model produced in its terminal sandbox.
+    ///
+    /// Not under the file routes: the sandbox is a separate service that Open
+    /// WebUI proxies at `/terminals/{selector}/`, and it identifies the chat by
+    /// an `X-Session-Id` header rather than anything in the path — without it
+    /// the terminal does not know whose sandbox to look in.
+    public func terminalFile(selector: String, path: String, sessionID: String) async throws -> Data {
+        let url = try server.api("/terminals/\(selector)/files/view",
+                                 query: ["path": path])
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 120
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        if !server.token.isEmpty {
+            req.setValue("Bearer \(server.token)", forHTTPHeaderField: "Authorization")
+        }
+        req.setValue(sessionID, forHTTPHeaderField: "X-Session-Id")
+        let (data, response) = try await transport.send(req)
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.unreachable("response was not HTTP")
+        }
         switch http.statusCode {
         case 200..<300: return data
         case 401: throw APIError.unauthorized
