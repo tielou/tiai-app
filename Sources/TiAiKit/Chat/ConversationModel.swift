@@ -48,6 +48,10 @@ public final class ConversationModel {
     /// Tool ids to offer this run. Empty means the server's own default set for
     /// the model, which is what almost every chat wants.
     public var tools: [String] = []
+    /// The terminal to run code in, named on every request as `terminal_id`.
+    /// Without it the server does not offer the terminal's tools at all, so a
+    /// model asked for a PDF will describe one instead of making one.
+    public var terminalID: String?
     /// The chat's template variables, carried back untouched on every send.
     public var chatVariables: JSONValue?
     public var modelIDs: [String] = []
@@ -366,6 +370,15 @@ public final class ConversationModel {
 
     public func detach(_ attachment: PendingAttachment) {
         attachments.removeAll { $0.id == attachment.id }
+    }
+
+    /// Diagnostics: a single-value env var.
+    static func debugString(_ name: String) -> String? {
+        #if DEBUG
+        ProcessInfo.processInfo.environment[name]
+        #else
+        nil
+        #endif
     }
 
     /// Diagnostics only: `TIAI_FEATURES=terminal,foo=false` merges extra keys into
@@ -708,8 +721,13 @@ public final class ConversationModel {
             // `ask` is what makes the server park on a tool call and wait for a
             // tap. Left unset the server runs every tool without asking, which is
             // right for a headless client and wrong for one in the hand.
-            params: CompletionRequest.Params(toolApprovalMode: "ask"),
+            params: CompletionRequest.Params(
+                functionCalling: Self.debugString("TIAI_FC"),
+                toolApprovalMode: "ask"),
             toolIDs: tools.isEmpty ? nil : tools,
+            terminalID: (features[ChatFeature.codeInterpreter.rawValue] == true)
+                ? (terminalID ?? Self.debugString("TIAI_TERMINAL_ID"))
+                : nil,
             // Left nil on purpose. `tool_servers` is for ad-hoc servers passed by
             // url, which is not what the picker offers: connected MCP servers
             // arrive from /tools/ as `server:mcp:N` and go in `tool_ids` like
@@ -1026,6 +1044,16 @@ public final class ConversationModel {
                 // as the feature being broken.
                 if stored.citedSources.isEmpty == false {
                     self.turns[at].sources = stored.citedSources
+                }
+                // Same story for files the model wrote in its terminal: the
+                // `display_file` result is attached when the message is saved,
+                // not streamed, so without this the download card only appeared
+                // after leaving and re-entering the chat.
+                if self.turns[at].terminalFiles.isEmpty, !stored.terminalFiles.isEmpty {
+                    self.turns[at].terminalFiles = stored.terminalFiles
+                }
+                if self.turns[at].attachments.isEmpty, !stored.messageAttachments.isEmpty {
+                    self.turns[at].attachments = stored.messageAttachments
                 }
                 // And if the stored answer is longer than what arrived, the run
                 // outlived the stream. Adopt the stored text rather than leaving

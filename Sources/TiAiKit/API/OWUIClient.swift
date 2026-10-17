@@ -416,6 +416,12 @@ public struct OWUIClient: Sendable {
     ///
     /// Selected ids go out as `tool_ids`. Entries that cannot be read are dropped
     /// rather than failing the list: one odd row should not cost the whole picker.
+    /// Terminals the instance registered, so the completion request can name one.
+    public func terminals() async throws -> [Terminal] {
+        let json: JSONValue = try await request("GET", "/terminals/")
+        return (json.arrayValue ?? []).compactMap(Terminal.init)
+    }
+
     public func chatTools() async throws -> [ChatTool] {
         let json: JSONValue = try await request("GET", "/tools/")
         return (json.arrayValue ?? []).compactMap(ChatTool.init)

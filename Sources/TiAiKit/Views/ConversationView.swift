@@ -28,6 +28,9 @@ public struct ConversationView: View {
     /// tools simply has no Tools row.
     @State private var chatTools: [ChatTool] = []
     @State private var chatToolsError: String?
+    /// Said out loud rather than swallowed: without a terminal the model cannot
+    /// write a file, and a silent failure here looks like a model that lies.
+    @State private var terminalError: String?
 
     /// Sandbox files: which one is downloading, which failed, and the one handed
     /// to the share sheet.
@@ -217,8 +220,10 @@ public struct ConversationView: View {
             if let probe = ProcessInfo.processInfo.environment["TIAI_DUMP_CHAT"] {
                 Task {
                     // A leading slash means "this exact path", so a route can be
-                    // probed with the app's session; a bare id is a chat.
-                    let path = probe.hasPrefix("/") ? String(probe.dropFirst()) : "chats/\(probe)"
+                    // probed with the app's session; a bare id is a chat. The
+                    // slash is load-bearing: `api()` concatenates, so dropping it
+                    // produced `/api/v1tools/` and every probe came back null.
+                    let path = probe.hasPrefix("/") ? probe : "chats/\(probe)"
                     do {
                         let json = try await session.client.rawJSON(path)
                         let data = try JSONEncoder().encode(json)
@@ -295,6 +300,10 @@ public struct ConversationView: View {
                 DiskCache.save(fresh, key: DiskCache.key("models", host: host))
             }
             conversation.setModels(models)
+            if conversation.terminalID == nil,
+                let cached = DiskCache.load([Terminal].self, key: DiskCache.key("terminals", host: host)) {
+                conversation.terminalID = cached.first?.id
+            }
             do {
                 let fresh = try await session.client.chatTools()
                 chatTools = fresh
@@ -305,6 +314,14 @@ public struct ConversationView: View {
             // indistinguishable from an instance that has no tools, and the
             // second one is normal while the first is a bug.
             catch { chatToolsError = error.localizedDescription }
+            // The completion request has to name a terminal to be given its tools,
+            // so this is what makes "make me a PDF" possible at all. Cached like
+            // the tools: a chat opened offline still knows where its sandbox is.
+            do {
+                let fresh = try await session.client.terminals()
+                conversation.terminalID = fresh.first?.id
+                DiskCache.save(fresh, key: DiskCache.key("terminals", host: host))
+            } catch { terminalError = error.localizedDescription }
         }
         .onChange(of: scenePhase) { _, phase in
             // Only act on coming back. `.inactive` is Control Centre, a pulled-down

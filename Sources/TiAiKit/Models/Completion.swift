@@ -131,6 +131,7 @@ public struct CompletionRequest: Encodable, Sendable {
     /// Tools and MCP servers for this run. The server reads these top level, not
     /// inside `features`, so a `[String: Bool]` `features` map cannot carry them.
     public var toolIDs: [String]?
+
     public var toolServerIDs: [String]?
     /// Filter functions to run over this exchange.
     public var filterIDs: [String]?
@@ -181,6 +182,7 @@ public struct CompletionRequest: Encodable, Sendable {
         stream: Bool = true,
         folderID: String? = nil,
         toolIDs: [String]? = nil,
+        terminalID: String? = nil,
         toolServerIDs: [String]? = nil,
         filterIDs: [String]? = nil,
         variables: [String: JSONValue]? = nil,
@@ -201,6 +203,7 @@ public struct CompletionRequest: Encodable, Sendable {
         self.params = params
         self.folderID = folderID
         self.toolIDs = toolIDs
+        self.terminalID = terminalID
         self.toolServerIDs = toolServerIDs
         self.filterIDs = filterIDs
         self.variables = variables
@@ -218,6 +221,7 @@ public struct CompletionRequest: Encodable, Sendable {
         case assistantMessageID = "assistant_message_id"
         case folderID = "folder_id"
         case toolIDs = "tool_ids"
+        case terminalID = "terminal_id"
         case toolServerIDs = "tool_servers"
         case filterIDs = "filter_ids"
         case variables
@@ -255,7 +259,11 @@ public struct CompletionRequest: Encodable, Sendable {
         if let chatVariables { try c.encode(chatVariables, forKey: .chatVariables) }
         if let backgroundTasks { try c.encode(backgroundTasks, forKey: .backgroundTasks) }
         if let sessionID { try c.encode(sessionID, forKey: .sessionID) }
+        if let terminalID { try c.encode(terminalID, forKey: .terminalID) }
     }
+
+    /// The server's own name for the selection: `form_data.pop('terminal_id')`.
+    public var terminalID: String?
 }
 
 /// One `data:` frame of the completion stream, before it is turned into a

@@ -149,3 +149,29 @@ public struct FileLink: Identifiable, Equatable, Sendable {
         return (links, stripped.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 }
+
+/// A terminal the instance has registered, from `GET /terminals/`.
+///
+/// The id is what the completion request has to name (`terminal_id`) to be given
+/// the terminal's tools at all — without it the model gets no `run_command`, no
+/// `write_file`, no `display_file`, and will happily claim it attached a file it
+/// had no way to write. The id is the deployment's, not a constant: this one
+/// happens to be called `sandbox`, and hardcoding that would break the first
+/// person who names theirs something else.
+public struct Terminal: Codable, Equatable, Sendable, Identifiable {
+    public var id: String
+    public var name: String
+
+    public init(id: String, name: String) {
+        self.id = id
+        self.name = name
+    }
+
+    init?(_ value: JSONValue) {
+        guard let object = value.objectValue,
+            let id = object["id"]?.stringValue, !id.isEmpty
+        else { return nil }
+        self.id = id
+        self.name = object["name"]?.stringValue ?? id
+    }
+}

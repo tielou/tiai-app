@@ -271,6 +271,28 @@ struct ChatDetailTests {
 
 // MARK: - encoding
 
+/// Without `terminal_id` the server does not offer the terminal's tools at all,
+/// and a model asked for a PDF will describe one instead of writing one. The
+/// field name is the server's (`form_data.pop('terminal_id')`), pinned here so a
+/// rename in the app is caught by a test rather than by a silent loss of tools.
+@Test func terminalIsNamedBySingularTerminalID() throws {
+    var request = CompletionRequest(
+        model: "local-personal",
+        messages: [CompletionRequest.WireMessage(id: "m", role: "user", content: .text("hi"))],
+        chatID: "c", parentID: .root, stream: true)
+    request.terminalID = "sandbox"
+    let data = try JSONEncoder().encode(request)
+    let object = try JSONDecoder().decode([String: JSONValue].self, from: data)
+    #expect(object["terminal_id"]?.stringValue == "sandbox")
+    #expect(object["terminal_ids"] == nil)
+
+    // And it is absent when no terminal was named, rather than a null the server
+    // reads as "clear the selection".
+    request.terminalID = nil
+    let bare = try JSONDecoder().decode([String: JSONValue].self, from: JSONEncoder().encode(request))
+    #expect(bare["terminal_id"] == nil)
+}
+
 struct CompletionRequestTests {
     private func json(_ request: CompletionRequest) throws -> [String: JSONValue] {
         try JSONDecoder().decode([String: JSONValue].self, from: JSONEncoder().encode(request))
