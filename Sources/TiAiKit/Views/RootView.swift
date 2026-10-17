@@ -131,7 +131,7 @@ public struct ChatListView: View {
     /// document, not a menu — reading it in a strip was the wrong shape.
     var onOpenNotes: (() -> Void)? = nil
 
-    /// When set, a toolbar button opens the whole list full screen.
+    /// When set, a "Chats" row in the list opens the whole thing full screen.
     var onExpand: (() -> Void)? = nil
 
     /// Bumped by the host to ask for a refresh. A chat started on this phone does
@@ -250,6 +250,14 @@ public struct ChatListView: View {
                     // what every iOS sidebar does, and the pills drew more
                     // attention to themselves than to what they open.
                     Section {
+                        // Only offered where it is not self-referential: in the
+                        // full-screen list this row would open the screen you are
+                        // already on.
+                        if let onExpand {
+                            Button(action: onExpand) {
+                                Label("Chats", systemImage: "bubble.left.and.bubble.right")
+                            }
+                        }
                         if let onOpenNotes {
                             Button(action: onOpenNotes) {
                                 Label("Notes", systemImage: "note.text")
@@ -403,16 +411,6 @@ public struct ChatListView: View {
                         ConversationView(session: session, chatID: nil, models: models)
                     } label: {
                         Label("New chat", systemImage: "square.and.pencil")
-                    }
-                }
-            }
-            // Its own item, not a second button in the compose item: two buttons
-            // in one ToolbarItem render as one, and the compose control simply
-            // disappeared.
-            if let onExpand {
-                ToolbarItem(placement: .primaryAction) {
-                    Button(action: onExpand) {
-                        Label("Open full screen", systemImage: "arrow.up.left.and.arrow.down.right")
                     }
                 }
             }
