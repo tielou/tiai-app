@@ -389,6 +389,8 @@ public struct ChatHomeView: View {
     /// kept showing the conversation you were already looking at.
     @State private var draft = 0
     @State private var showingChats = false
+    /// Live drag offset while closing the drawer by hand. Negative, in points.
+    @State private var drag: CGFloat = 0
 
     private var host: String { session.client.server.baseURL.host ?? "local" }
 
@@ -404,11 +406,19 @@ public struct ChatHomeView: View {
     }
 
     private func closeChats() {
-        withAnimation(.snappy(duration: 0.28)) { showingChats = false }
+        drag = 0
+        showingChats = false
     }
 
     public var body: some View {
         GeometryReader { proxy in
+            let panelWidth = proxy.size.width * 0.84
+            // Where the panel is right now: fully out, fully in, or partway
+            // through a drag. Driving an offset from state, rather than inserting
+            // and removing the view with a transition, is what makes it slide out
+            // as well as in — a removal transition was being dropped on the floor
+            // and the drawer simply vanished.
+            let x = (showingChats ? 0 : -panelWidth) + min(drag, 0)
             ZStack(alignment: .leading) {
                 NavigationStack {
                     ConversationView(
@@ -417,56 +427,58 @@ public struct ChatHomeView: View {
                         .id("\(chatID ?? "new")-\(draft)")
                         .toolbar {
                             ToolbarItem(placement: .navigation) {
-                                Button { withAnimation(.snappy(duration: 0.28)) { showingChats = true } } label: {
+                                Button { showingChats = true } label: {
                                     Label("Chats", systemImage: "line.3.horizontal")
                                 }
                             }
                         }
                 }
 
-                if showingChats {
-                    // The rest of the screen, dimmed, and a tap on it closes.
-                    Color.black.opacity(0.45)
-                        .ignoresSafeArea()
-                        .contentShape(Rectangle())
-                        .onTapGesture { closeChats() }
-                        .transition(.opacity)
+                // The rest of the screen, dimmed, and a tap on it closes.
+                Color.black
+                    .opacity(showingChats ? 0.45 * max(0, 1 + Double(drag / panelWidth)) : 0)
+                    .ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .onTapGesture { closeChats() }
+                    .allowsHitTesting(showingChats)
 
-                    // A drawer, not a push. The button that opens it is on the
-                    // left, so it has to arrive from the left: a list sliding in
-                    // from the right to answer a button in the opposite corner
-                    // reads as a mistake, and a sheet from below read as one too.
-                    // The conversation stays partly visible behind it, which is
-                    // what tells you this is an overlay and not another screen.
-                    NavigationStack {
-                        ChatListView(session: session) { picked in
-                            chatID = picked
-                            if picked == nil { startNewChat() }
-                            closeChats()
-                        }
+                // A drawer, not a push. The button that opens it is on the left,
+                // so it has to arrive from the left. The conversation stays partly
+                // visible behind it, which is what tells you this is an overlay
+                // and not another screen.
+                NavigationStack {
+                    ChatListView(session: session) { picked in
+                        chatID = picked
+                        if picked == nil { startNewChat() }
+                        closeChats()
                     }
-                    // Background and shadow before the width frames, not after.
-                    // Applied to the full-width positioning frame they painted the
-                    // panel across the entire screen: the dim strip was covered,
-                    // and the tap that should have closed the drawer landed on the
-                    // drawer's own background instead of the scrim behind it.
-                    .opaqueBackground()
-                    .shadow(color: .black.opacity(0.35), radius: 16, x: 6)
-                    .gesture(
-                        DragGesture()
-                            .onEnded { value in
-                                if value.translation.width < -50
-                                    || value.predictedEndTranslation.width < -160 {
-                                    closeChats()
-                                }
-                            }
-                    )
-                    .frame(width: proxy.size.width * 0.84)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .transition(.move(edge: .leading))
                 }
+                // Background and shadow before the width frame, not after: applied
+                // to the full-width positioning frame they painted the panel across
+                // the whole screen, covering the dim strip and swallowing the tap
+                // that was meant to close it.
+                .opaqueBackground()
+                .shadow(color: .black.opacity(0.35), radius: 16, x: 6)
+                .frame(width: panelWidth)
+                .offset(x: x)
+                .allowsHitTesting(showingChats)
+                // Drags shut under the finger, the way a real drawer does, and
+                // snaps back if you let go early.
+                .gesture(
+                    DragGesture()
+                        .onChanged { drag = min($0.translation.width, 0) }
+                        .onEnded { value in
+                            let travel = min(value.translation.width, 0)
+                            drag = 0
+                            if travel < -panelWidth * 0.3
+                                || value.predictedEndTranslation.width < -panelWidth * 0.7 {
+                                closeChats()
+                            }
+                        }
+                )
             }
-            .animation(.snappy(duration: 0.28), value: showingChats)
+            .animation(.spring(response: 0.3, dampingFraction: 0.9), value: showingChats)
+            .animation(.interactiveSpring(response: 0.2, dampingFraction: 0.9), value: drag)
             // Swipe right from the left edge to open, the way every other drawer
             // on the platform works. A simultaneous gesture rather than a
             // high-priority one, so a vertical scroll inside the transcript still
