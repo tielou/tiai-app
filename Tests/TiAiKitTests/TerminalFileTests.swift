@@ -85,3 +85,38 @@ private func decode(output: [JSONValue]) throws -> ChatMessage {
     let message = try decode(output: output)
     #expect(message.terminalFiles.isEmpty)
 }
+
+/// The PDF writer answers with a markdown link to `/files/{id}/content`. Those
+/// routes need the app's token, so the link cannot be left for the browser.
+@Test func fileLinksAreLiftedOutOfTheAnswer() {
+    let text = """
+    Done! Your PDF is ready.
+
+    [\u{2B07}\u{FE0F} Download Smoke_Test.pdf](/api/v1/files/d1ce2b39-207a/content)
+    """
+    let found = FileLink.extract(text)
+    #expect(found.links.count == 1)
+    #expect(found.links.first?.id == "d1ce2b39-207a")
+    // The label keeps its glyph; only the variation selector is dropped. It is
+    // the model's wording, and a card that renames the file it offers is worse
+    // than one that shows an emoji the simulator cannot draw.
+    #expect(found.links.first?.name == "\u{2B07} Download Smoke_Test.pdf")
+    // The link is gone from the prose, so it is not drawn twice.
+    #expect(!found.text.contains("/api/v1/files/"))
+    #expect(found.text.contains("Done!"))
+}
+
+/// An absolute URL to the same route is the same file.
+@Test func absoluteFileLinksAreFoundToo() {
+    let found = FileLink.extract(
+        "see [x](https://chat.example/api/v1/files/abc123/content)")
+    #expect(found.links.first?.id == "abc123")
+}
+
+/// Ordinary links must be left alone for the browser.
+@Test func ordinaryLinksAreLeftAlone() {
+    let text = "Read [the docs](https://example.com/a) for more."
+    let found = FileLink.extract(text)
+    #expect(found.links.isEmpty)
+    #expect(found.text.contains("[the docs](https://example.com/a)"))
+}

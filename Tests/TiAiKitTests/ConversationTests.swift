@@ -1646,3 +1646,25 @@ enum AskUserFixture {
     #expect(conversation.phase == .ready, "a dead run must not hold the composer hostage")
     #expect(conversation.turns.last?.text == "abandoned here", "and the partial answer stays")
 }
+
+/// The terminal sandbox is what makes the model able to hand you a file. Off, it
+/// cannot write one — and the web UI has it on, so the app being off by default
+/// would silently drop a whole class of answer.
+@Test @MainActor func codeInterpreterStartsOnWhereTheModelHasIt() {
+    let model = ChatModel.stub("local-personal",
+                               caps: ["memory": true, "code_interpreter": true])
+    let seeded = ConversationModel.seedFeatures(for: model)
+    #expect(seeded["code_interpreter"] == true)
+    #expect(seeded["memory"] == true)
+}
+
+/// A model that says it has no sandbox must not get a toggle that lies about it.
+/// A model that said *nothing at all* is different and still gets one — see
+/// `ChatModel.supports(_:)`: silence is not a refusal.
+@Test @MainActor func codeInterpreterIsNotForcedOnForModelsThatRefuseIt() {
+    let model = ChatModel.stub("local-fast",
+                               caps: ["code_interpreter": false, "memory": false])
+    let seeded = ConversationModel.seedFeatures(for: model)
+    #expect(seeded["code_interpreter"] == nil)
+    #expect(seeded["memory"] == nil)
+}

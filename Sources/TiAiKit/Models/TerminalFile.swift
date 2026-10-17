@@ -110,3 +110,42 @@ extension ChatMessage {
         return nil
     }
 }
+
+/// A link the answer gave to a file it produced, e.g. the PDF writer's
+/// `[Download Smoke_Test.pdf](/api/v1/files/<id>/content)`.
+///
+/// Worth its own type because the obvious thing — letting the system open the
+/// link — does not work. Those URLs need the app's bearer token, so opening one
+/// in a browser answers 401. The link has to be fetched in-app and handed over.
+public struct FileLink: Identifiable, Equatable, Sendable {
+    public var id: String
+    public var name: String
+
+    public init(id: String, name: String) {
+        self.id = id
+        self.name = name
+    }
+
+    nonisolated(unsafe) private static let pattern = try! Regex(
+        #"\[([^\]]*)\]\((?:https?://[^/\s]+)?/api/v1/files/([^/\s)]+)/content\)"#)
+
+    /// The links in a message, and the same text with them taken out so the link
+    /// is not rendered twice — once as a card and once as a dead browser link.
+    public static func extract(_ text: String) -> (links: [FileLink], text: String) {
+        var links: [FileLink] = []
+        for match in text.matches(of: pattern) {
+            guard let id = match.output[2].substring.map(String.init), !id.isEmpty else {
+                continue
+            }
+            let label = (match.output[1].substring.map(String.init) ?? "")
+                .replacingOccurrences(of: "\u{FE0F}", with: "")
+                .trimmingCharacters(in: .whitespaces)
+            links.append(FileLink(id: id, name: label.isEmpty ? "Download file" : label))
+        }
+        let stripped = text.replacing(pattern) { _ in "" }
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            .joined(separator: "\n")
+        return (links, stripped.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+}

@@ -40,6 +40,47 @@ public struct ConversationView: View {
     ///
     /// The sandbox is addressed by chat, so a chat that has not been saved yet
     /// cannot have one — the server would not know whose terminal to look in.
+    /// Which sandbox file is downloading, and which failed. Owned by the screen,
+    /// because the screen is the one doing the fetching.
+    @State private var seededTools = false
+
+    /// Workspace tools start switched on.
+    ///
+    /// They are capabilities the admin installed for this instance — a PDF writer,
+    /// a document reader — and a chat that cannot make a PDF because the reader
+    /// had to know to dig for a toggle three levels deep is worse than one that
+    /// tries. MCP servers are the exception: they need a sign-in first, so
+    /// selecting them by default would put a broken tool in every request.
+    ///
+    /// Only seeded once, and only while nothing is selected, so switching
+    /// everything off stays switched off.
+    private func seedTools(_ tools: [ChatTool]) {
+        guard !seededTools else { return }
+        seededTools = true
+        guard conversation.tools.isEmpty else { return }
+        conversation.tools = tools
+            .filter { !$0.id.hasPrefix("server:") && $0.available }
+            .map(\.id)
+    }
+
+    /// Fetch a file the answer linked and hand it to the share sheet. The link is
+    /// a `/files/{id}/content` route, which needs the app's token, so the system
+    /// browser would only be shown a 401.
+    private func openFileLink(_ link: FileLink) {
+        busyFile = link.id
+        failedFile = nil
+        Task {
+            defer { busyFile = nil }
+            guard let data = try? await session.client.fileContent(id: link.id), !data.isEmpty
+            else { failedFile = link.id; return }
+            let out = FileManager.default.temporaryDirectory
+                .appendingPathComponent(link.name.replacingOccurrences(of: "/", with: "-"))
+            try? FileManager.default.removeItem(at: out)
+            guard (try? data.write(to: out)) != nil else { failedFile = link.id; return }
+            shareFile = SharedFile(url: out)
+        }
+    }
+
     private func openTerminalFile(_ file: TerminalFile) {
         guard let chat = conversation.chatID else {
             failedFile = file.id
@@ -169,31 +210,6 @@ public struct ConversationView: View {
         #endif
         .toolbar { toolbar }
         .task {
-            await conversation.connect()
-            // Cached tools and models appear immediately; the network corrects
-            // them a beat later. A chat with no model to name cannot send.
-            if models.isEmpty,
-               let cached = DiskCache.load([ChatModel].self, key: DiskCache.key("models", host: host)) {
-                models = cached
-            }
-            if let cached = DiskCache.load([ChatTool].self, key: DiskCache.key("tools", host: host)) {
-                chatTools = cached
-            }
-            await conversation.load()
-            if models.isEmpty, let fresh = try? await session.client.models(), !fresh.isEmpty {
-                models = fresh
-                DiskCache.save(fresh, key: DiskCache.key("models", host: host))
-            }
-            conversation.setModels(models)
-            do {
-                let fresh = try await session.client.chatTools()
-                chatTools = fresh
-                DiskCache.save(fresh, key: DiskCache.key("tools", host: host))
-            }
-            // Kept rather than swallowed: an absent Tools section is otherwise
-            // indistinguishable from an instance that has no tools, and the
-            // second one is normal while the first is a bug.
-            catch { chatToolsError = error.localizedDescription }
             #if DEBUG
             // Diagnostics: `TIAI_DUMP_CHAT=<id>` reads one chat record into the
             // dump directory using the app's own session, so a payload can be
@@ -218,7 +234,77 @@ public struct ConversationView: View {
                conversation.chatID == nil {
                 probeOAuth()
             }
+            // Diagnostics: `TIAI_FILE_PROBE=<chat>|<selector>|<path>` fetches one
+            // sandbox file and logs the result, so the terminal route can be
+            // confirmed without driving the transcript to a message that has one.
+            if let probe = ProcessInfo.processInfo.environment["TIAI_FILE_PROBE"] {
+                Task {
+                    // `file:<id>` checks the link path instead of the sandbox one.
+                    if probe.hasPrefix("file:") {
+                        let id = String(probe.dropFirst(5))
+                        do {
+                            let data = try await session.client.fileContent(id: id)
+                            OWUIClient.debugLog("file probe ok: \(data.count) bytes")
+                        } catch { OWUIClient.debugLog("file probe failed: \(error)") }
+                        return
+                    }
+                    let parts = probe.split(separator: "|", omittingEmptySubsequences: false)
+                    guard parts.count == 3 else {
+                        OWUIClient.debugLog("file probe: expected chat|selector|path")
+                        return
+                    }
+                    do {
+                        let data = try await session.client.terminalFile(
+                            selector: String(parts[1]), path: String(parts[2]),
+                            sessionID: String(parts[0]))
+                        OWUIClient.debugLog("file probe ok: \(data.count) bytes")
+                    } catch { OWUIClient.debugLog("file probe failed: \(error)") }
+                }
+            }
+            // Diagnostics: `TIAI_SEND=<text>` sends a message through the real send
+            // path on launch. Synthetic clicks stopped registering in the simulator,
+            // and what is worth checking — which `features` actually go on the wire —
+            // is only knowable by really sending.
+            if let text = ProcessInfo.processInfo.environment["TIAI_SEND"] {
+                Task {
+                    // Wait for models and tools to land, or the send picks a model
+                    // that has not been chosen yet.
+                    try? await Task.sleep(for: .seconds(4))
+                    if let ids = ProcessInfo.processInfo.environment["TIAI_TOOLS"] {
+                        conversation.tools = ids.split(separator: ",").map(String.init)
+                    }
+                    conversation.draft = text
+                    conversation.send()
+                }
+            }
             #endif
+            await conversation.connect()
+            // Cached tools and models appear immediately; the network corrects
+            // them a beat later. A chat with no model to name cannot send.
+            if models.isEmpty,
+               let cached = DiskCache.load([ChatModel].self, key: DiskCache.key("models", host: host)) {
+                models = cached
+            }
+            if let cached = DiskCache.load([ChatTool].self, key: DiskCache.key("tools", host: host)) {
+                chatTools = cached
+                seedTools(cached)
+            }
+            await conversation.load()
+            if models.isEmpty, let fresh = try? await session.client.models(), !fresh.isEmpty {
+                models = fresh
+                DiskCache.save(fresh, key: DiskCache.key("models", host: host))
+            }
+            conversation.setModels(models)
+            do {
+                let fresh = try await session.client.chatTools()
+                chatTools = fresh
+                DiskCache.save(fresh, key: DiskCache.key("tools", host: host))
+                seedTools(fresh)
+            }
+            // Kept rather than swallowed: an absent Tools section is otherwise
+            // indistinguishable from an instance that has no tools, and the
+            // second one is normal while the first is a bug.
+            catch { chatToolsError = error.localizedDescription }
         }
         .onChange(of: scenePhase) { _, phase in
             // Only act on coming back. `.inactive` is Control Centre, a pulled-down
@@ -293,6 +379,7 @@ public struct ConversationView: View {
                             onSibling: { conversation.selectSibling(of: turn.id, direction: $0) },
                             fileLoader: { await conversation.fileData(id: $0) },
                             onOpenFile: openTerminalFile,
+                            onOpenLink: openFileLink,
                             fileBusy: busyFile,
                             fileFailed: failedFile
                         )
@@ -617,8 +704,13 @@ struct MessageRow: View {
                         SettledCallsCard(calls: calls)
                     }
                 }
-                ForEach(Array(Markdown.blocks(TextSanitizer.clean(turn.text)).enumerated()), id: \.offset) { _, block in
+                ForEach(Array(Markdown.blocks(TextSanitizer.clean(renderedText)).enumerated()), id: \.offset) { _, block in
                     MarkdownBlockView(block: block, streaming: turn.streaming)
+                }
+                ForEach(FileLink.extract(TextSanitizer.clean(turn.text)).links) { link in
+                    FileLinkCard(link: link, busy: fileBusy == link.id,
+                                 failed: fileFailed == link.id)
+                    { onOpenLink?(link) }
                 }
                 if !turn.terminalFiles.isEmpty {
                     ForEach(turn.terminalFiles) { file in
@@ -643,6 +735,15 @@ struct MessageRow: View {
     /// sandbox. The row cannot fetch it itself: the sandbox is found by chat, and
     /// the row does not know which chat it is in.
     var onOpenFile: ((TerminalFile) -> Void)? = nil
+    /// Called for a link the answer gave to a file it made. Same reason as
+    /// `onOpenFile`: the fetch needs the app's token, so the system browser
+    /// cannot open these links itself.
+    var onOpenLink: ((FileLink) -> Void)? = nil
+
+    /// The answer with its file links lifted out, so a link is not drawn twice.
+    private var renderedText: String {
+        FileLink.extract(TextSanitizer.clean(turn.text)).text
+    }
     /// Which sandbox file is downloading, and which failed. Owned by the screen,
     /// because the screen is the one doing the fetching.
     var fileBusy: String? = nil
@@ -1567,3 +1668,43 @@ struct TerminalFileCard: View {
         }
     }
 
+/// A link the answer gave to a file it produced, made tappable in-app.
+///
+/// The system would happily open the URL itself — and get a 401, because those
+/// routes need the app's bearer token. So the link is fetched here and handed to
+/// the share sheet instead.
+struct FileLinkCard: View {
+    let link: FileLink
+    let busy: Bool
+    let failed: Bool
+    let open: () -> Void
+
+    var body: some View {
+        Button(action: open) {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(.tint)
+                    .frame(width: 26)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(link.name)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                    Text(busy ? "Opening\u{2026}"
+                        : failed ? "Could not fetch it"
+                        : "Tap to open or save")
+                        .font(.caption)
+                        .foregroundStyle(failed ? .orange : .secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                if busy { ProgressView().controlSize(.small) }
+            }
+            .padding(11)
+            .background(cardBackground, in: .rect(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+    }
+}

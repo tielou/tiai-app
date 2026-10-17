@@ -145,11 +145,18 @@ public final class ConversationModel {
     /// The toggles a model starts a chat with.
     ///
     /// The server's own defaults first, so a model configured for web search
-    /// starts with it on. Then memory, which the server leaves off unless the
-    /// user enabled it globally — and a chat that quietly forgets what you told
-    /// it is a worse surprise than one that remembers too much. Memory is only
-    /// offered where the model reports the capability, because a toggle that
-    /// does nothing is worse than no toggle.
+    /// starts with it on. Then two we force on deliberately:
+    ///
+    /// * **memory**, which the server leaves off unless enabled globally — and a
+    ///   chat that quietly forgets what you told it is a worse surprise than one
+    ///   that remembers too much.
+    /// * **code interpreter**, because it is what the terminal sandbox is. Off,
+    ///   the model cannot write a file, run a command, or hand you a PDF, and the
+    ///   web UI has it on by default — so the app would be missing a whole class
+    ///   of answer for no reason the user chose.
+    ///
+    /// Both are only offered where the model reports the capability, because a
+    /// toggle that does nothing is worse than no toggle.
     static func seedFeatures(for model: ChatModel?, incognito: Bool = false) -> [String: Bool] {
         guard let model else { return [:] }
         var seeded = Dictionary(
@@ -157,6 +164,7 @@ public final class ConversationModel {
         // Incognito has to mean something. Remembering what the user just said
         // in a chat that is supposed to vanish is the opposite of the request.
         if model.supports(.memory) && !incognito { seeded[ChatFeature.memory.rawValue] = true }
+        if model.supports(.codeInterpreter) { seeded[ChatFeature.codeInterpreter.rawValue] = true }
         return seeded
     }
 
@@ -358,6 +366,27 @@ public final class ConversationModel {
 
     public func detach(_ attachment: PendingAttachment) {
         attachments.removeAll { $0.id == attachment.id }
+    }
+
+    /// Diagnostics only: `TIAI_FEATURES=terminal,foo=false` merges extra keys into
+    /// the `features` map so a candidate capability name can be tested against a
+    /// live server without guessing from the client's own defaults.
+    static func debugFeatureOverrides(base: [String: Bool]) -> [String: Bool] {
+        #if DEBUG
+        guard let raw = ProcessInfo.processInfo.environment["TIAI_FEATURES"], !raw.isEmpty
+        else { return base }
+        var merged = base
+        for item in raw.split(separator: ",") {
+            let parts = item.split(separator: "=", maxSplits: 1)
+            let key = parts.first.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? ""
+            guard !key.isEmpty else { continue }
+            let value = parts.count > 1 ? (parts[1] == "true") : true
+            merged[key] = value
+        }
+        return merged
+        #else
+        return base
+        #endif
     }
 
     public func send() {
@@ -674,7 +703,7 @@ public final class ConversationModel {
                 id: userMessageID, role: "user", content: content,
                 parentID: parentID, model: model),
             messageID: assistantID,
-            features: features,
+            features: Self.debugFeatureOverrides(base: features),
             files: files.isEmpty ? nil : Self.filePayload(files),
             // `ask` is what makes the server park on a tool call and wait for a
             // tap. Left unset the server runs every tool without asking, which is

@@ -513,6 +513,14 @@ public struct ChatHomeView: View {
         refreshBadge += 1
     }
 
+    #if DEBUG
+    /// Diagnostics: `TIAI_OPEN_CHAT=<id>` opens one chat on launch, so a specific
+    /// message can be screenshotted without driving a flaky list to it.
+    private func probeOpenChat() {
+        if let id = ProcessInfo.processInfo.environment["TIAI_OPEN_CHAT"] { chatID = id }
+    }
+    #endif
+
     /// A chat the server has just removed. If it is the one on screen, leave it —
     /// staying in a deleted conversation means the next message goes somewhere
     /// that no longer exists, and the transcript on screen is a copy of nothing.
@@ -595,6 +603,11 @@ public struct ChatHomeView: View {
                             }
                         }
                 )
+            }
+            .task {
+                #if DEBUG
+                probeOpenChat()
+                #endif
             }
             .animation(.spring(response: 0.3, dampingFraction: 0.9), value: showingChats)
             .animation(.interactiveSpring(response: 0.2, dampingFraction: 0.9), value: drag)
