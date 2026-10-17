@@ -96,13 +96,60 @@ public struct Note: Codable, Equatable, Sendable, Identifiable {
     public var preview: String {
         let lines = markdown
             .split(separator: "\n", omittingEmptySubsequences: true)
-            .map { $0.replacingOccurrences(of: "#", with: "").trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty && $0 != "***" && $0 != "---" }
-        let heading = title.trimmingCharacters(in: .whitespaces)
-        if let first = lines.first, first == heading {
+            .map { Self.plain(String($0)) }
+            // A rule (`---`, `***`) survives the markup strip as punctuation, and
+            // a row of dashes is not a preview of anything.
+            .filter { $0.contains(where: \.isLetter) || $0.contains(where: \.isNumber) }
+        guard let first = lines.first else { return "Empty note" }
+        if Self.saysTheSameThing(first, title) {
             return lines.dropFirst().first ?? "Empty note"
         }
-        return lines.first ?? "Empty note"
+        return first
+    }
+
+    /// A line of Markdown reduced to the text a reader would actually want.
+    ///
+    /// A preview is a preview. `**Base:** Kos Town · **Car:** yes` and
+    /// `[_open-systems.com_](http://…)` are the author's punctuation, not
+    /// yours, and at one line long the markup cost more than it explained.
+    static func plain(_ line: String) -> String {
+        var s = line
+        // Block markers off the front, links down to their text — a bare URL is
+        // the whole line at this width — then the emphasis characters.
+        s = s.replacing(/^[\s#>]+/, with: "")
+        s = s.replacing(/!\[[^\]]*\]\([^)]*\)/, with: "")
+        s = s.replacing(/\[([^\]]*)\]\([^)]*\)/) { String($0.1) }
+        for marker in ["**", "__", "~~", "*", "_", "`"] {
+            s = s.replacingOccurrences(of: marker, with: "")
+        }
+        return s.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
+    /// Whether a body line is just the title again.
+    ///
+    /// Compared on letters and numbers alone: an emoji in front, `_UNDERSCORES_`
+    /// around it and an em dash instead of a hyphen are decoration, and the real
+    /// notes have all three.
+    ///
+    /// The shape that matters is a body line that is a *shorter* version of the
+    /// title, because Open WebUI titles a note from its first heading and then
+    /// widens it — a note titled "Kos — 7 Days, Late September (Vegetarian
+    /// Edition)" opens with "# Kos — 7 Days, Late September".
+    ///
+    /// Only in that direction. A body that starts with the title's words and
+    /// carries on is content, not a restatement, and dropping it loses the only
+    /// line the note has. Hence the length floor as well: a bare "Goal" under a
+    /// title of "Goal setting" is not the title repeated.
+    static func saysTheSameThing(_ body: String, _ title: String) -> Bool {
+        func scrub(_ s: String) -> String {
+            s.lowercased()
+                .filter { $0.isLetter || $0.isNumber || $0.isWhitespace }
+                .split(whereSeparator: \.isWhitespace)
+                .joined(separator: " ")
+        }
+        let a = scrub(body), b = scrub(title)
+        guard a.count >= 10, !b.isEmpty else { return false }
+        return b.hasPrefix(a)
     }
 
     /// The payload for a save: only `content.md`, so the rich-editor document the

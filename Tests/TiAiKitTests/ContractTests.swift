@@ -511,6 +511,39 @@ struct ServerTests {
     #expect(note("\(expected)000000000").preview == "Head")
 }
 
+@Test func aPreviewDoesNotRepeatTheTitle() throws {
+    func note(_ title: String, _ md: String) throws -> Note {
+        let raw: [String: Any] = [
+            "id": "n", "title": title,
+            "updated_at": 1_790_407_934, "created_at": 1_790_407_934,
+            "data": ["content": ["md": md]],
+        ]
+        return try JSONDecoder().decode(Note.self, from: JSONSerialization.data(withJSONObject: raw))
+    }
+    // All three shapes off the live server, verbatim.
+    #expect(try note("Kos — 7 Days, Late September (Vegetarian Edition)",
+                     "# Kos — 7 Days, Late September\n\n**Base:** Kos Town")
+        .preview.contains("Base"))
+    #expect(try note("AI Agent Naming — Options & Recommendation (Slack-ready)",
+                     "🛰️ _AI AGENT NAMING — OPTIONS & RECOMMENDATION_  \n\nRoster below")
+        .preview.contains("Roster"))
+    #expect(try note("Home Agent Platform — Architecture",
+                     "# Home Agent Platform — Architecture\n**Goal:** resident agents")
+        .preview.contains("Goal"))
+    // A body that starts with the title's words and carries on is content.
+    #expect(try note("Kos", "Kos is an island").preview == "Kos is an island")
+    // Too short to be a restatement, whatever it prefixes.
+    #expect(try note("Goal setting for the quarter", "Goal\nrun the plan").preview == "Goal")
+    #expect(try note("Anything", "").preview == "Empty note")
+    // Markup is the author's, not the reader's.
+    #expect(try note("Trip", "**Base:** Kos Town · **Car:** yes").preview
+        == "Base: Kos Town · Car: yes")
+    #expect(try note("Roster", "[_open-systems.com_](http://open-systems.com/x) has them")
+        .preview == "open-systems.com has them")
+    // A rule is not a preview of anything.
+    #expect(try note("Plan", "---\n\nactually this").preview == "actually this")
+}
+
 @Test func notesRequestsMatchTheRoutes() async throws {
     // The routes are `POST /notes/create`, `POST /notes/{id}/update` and
     // `DELETE /notes/{id}/delete` — none of them RESTful, all of them easy to
