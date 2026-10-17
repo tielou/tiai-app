@@ -79,7 +79,7 @@ public final class ConversationModel {
 
     /// How long to wait on a silent stream before calling it dead. Longer than
     /// the slowest cold prefill you have seen, shorter than someone's patience.
-    static let silenceLimit: Duration = .seconds(180)
+    static let silenceLimit: Duration = .seconds(60)
     /// How long a turn may sit between a `finish_reason` and the tool result that
     /// follows it. Long enough for a slow MCP server, short enough that a tool
     /// which died silently does not leave the composer spinning for three minutes.
@@ -196,10 +196,22 @@ public final class ConversationModel {
         catch let problem { error = "Live streaming is unavailable: \(problem.localizedDescription)" }
     }
 
-    /// Bring the socket back after the app has been away, without making the
-    /// screen wait for it or showing a banner about it. The hub retries on its
-    /// own; a chat that opens on a dead radio should still show its messages.
-    public func reconnect() { hub.reconnectIfNeeded() }
+    /// Coming back to the foreground with a run still marked as streaming.
+    ///
+    /// iOS kills the socket in the background and the server keeps writing, so
+    /// the answer is already finished by the time you look again — but the run is
+    /// sitting on a frame stream that will never see them. If the reconnect does
+    /// not come back, end the stream so the run reconciles against the server
+    /// record now instead of after the silence watchdog.
+    public func resumeAfterBackground() {
+        hub.reconnectIfNeeded()
+        guard phase == .streaming, let chat = chatID else { return }
+        Task { [weak self] in
+            try? await Task.sleep(for: ChatEventHub.reconnectGrace)
+            guard let self, self.phase == .streaming, !self.hub.isConnected else { return }
+            self.hub.expire(chatID: chat)
+        }
+    }
 
     // MARK: - loading
 

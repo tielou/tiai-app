@@ -45,6 +45,34 @@ public final class ChatEventHub {
         socket.onFrame { [weak self] frame in
             Task { @MainActor in self?.receive(frame) }
         }
+        // The socket reconnects itself; this is how the hub finds out.
+        //
+        // A drop is not immediately fatal to a run — Starscream is usually back
+        // within a second, and tearing the listener down that fast would throw
+        // away live streaming over a wifi blip. So there is a grace period, and
+        // if the connection is still dead after it, every listener is ended.
+        // Their runs then fall into the reconcile path and read the answer off
+        // the server record, which is the thing that already works when you
+        // leave the chat and come back.
+        socket.onStatusChange { [weak self] up in
+            Task { @MainActor in
+                guard let self else { return }
+                self.isConnected = up
+                if up { self.lastError = nil; return }
+                try? await Task.sleep(for: Self.reconnectGrace)
+                if !self.isConnected { self.expireAll() }
+            }
+        }
+    }
+
+    /// How long the socket may be down before runs stop waiting for it.
+    static let reconnectGrace: Duration = .seconds(4)
+
+    /// Ends every listener. A run whose stream ends this way has seen no terminal
+    /// frame, so its caller reconciles against the server instead of hanging.
+    public func expireAll() {
+        for (_, subscriber) in subscribers { subscriber.continuation.finish() }
+        subscribers.removeAll()
     }
 
     /// Connects if not already connected. Safe to call from every screen.

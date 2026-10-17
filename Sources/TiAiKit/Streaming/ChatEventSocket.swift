@@ -299,6 +299,19 @@ public final class ChatEventSocket: @unchecked Sendable {
         }
     }
 
+    /// Reports the socket going up and down after the first connect.
+    ///
+    /// Starscream reconnects on its own, but until now nothing upstream knew it
+    /// had: the hub still believed it was connected, a run kept waiting for frames
+    /// that would never come, and the only thing that ever ended it was the
+    /// three-minute silence watchdog. That is the "I have to leave the chat and
+    /// come back" bug — the server had finished writing a minute ago.
+    public func onStatusChange(_ handler: @escaping (_ connected: Bool) -> Void) {
+        client.on(clientEvent: .connect) { _, _ in handler(true) }
+        client.on(clientEvent: .disconnect) { _, _ in handler(false) }
+        client.on(clientEvent: .error) { _, _ in handler(false) }
+    }
+
     /// Subscribes to every `events` frame. The caller filters by chat and
     /// message; the socket itself is one shared connection for the whole app.
     public func onFrame(_ handler: @escaping (Frame) -> Void) {

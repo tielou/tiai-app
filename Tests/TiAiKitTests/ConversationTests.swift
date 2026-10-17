@@ -1498,6 +1498,26 @@ enum AskUserFixture {
 // A chat the server creates has no id the app can subscribe with, so the listener
 // has to adopt one from the traffic. Without this the first message of a new chat
 // would stream into nowhere.
+@Test @MainActor func aDroppedSocketEndsRunsSoTheyReconcile() async throws {
+    // The bug this pins: the socket dies, and nothing told the hub — so a run sat
+    // on a frame stream that would never see another frame, stuck on "streaming"
+    // until the silence watchdog fired. The user's workaround was to leave the
+    // chat and come back, which refetches.
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let stream = hub.frames(for: "c1")
+    let collector = Task { () -> Int in
+        var n = 0
+        for await _ in stream { n += 1 }
+        return n
+    }
+    try await Task.sleep(for: .milliseconds(20))
+    for frame in Frames.run(chat: "c1", message: "m1", answer: "partial") { hub.receive(frame) }
+    hub.expireAll()
+    // The stream ends rather than hanging, which is what lets the run fall
+    // through to reading the finished answer off the server record.
+    #expect(await collector.value > 0)
+}
+
 @Test @MainActor func aWaitingListenerAdoptsTheChatItHearsFrom() async throws {
     let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
     var adopted: String?

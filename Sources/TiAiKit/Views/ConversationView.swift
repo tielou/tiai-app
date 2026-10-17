@@ -178,7 +178,7 @@ public struct ConversationView: View {
                 // radio is often still coming back at this exact moment, and
                 // making the chat wait for it — or banner about it — is worse
                 // than connecting a second later.
-                conversation.reconnect()
+                conversation.resumeAfterBackground()
                 // Coming back from a browser sign-in is the normal way this
                 // changes: the tool said "not signed in", you signed in, and
                 // the row should know that without a relaunch.
