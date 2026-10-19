@@ -1029,43 +1029,67 @@ public final class ConversationModel {
         // Sources are not streamed as deltas — the server attaches them when it
         // saves the message. Without this a citation only appeared after leaving
         // and re-entering the chat, which reads as the feature being broken.
-        if outcome.failure == nil, outcome.sawTerminal, let chat = chatID {
+        // Not gated on `sawTerminal`. A long run — twenty-odd tool calls, a
+        // weasyprint build — can end by the listener expiring rather than by a
+        // finish frame, and gating on the terminal frame meant exactly those runs
+        // never looked at the stored message. Which is where the file the model
+        // had just wrote lives. The fetch is cheap and idempotent; the cases it
+        // used to skip were the ones that needed it.
+        if outcome.failure == nil, let chat = chatID {
             let id = finished.id
             let streamed = finished.text
+            // A `display_file` call means a card is owed. The result is written
+            // when the server saves the message, which can land a beat after the
+            // run ends, so keep looking for a few seconds rather than concluding
+            // there is no file on the first miss.
+            let owesFile = finished.calls.contains { $0.name == "display_file" }
+            let api = client
             Task { @MainActor [weak self] in
-                guard let self,
-                    let detail = try? await client.chat(id: chat),
-                    let stored = detail.messages[id],
-                    let at = self.turns.firstIndex(where: { $0.id == id })
-                else { return }
-                // Sources are not streamed as deltas — the server attaches them
-                // when it saves the message. Without this a citation only
-                // appeared after leaving and re-entering the chat, which reads
-                // as the feature being broken.
-                if stored.citedSources.isEmpty == false {
-                    self.turns[at].sources = stored.citedSources
-                }
-                // Same story for files the model wrote in its terminal: the
-                // `display_file` result is attached when the message is saved,
-                // not streamed, so without this the download card only appeared
-                // after leaving and re-entering the chat.
-                if self.turns[at].terminalFiles.isEmpty, !stored.terminalFiles.isEmpty {
-                    self.turns[at].terminalFiles = stored.terminalFiles
-                }
-                if self.turns[at].attachments.isEmpty, !stored.messageAttachments.isEmpty {
-                    self.turns[at].attachments = stored.messageAttachments
-                }
-                // And if the stored answer is longer than what arrived, the run
-                // outlived the stream. Adopt the stored text rather than leaving
-                // a truncated answer on screen; the refetch that used to be the
-                // only way to see it is now the safety net instead of the fix.
-                let storedText = stored.content.text
-                if storedText.count > streamed.count + 1 {
-                    self.turns[at].text = storedText
+                for attempt in 0..<(owesFile ? 5 : 1) {
+                    if attempt > 0 { try? await Task.sleep(for: .seconds(1)) }
+                    guard let model = self else { return }
+                    if await ConversationModel.adoptStoredMessage(
+                        model, client: api, chat: chat, id: id, streamed: streamed)
+                    { break }
                 }
             }
         }
         return outcome
+    }
+
+    /// Copies what the stored message knows onto the turn on screen, and reports
+    /// whether the turn is now complete enough to stop looking.
+    ///
+    /// The server attaches sources and terminal files when it *saves* the message,
+    /// not as stream deltas, so a run that ends the instant the model stops typing
+    /// can be missing both. Leaving and re-entering the chat refetched and they
+    /// appeared — which is the asymmetry that makes a feature look broken rather
+    /// than late.
+    private static func adoptStoredMessage(
+        _ model: ConversationModel, client: OWUIClient, chat: String,
+        id: String, streamed: String
+    ) async -> Bool {
+        guard let detail = try? await client.chat(id: chat),
+            let stored = detail.messages[id],
+            let at = model.turns.firstIndex(where: { $0.id == id })
+        else { return false }
+        if stored.citedSources.isEmpty == false {
+            model.turns[at].sources = stored.citedSources
+        }
+        if model.turns[at].terminalFiles.isEmpty, !stored.terminalFiles.isEmpty {
+            model.turns[at].terminalFiles = stored.terminalFiles
+        }
+        if model.turns[at].attachments.isEmpty, !stored.messageAttachments.isEmpty {
+            model.turns[at].attachments = stored.messageAttachments
+        }
+        // If the stored answer is longer than what arrived, the run outlived the
+        // stream. Adopt the stored text rather than leaving half an answer up.
+        let storedText = stored.content.text
+        if storedText.count > streamed.count + 1 {
+            model.turns[at].text = storedText
+        }
+        return model.turns[at].terminalFiles.isEmpty == false
+            || stored.terminalFiles.isEmpty == false
     }
 
     /// Whether the server still considers this assistant message open.
