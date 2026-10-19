@@ -273,38 +273,6 @@ public struct ConversationView: View {
                     } catch { OWUIClient.debugLog("file probe failed: \(error)") }
                 }
             }
-            // Diagnostics: `TIAI_SEND=<text>` sends a message through the real send
-            // path on launch. Synthetic clicks stopped registering in the simulator,
-            // and what is worth checking — which `features` actually go on the wire —
-            // is only knowable by really sending.
-            // Diagnostics: `TIAI_PREVIEW=<chat>|<selector>|<path>` fetches a
-            // sandbox file and presents the preview, so QuickLook can be checked
-            // without a tap — synthetic clicks do not register in this simulator.
-            if let probe = ProcessInfo.processInfo.environment["TIAI_PREVIEW"] {
-                let parts = probe.split(separator: "|", omittingEmptySubsequences: false)
-                if parts.count == 2 {
-                    Task {
-                        try? await Task.sleep(for: .seconds(2))
-                        openTerminalFile(
-                            TerminalFile(
-                                selector: String(parts[0]), path: String(parts[1]),
-                                name: (parts[1].split(separator: "/").last.map(String.init) ?? "file"),
-                                mimeType: "application/pdf"))
-                    }
-                }
-            }
-            if let text = ProcessInfo.processInfo.environment["TIAI_SEND"] {
-                Task {
-                    // Wait for models and tools to land, or the send picks a model
-                    // that has not been chosen yet.
-                    try? await Task.sleep(for: .seconds(4))
-                    if let ids = ProcessInfo.processInfo.environment["TIAI_TOOLS"] {
-                        conversation.tools = ids.split(separator: ",").map(String.init)
-                    }
-                    conversation.draft = text
-                    conversation.send()
-                }
-            }
             #endif
             await conversation.connect()
             // Cached tools and models appear immediately; the network corrects
