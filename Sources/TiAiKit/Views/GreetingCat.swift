@@ -144,8 +144,14 @@ public struct GreetingCat: View {
 
         // The tail is a stroked curve turned into a filled shape so it unions with
         // the body instead of being a separate outline on top of it.
+        //
+        // The root has to be *inside* the body, not on its edge. The egg narrows
+        // toward the base, so at this height the silhouette's right side is near
+        // x 0.62 — starting the tail at 0.70 left it floating a few points clear of
+        // the cat, which reads as a detached tail.
+        let tailRoot = CGPoint(x: s * 0.60, y: s * 0.865)
         var tail = Path()
-        tail.move(to: CGPoint(x: s * 0.70, y: s * 0.855))
+        tail.move(to: tailRoot)
         tail.addCurve(
             to: CGPoint(x: s * 0.90, y: s * 0.60),
             control1: CGPoint(x: s * 0.86, y: s * 0.87),
@@ -153,9 +159,9 @@ public struct GreetingCat: View {
         )
         let sway = b.tail * 0.16
         tail = tail.applying(
-            CGAffineTransform(translationX: s * 0.70, y: s * 0.855)
+            CGAffineTransform(translationX: tailRoot.x, y: tailRoot.y)
                 .rotated(by: sway)
-                .translatedBy(x: -s * 0.70, y: -s * 0.855)
+                .translatedBy(x: -tailRoot.x, y: -tailRoot.y)
         )
 
         // Front paws, just proud of the base so the silhouette ends in feet
