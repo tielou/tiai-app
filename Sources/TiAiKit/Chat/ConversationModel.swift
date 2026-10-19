@@ -549,6 +549,7 @@ public final class ConversationModel {
     /// the terminal frame is what actually ends it.
     public func stop() {
         guard let chatID, phase.isBusy else { return }
+        userStopped = true
         phase = .stopping
         Task {
             do {
@@ -874,6 +875,11 @@ public final class ConversationModel {
         }
     }
 
+    /// Set when the reader pressed Stop. A stopped run has nothing new attached
+    /// to it, so the post-run refetch is skipped — it would only be a network call
+    /// racing with the screen that just stopped showing things.
+    private var userStopped = false
+
     struct DrainOutcome {
         var sawTerminal = false
         /// An error the server reported mid-run, kept apart from `failure`.
@@ -905,6 +911,9 @@ public final class ConversationModel {
         continuing: Bool = false
     ) async -> DrainOutcome {
         var outcome = DrainOutcome()
+        // A stop belongs to the run it stopped. The next one earns its refetch
+        // back.
+        userStopped = false
         // Buffered off the frame loop so a timer, not the next frame, decides
         // when it becomes visible. Flushing only "when a frame arrives and 60 ms
         // have passed" loses the tail: a stream that stops without a terminal
@@ -1035,7 +1044,7 @@ public final class ConversationModel {
         // never looked at the stored message. Which is where the file the model
         // had just wrote lives. The fetch is cheap and idempotent; the cases it
         // used to skip were the ones that needed it.
-        if outcome.failure == nil, let chat = chatID {
+        if outcome.failure == nil, !userStopped, let chat = chatID {
             let id = finished.id
             let streamed = finished.text
             // A `display_file` call means a card is owed. The result is written
