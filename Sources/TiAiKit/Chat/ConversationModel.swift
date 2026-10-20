@@ -706,6 +706,10 @@ public final class ConversationModel {
             // tap. Left unset the server runs every tool without asking, which is
             // right for a headless client and wrong for one in the hand.
             params: CompletionRequest.Params(
+                temperature: SettingsStore.shared.defaults.temperature,
+                system: SettingsStore.shared.defaults.systemPrompt
+                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? nil : SettingsStore.shared.defaults.systemPrompt,
                 functionCalling: Self.debugString("TIAI_FC"),
                 toolApprovalMode: "ask"),
             toolIDs: tools.isEmpty ? nil : tools,

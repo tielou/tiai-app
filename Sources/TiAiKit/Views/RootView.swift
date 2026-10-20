@@ -133,6 +133,9 @@ public struct ChatListView: View {
 
     /// When set, a "Chats" row in the list opens the whole thing full screen.
     var onExpand: (() -> Void)? = nil
+    /// Opens the account and defaults screen. Nil in the full-screen list, where
+    /// the row would be a way to open the thing you are already looking at.
+    var onOpenSettings: (() -> Void)? = nil
 
     /// Whether the Notes and Memory rows belong here.
     ///
@@ -222,6 +225,7 @@ public struct ChatListView: View {
         session: SessionStore,
         onOpenNotes: (() -> Void)? = nil,
         onExpand: (() -> Void)? = nil,
+        onOpenSettings: (() -> Void)? = nil,
         refreshBadge: Int = 0,
         showsLibrary: Bool = true,
         onDeleted: ((String) -> Void)? = nil,
@@ -230,6 +234,7 @@ public struct ChatListView: View {
         self.session = session
         self.onOpenNotes = onOpenNotes
         self.onExpand = onExpand
+        self.onOpenSettings = onOpenSettings
         self.refreshBadge = refreshBadge
         self.showsLibrary = showsLibrary
         self.onDeleted = onDeleted
@@ -293,6 +298,9 @@ public struct ChatListView: View {
                             }
                             Button { showingMemory = true } label: {
                                 Label("Memory", systemImage: "brain.head.profile")
+                            }
+                            Button(action: { onOpenSettings?() }) {
+                                Label("Settings", systemImage: "gearshape")
                             }
                         }
                     }
@@ -483,7 +491,7 @@ public struct ChatHomeView: View {
     /// Something shown over the whole screen rather than inside the drawer: the
     /// full chat list, or Notes. Both are things you read, and a document in a
     /// 330-point strip is the wrong shape.
-    enum Fullscreen: String, Identifiable { case chats, notes; var id: String { rawValue } }
+    enum Fullscreen: String, Identifiable { case chats, notes, settings; var id: String { rawValue } }
     @State private var fullscreen: Fullscreen?
     /// Bumped every time the drawer opens, so the list asks the server again.
     /// A chat started on this phone did not exist the last time it looked.
@@ -577,6 +585,7 @@ public struct ChatHomeView: View {
                         session: session,
                         onOpenNotes: { fullscreen = .notes },
                         onExpand: { fullscreen = .chats },
+                        onOpenSettings: { fullscreen = .settings },
                         refreshBadge: refreshBadge,
                         onDeleted: { chatWasDeleted($0) }
                     ) { picked in
@@ -637,6 +646,15 @@ public struct ChatHomeView: View {
                             }
                         case .notes:
                             NotesView(client: session.client)
+                        case .settings:
+                            SettingsView(session: session) {
+                                // Closing the cover first: the sign-out drops the
+                                // token and the root swaps to the sign-in screen,
+                                // and a cover left over the swap looks like a
+                                // crash rather than a sign-out.
+                                fullscreen = nil
+                                session.signOut()
+                            }
                         }
                     }
                     .toolbar {

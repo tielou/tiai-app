@@ -85,6 +85,30 @@ final class ConversationUITests: XCTestCase {
                           "the toggle did not change state")
     }
 
+    /// The settings screen has to show who you are, not a blank card: the token
+    /// is restored from the keychain at launch and the user record comes from a
+    /// verify call, so a screen that reads the user too early shows "Signed out".
+    func testSettingsShowsProfileAndDefaults() throws {
+        tap("drawerToggle")
+        settle()
+        let settings = app.buttons["Settings"]
+        guard settings.isHittable else { throw XCTSkip("no settings row") }
+        settings.tap()
+        settle(1.5)
+
+        XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5),
+                      "settings did not open")
+        XCTAssertTrue(app.staticTexts["Account"].exists)
+        XCTAssertTrue(app.staticTexts["Defaults for new chats"].exists)
+        // An email address must be on screen — that is the proof the session
+        // actually resolved rather than half-restored.
+        let hasEmail = app.staticTexts.allElementsBoundByIndex.contains {
+            $0.label.contains("@")
+        }
+        XCTAssertTrue(hasEmail, "no account email on the settings screen")
+        XCTAssertTrue(app.switches["Set a temperature"].exists)
+    }
+
     /// The reason the answer is one `UITextView` rather than a stack of `Text`s.
     ///
     /// Selection scoped per block could not cross a heading or a list item, so
