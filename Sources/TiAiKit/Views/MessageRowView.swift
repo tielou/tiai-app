@@ -194,6 +194,13 @@ struct MessageRow: View {
     }
 
     private var renderedText: String { lifted.text }
+
+    /// The fenced blocks, in order, for the copy menu.
+    private var codeBlocks: [String] {
+        Markdown.blocks(TextSanitizer.clean(turn.text)).compactMap {
+            if case .code(_, let code) = $0 { return code } else { return nil }
+        }
+    }
     /// Which sandbox file is downloading, and which failed. Owned by the screen,
     /// because the screen is the one doing the fetching.
     var fileBusy: String? = nil
@@ -322,6 +329,18 @@ struct MessageRow: View {
                 Menu {
                     Button("Copy text") { copy(TextSanitizer.plain(turn.text)) }
                     Button("Copy as Markdown") { copy(turn.text) }
+                    // Selection can reach code now, but reaching it means aiming:
+                    // a fenced block in the middle of a long answer is a drag and
+                    // two handles. One tap to take the whole block is what people
+                    // actually want when they say "copy the code".
+                    if codeBlocks.count == 1 {
+                        Button("Copy code") { copy(codeBlocks[0]) }
+                    } else if !codeBlocks.isEmpty {
+                        Divider()
+                        ForEach(Array(codeBlocks.enumerated()), id: \.offset) { index, code in
+                            Button("Copy code \(index + 1)") { copy(code) }
+                        }
+                    }
                 } label: {
                     Image(systemName: "doc.on.doc")
                 }
