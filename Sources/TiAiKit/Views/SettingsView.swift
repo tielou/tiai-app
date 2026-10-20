@@ -43,6 +43,17 @@ public struct SettingsView: View {
         }
     }
 
+    /// The server's `name` is usually the email address, and printing it twice —
+    /// once as the name, once as the address underneath — reads as a bug even
+    /// though both fields are technically correct.
+    private var displayName: String {
+        let name = session.user?.name ?? ""
+        let email = session.user?.email ?? ""
+        if name.isEmpty { return email.isEmpty ? "Signed out" : "Signed in" }
+        if name == email, let first = Greeting.firstName(from: email) { return first }
+        return name
+    }
+
     // MARK: - sections
 
     private var profile: some View {
@@ -50,7 +61,7 @@ public struct SettingsView: View {
             HStack(spacing: 12) {
                 Avatar(name: session.user?.name ?? "", email: session.user?.email ?? "")
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(session.user?.name ?? "Signed out")
+                    Text(displayName)
                         .font(.headline)
                     Text(session.user?.email ?? "")
                         .font(.subheadline)
@@ -77,9 +88,16 @@ public struct SettingsView: View {
                 Text("Sent with every new conversation on this server. Not retroactive — a chat already started keeps what it was given.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                TextEditor(text: $promptDraft)
+                // A field that grows, not a box that waits. A fixed-height editor
+                // dominates the screen while empty and is exactly as tall as the
+                // one line most people type; this starts at one line and expands
+                // as the text does, up to a scrollable ten.
+                TextField(
+                    "Add instructions", text: $promptDraft, axis: .vertical
+                )
                     .font(.body)
-                    .frame(minHeight: 110)
+                    .lineLimit(1...10)
+                    .lineSpacing(2)
                     .onChange(of: promptDraft) { _, new in commit() }
             }
 
@@ -152,8 +170,11 @@ public struct SettingsView: View {
     private var appVersion: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
-        if let version { return build == version || build == nil ? version : "\(version) (\(build))" }
-        return "development"
+        guard let version else { return "development" }
+        // Interpolating the optional straight out prints `0.1 (Optional("1"))`,
+        // which is the sort of thing a user notices immediately.
+        if let build, build != version { return "\(version) (\(build))" }
+        return version
     }
 
     private func load() {
