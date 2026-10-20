@@ -97,10 +97,8 @@ public struct SettingsView: View {
                 .lineLimit(2...10)
                 .lineSpacing(3)
                 .padding(10)
-                .background(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(Color(.secondarySystemGroupedBackground))
-                )
+                .background(fieldFill,
+                            in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
                         .strokeBorder(.separator, lineWidth: 0.5)

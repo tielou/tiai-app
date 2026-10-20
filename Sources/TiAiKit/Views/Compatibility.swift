@@ -21,6 +21,16 @@ extension View {
         #endif
     }
 
+    /// The fill for an inset text field: the grouped-background grey on iOS,
+    /// which is what makes a field read as a field inside a grouped form.
+    var fieldFill: Color {
+        #if os(iOS)
+        Color(uiColor: .secondarySystemGroupedBackground)
+        #else
+        Color(nsColor: .textBackgroundColor)
+        #endif
+    }
+
     /// A cover that fills the screen. iOS only, so the kit still builds on macOS.
     func fullScreenCoverIOS<Item: Identifiable, Content: View>(
         item: Binding<Item?>, @ViewBuilder content: @escaping (Item) -> Content
