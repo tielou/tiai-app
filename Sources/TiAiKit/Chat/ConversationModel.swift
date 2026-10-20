@@ -500,31 +500,14 @@ public final class ConversationModel {
     }
 
     /// The last message below `id`, following the newest child at each step.
-    ///
-    /// The server lists at least one message as its own child, so the walk
-    /// refuses to revisit anything it has already stood on.
     private func leaf(below id: String) -> String {
-        guard let detail else { return id }
-        var cursor = id
-        var seen: Set<String> = [id]
-        while let node = detail.messages[cursor],
-            let next = node.childrenIDs.last(where: { !seen.contains($0) }) {
-            seen.insert(next)
-            cursor = next
-        }
-        return cursor
+        ChatTree.leaf(below: id, in: detail?.messages ?? [:])
     }
 
     /// The child of `messageID` that leads to the message the branch ends on.
     private func branchChild(of messageID: String) -> String? {
-        guard let detail, var id = leafID else { return nil }
-        var guardCount = 0
-        while guardCount < 500, let node = detail.messages[id], let parent = node.parentID {
-            if parent == messageID { return id }
-            id = parent
-            guardCount += 1
-        }
-        return nil
+        guard let detail, let leaf = leafID else { return nil }
+        return ChatTree.branchChild(of: messageID, leaf: leaf, in: detail.messages)
     }
 
     /// Re-runs the last user message. That message's id is reused, so the server
@@ -1326,8 +1309,7 @@ public final class ConversationModel {
         // spinner on a dead chat, which is its own bug. So growth is the signal:
         // if neither the answer nor the reasoning has moved in half a minute,
         // nothing is coming.
-        var still = 0
-        var seen = 0
+        var watch = RunWatch(stallLimit: reconcileStallLimit)
         for _ in 0..<reconcileBudget {
             guard let detail = try? await client.chat(id: chat) else {
                 // A failed read says nothing about the run, so it must not end
@@ -1349,10 +1331,7 @@ public final class ConversationModel {
                 }
                 return
             }
-            let size = message.content.text.count + message.output.count
-            still = size == seen ? still + 1 : 0
-            seen = max(seen, size)
-            if still >= reconcileStallLimit {
+            if watch.observe(size: message.content.text.count + message.output.count) {
                 // Nothing has moved in half a minute. Leave the answer on screen
                 // and hand the composer back rather than spin over a dead run.
                 turns.firstIndex(where: { $0.id == messageID }).map {

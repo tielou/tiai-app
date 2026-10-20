@@ -14,21 +14,6 @@ public protocol CredentialStore: Sendable {
     func clearAll()
 }
 
-public struct MemoryCredentialStore: CredentialStore {
-    private let box: SendableBox<(token: String?, password: String?)>
-
-    public init(token: String? = nil, password: String? = nil) {
-        box = SendableBox((token, password))
-    }
-
-    public func readToken() -> String? { box.value.token }
-    public func readPassword() -> String? { box.value.password }
-    public func writeToken(_ token: String) { box.value = (token, box.value.password) }
-    public func writePassword(_ password: String) { box.value = (box.value.token, password) }
-    public func clearPassword() { box.value = (box.value.token, nil) }
-    public func clearAll() { box.value = (nil, nil) }
-}
-
 /// A lock-guarded box. Small and explicit rather than spreading
 /// `@unchecked Sendable` state through every call site.
 final class SendableBox<Value>: @unchecked Sendable {
