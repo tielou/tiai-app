@@ -99,9 +99,11 @@ struct TerminalFileCard: View {
                     Spacer(minLength: 8)
                     if busy {
                         ProgressView().controlSize(.small)
+                            .accessibilityLabel("Loading")
                     } else {
                         Image(systemName: "arrow.down.circle")
                             .foregroundStyle(.secondary)
+                            .accessibilityHidden(true)
                     }
                 }
                 .padding(11)
@@ -147,6 +149,7 @@ struct FileLinkCard: View {
                     .font(.title3)
                     .foregroundStyle(.tint)
                     .frame(width: 26)
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(link.name)
                         .font(.callout.weight(.medium))

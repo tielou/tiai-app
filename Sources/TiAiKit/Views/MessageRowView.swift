@@ -241,6 +241,7 @@ struct MessageRow: View {
         HStack(spacing: 4) {
             Button { onSibling?(-1) } label: {
                 Image(systemName: "chevron.left")
+                    .accessibilityLabel("Previous answer")
                     .foregroundStyle(page.index > 1 ? Color.primary : Color.secondary)
                     // A bare chevron glyph is a ~12pt target, which is a coin
                     // flip on a phone. Padding plus a shape makes the whole
@@ -254,6 +255,7 @@ struct MessageRow: View {
                 .monospacedDigit()
             Button { onSibling?(1) } label: {
                 Image(systemName: "chevron.right")
+                    .accessibilityLabel("Next answer")
                     .foregroundStyle(page.index < page.total ? Color.primary : Color.secondary)
                     .padding(.horizontal, 10).padding(.vertical, 6)
                     .contentShape(Rectangle())

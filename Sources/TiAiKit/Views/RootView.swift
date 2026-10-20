@@ -166,9 +166,12 @@ public struct ChatListView: View {
             HStack {
                 Text(chat.title).lineLimit(1)
                 if chat.pinned {
+                    // The title already reads as pinned to anyone looking; the
+                    // badge is decoration and a screen reader would only repeat it.
                     Image(systemName: "pin.fill")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
                 }
             }
             Text(since(chat.updatedAt))

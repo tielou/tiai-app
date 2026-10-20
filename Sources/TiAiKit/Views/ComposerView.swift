@@ -312,6 +312,7 @@ struct ComposerView: View {
             Image(systemName: "stop.fill")
                 .font(.system(size: 11, weight: .semibold))
                 .opacity(recording ? 1 : 0)
+                .accessibilityHidden(true)
             ProgressView().controlSize(.small).opacity(busy ? 1 : 0)
         }
         .font(.system(size: 15, weight: .medium))
@@ -592,6 +593,7 @@ struct AddToChatSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button { dismiss() } label: { Image(systemName: "xmark") }
+                        .accessibilityLabel("Close")
                 }
             }
         }
@@ -699,7 +701,9 @@ struct ModelPickerSheet: View {
                                 }
                                 Spacer()
                                 if model.id == conversation.model {
-                                    Image(systemName: "checkmark").foregroundStyle(.tint)
+                                    Image(systemName: "checkmark")
+                                        .foregroundStyle(.tint)
+                                        .accessibilityLabel("Current model")
                                 }
                             }
                             .contentShape(.rect)
@@ -714,6 +718,7 @@ struct ModelPickerSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button { dismiss() } label: { Image(systemName: "xmark") }
+                        .accessibilityLabel("Close")
                 }
             }
         }

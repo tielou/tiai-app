@@ -128,6 +128,7 @@ struct ToolCallCard: View {
                 Button {
                     if index > 0 { index -= 1 }
                 } label: { Image(systemName: "chevron.left") }
+                    .accessibilityLabel("Previous question")
                     .disabled(index == 0)
                 Text("\(index + 1) of \(prompt.questions.count)")
                     .font(.callout).foregroundStyle(.secondary)
@@ -135,6 +136,7 @@ struct ToolCallCard: View {
                 Button {
                     if prompt.questions.indices.contains(index + 1) { index += 1 }
                 } label: { Image(systemName: "chevron.right") }
+                    .accessibilityLabel("Next question")
                     .disabled(!prompt.questions.indices.contains(index + 1))
             } else if let title = prompt.title {
                 Text(title).font(.callout).foregroundStyle(.secondary)
