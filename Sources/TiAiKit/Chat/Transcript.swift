@@ -107,6 +107,15 @@ public struct Turn: Identifiable, Equatable, Sendable {
         createdAt = message.timestamp ?? .now
     }
 
+    /// Calls that came before the answer text, and calls that came after it.
+    ///
+    /// A tool that *produced* the answer belongs above it. A question the model
+    /// asked once the answer was written belongs below, next to the reply it
+    /// follows — otherwise a long answer pushes the question off the top of the
+    /// screen and the app looks like it dropped it.
+    public var callsBeforeText: [ToolCall] { calls.filter { !$0.afterText } }
+    public var callsAfterText: [ToolCall] { calls.filter(\.afterText) }
+
     /// A finished message is not waiting on anyone.
     ///
     /// A stored message can keep a `function_call` item in `pending` after the

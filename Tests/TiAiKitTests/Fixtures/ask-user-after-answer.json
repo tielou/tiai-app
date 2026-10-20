@@ -1,0 +1,26 @@
+{
+ "id": "m1",
+ "role": "assistant",
+ "parent_id": "u1",
+ "childrenIds": [],
+ "done": false,
+ "content": "Here is the plan.",
+ "output": [
+  {
+   "type": "reasoning",
+   "reasoning_text": "thinking about it"
+  },
+  {
+   "type": "message",
+   "message": "Here is the plan."
+  },
+  {
+   "type": "function_call",
+   "name": "ask_user",
+   "call_id": "call_b55db0a1bc9d4c39bf9106f7",
+   "id": "call_b55db0a1bc9d4c39bf9106f7",
+   "status": "pending",
+   "arguments": "{\"questions\":[{\"id\":\"handys\",\"header\":\"Geräte\",\"question\":\"Was sind das für Handys in deiner Phone-Farm?\",\"options\":[{\"label\":\"Android\",\"description\":\"ADB + uiautomator2 etc. ist direkt machbar\"},{\"label\":\"iPhone\",\"description\":\"Dann müssen wir umdenken – Jailbreak/Alternative oder Fokus auf offizielle API\"},{\"label\":\"Gemischt / noch nicht gekauft\",\"description\":\"Dann kann ich direkt die ideale Hardware empfehlen\"}],\"allow_other\":true},{\"id\":\"umfang\",\"header\":\"Umfang\",\"question\":\"Was soll automatisiert werden?\",\"options\":[{\"label\":\"Nur Posten (Feed/Reels/Stories)\",\"description\":\"Dann ist die offizielle Meta API wahrscheinlich der bessere erste Schritt – Phone-Farm evtl. gar nicht nötig\"},{\"label\":\"Posten + Engagement (DMs, Kommentare, Likes)\",\"description\":\"Hybrid: API fürs Posten, Phone-Farm für den Rest – riskanterer Teil\"},{\"label\":\"Komplett über die App\",\"description\":\"Bewusste Entscheidung gegen die API, alles läuft über die Phone-Farm\"}],\"allow_other\":true},{\"id\":\"risiko\",\"header\":\"Risikobereitschaft\",\"question\":\"Wie empfindlich sind die Accounts für dich – was passiert bei einem Ban?\",\"options\":[{\"label\":\"Kann passieren, verkraftbar\",\"description\":\"Dann können wir aggressiver automatisieren und später absichern\"},{\"label\":\"Eher schmerzhaft\",\"description\":\"Dann: konservatives Setup, Shadow-/Approval-Modus, niedrige Volumina, Backups der Follower-Beziehung (DM-History etc.)\"},{\"label\":\"Katastrophal\",\"description\":\"Dann würde ich fast nur die offizielle API empfehlen und die Phone-Farm nur für Recherche/Analysen\"}],\"allow_other\":true}],\"allow_other\":true,\"timeout_ms\":120000}"
+  }
+ ]
+}

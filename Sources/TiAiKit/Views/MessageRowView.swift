@@ -121,17 +121,8 @@ struct MessageRow: View {
                 // answer they unlocked. That is the order it happened in, it is
                 // how the Claude client reads, and it keeps the question visible
                 // without scrolling past the reply to remember what was asked.
-                ForEach(ToolCall.grouped(turn.calls)) { group in
-                    switch group {
-                    case .awaiting(let call):
-                        ToolCallCard(call: call, questionIncoming: turn.questionIncoming) {
-                            action, answers in
-                            onResolve?(call, action, answers)
-                        }
-                    case .settled(let calls):
-                        SettledCallsCard(calls: calls)
-                    }
-                }
+                CallGroups(calls: turn.callsBeforeText, questionIncoming: turn.questionIncoming,
+                           onResolve: onResolve)
                 #if os(iOS)
                 // One text view, not a stack of `Text`s. Selection in SwiftUI is
                 // scoped to a single `Text`, so an answer rendered as markdown
@@ -145,6 +136,12 @@ struct MessageRow: View {
                 }
                 .accessibilityIdentifier("answerText")
                 #endif
+                // A question the model asked after answering sits under the
+                // answer it follows. Above it, a 4000-character reply pushes the
+                // question off the top of the screen and the app looks like it
+                // lost the thing the user is waiting for.
+                CallGroups(calls: turn.callsAfterText, questionIncoming: turn.questionIncoming,
+                           onResolve: onResolve)
                 ForEach(lifted.links) { link in
                     FileLinkCard(link: link, busy: fileBusy == link.id,
                                  failed: fileFailed == link.id)

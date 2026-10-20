@@ -347,3 +347,28 @@ extension ToolCall {
 /// token, and handing it a bare URL produced a 401 and an empty gap — which is
 /// how a photo attached in the web UI ended up invisible on the phone.
 /// An image carried as a `data:` url inside the message itself.
+
+/// The calls on one side of the answer text, grouped the way the transcript
+/// draws them: settled calls folded into one compact card, a question left on
+/// its own because it needs an answer.
+struct CallGroups: View {
+    let calls: [ToolCall]
+    var questionIncoming = false
+    var onResolve: ((ToolCall, ToolCallAction, JSONValue?) -> Void)?
+
+    @ViewBuilder var body: some View {
+        Group {
+            ForEach(ToolCall.grouped(calls)) { group in
+                switch group {
+                case .awaiting(let call):
+                    ToolCallCard(call: call, questionIncoming: questionIncoming) {
+                        action, answers in
+                        onResolve?(call, action, answers)
+                    }
+                case .settled(let calls):
+                    SettledCallsCard(calls: calls)
+                }
+            }
+        }
+    }
+}

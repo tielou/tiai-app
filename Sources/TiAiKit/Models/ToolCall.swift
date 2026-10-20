@@ -43,6 +43,15 @@ public struct ToolCall: Equatable, Sendable, Identifiable {
     public var id: String { callID }
     public var isAskUser: Bool { name == "ask_user" }
 
+    /// Whether the model asked this *after* writing its answer.
+    ///
+    /// The server keeps `output` in the order things happened, and a model that
+    /// answers and then asks — "here is the plan, now which phone?" — puts the
+    /// call after the message item. Rendering every call above the text hid that
+    /// question a full screen above the answer it belonged to, which reads as the
+    /// app having lost it.
+    public var afterText = false
+
     /// Whether the arguments have arrived *complete*.
     ///
     /// A model streams tool arguments as text, so for a moment the stored
@@ -160,9 +169,14 @@ public struct ToolCall: Equatable, Sendable, Identifiable {
     static func calls(from items: [JSONValue]) -> [ToolCall] {
         var order: [String] = []
         var byID: [String: ToolCall] = [:]
+        // Position in the run, not just membership in the list: a call that
+        // arrives after the answer text belongs below it.
+        var sawMessage = false
         for item in items {
             guard let type = item["type"]?.stringValue else { continue }
-            guard let call = ToolCall(item) else { continue }
+            if type == "message" { sawMessage = true; continue }
+            guard var call = ToolCall(item) else { continue }
+            call.afterText = sawMessage
             if type == "function_call_output", var existing = byID[call.callID] {
                 existing.resultText = call.resultText ?? existing.resultText
                 if existing.status != .rejected {
