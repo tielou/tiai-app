@@ -85,20 +85,30 @@ public struct SettingsView: View {
         Section {
             VStack(alignment: .leading, spacing: 6) {
                 Text("System prompt")
-                Text("Sent with every new conversation on this server. Not retroactive — a chat already started keeps what it was given.")
+                // A field that grows, not a box that waits: empty it is one line
+                // tall, and it expands as the text does. But it has to *look*
+                // like something you can type in — bare text with a hairline
+                // under it reads as a label that happens to be editable.
+                TextField(
+                    "e.g. Answer in German, be concise.",
+                    text: $promptDraft, axis: .vertical
+                )
+                .font(.body)
+                .lineLimit(2...10)
+                .lineSpacing(3)
+                .padding(10)
+                .background(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(Color(.secondarySystemGroupedBackground))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .strokeBorder(.separator, lineWidth: 0.5)
+                )
+                .onChange(of: promptDraft) { _, new in commit() }
+                Text("Applies to new conversations on this server only.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                // A field that grows, not a box that waits. A fixed-height editor
-                // dominates the screen while empty and is exactly as tall as the
-                // one line most people type; this starts at one line and expands
-                // as the text does, up to a scrollable ten.
-                TextField(
-                    "Add instructions", text: $promptDraft, axis: .vertical
-                )
-                    .font(.body)
-                    .lineLimit(1...10)
-                    .lineSpacing(2)
-                    .onChange(of: promptDraft) { _, new in commit() }
             }
 
             Toggle("Set a temperature", isOn: $useTemperature)
