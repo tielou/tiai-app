@@ -54,4 +54,93 @@ public enum TextSanitizer {
         }
         return String(out)
     }
+
+    // MARK: - Plain text for copying
+
+    /// Markdown turned into text a person would want pasted somewhere.
+    ///
+    /// The copy button used to hand over the answer exactly as it arrived, so
+    /// pasting into Mail or Notes carried the `##`, the `**` and the fences along
+    /// with the sentence they were formatting. Code is the exception: inside a
+    /// fence the characters *are* the content, so the fence markers go and the
+    /// code stays untouched.
+    public static func plain(_ markdown: String) -> String {
+        var out: [String] = []
+        var inFence = false
+        for line in markdown.split(separator: "\n", omittingEmptySubsequences: false) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                inFence.toggle()
+                continue
+            }
+            if inFence { out.append(String(line)); continue }
+
+            var text = String(line)
+            switch trimmed {
+            case "", "---", "***", "___":
+                // Rules carry nothing once the line breaks are gone.
+                out.append("")
+                continue
+            default: break
+            }
+            if let hashes = trimmed.firstIndex(where: { $0 != "#" }), trimmed.hasPrefix("#") {
+                let level = trimmed[..<hashes].count
+                if (1...6).contains(level) { text = String(trimmed[hashes...]) }
+            } else if trimmed.hasPrefix(">") {
+                text = String(trimmed.drop { $0 == ">" || $0 == " " })
+            } else if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || trimmed.hasPrefix("+ ") {
+                // Normalised rather than dropped: a list that pastes as a wall of
+                // prose is worse than one that pastes as a list.
+                text = "- " + inline(String(trimmed.dropFirst(2)))
+                out.append(text)
+                continue
+            }
+            out.append(inline(text))
+        }
+        // Runs of blank lines are a formatting accident more often than a choice.
+        var collapsed: [String] = []
+        var blanks = 0
+        for line in out {
+            if line.trimmingCharacters(in: .whitespaces).isEmpty {
+                blanks += 1
+                if blanks > 1 { continue }
+            } else { blanks = 0 }
+            collapsed.append(line)
+        }
+        return collapsed.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Inline markup, taken out. Order matters: `**bold**` has to go before the
+    /// single-star pass, or the star pass eats one of its stars.
+    private static func inline(_ text: String) -> String {
+        var out = text
+        func strip(_ pattern: String) {
+            guard let re = try? Regex(pattern) else { return }
+            // The closure form, not `with: "$1"`: the string variant substitutes
+            // nothing and pastes a literal `$1` into the answer.
+            let replaced = try? out.replacing(re) { match -> String in
+                guard let group = match.output[1].substring else {
+                    return String(match.output[0].substring ?? "")
+                }
+                return String(group)
+            }
+            if let replaced { out = replaced }
+        }
+        // [label](url) — kept as "label (url)" when they differ, because a copied
+        // sentence that loses where the link went is missing half of itself.
+        if let links = try? Regex(#"\[([^\]]+)\]\(([^)\s]+)\)"#) {
+            out = (try? out.replacing(links) { match in
+                let label = match.output[1].substring.map(String.init) ?? ""
+                let url = match.output[2].substring.map(String.init) ?? ""
+                return label == url ? url : "\(label) (\(url))"
+            }) ?? out
+        }
+        strip(#"\*\*(.+?)\*\*"#)
+        strip(#"__(.+?)__"#)
+        strip(#"~~(.+?)~~"#)
+        strip(#"\*([^*\n]+?)\*"#)
+        strip(#"(?<![\w])_([^_\n]+?)_(?![\w])"#)
+        strip(#"`([^`\n]+?)`"#)
+        return out
+    }
 }

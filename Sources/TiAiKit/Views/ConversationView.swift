@@ -366,7 +366,16 @@ public struct ConversationView: View {
                 // eagerly is the cheap side of that trade.
                 VStack(alignment: .leading, spacing: 14) {
                     if conversation.turns.isEmpty {
-                        EmptyTranscript(greeting: Greeting.line(for: session.user?.name))
+                        if let failure = conversation.error {
+                            // A chat that will not load must not look like a chat
+                            // that has nothing in it. This is what a deleted or
+                            // inaccessible conversation used to look like: the
+                            // greeting, the cat, and no hint that anything was
+                            // wrong.
+                            UnloadedChat(message: failure)
+                        } else {
+                            EmptyTranscript(greeting: Greeting.line(for: session.user?.name))
+                        }
                     }
                     ForEach(conversation.turns) { turn in
                         MessageRow(
@@ -559,6 +568,28 @@ public struct ConversationView: View {
 
 private enum BottomAnchor { static let id = "transcript-bottom" }
 
+/// A chat that opened onto nothing because the server would not give it up.
+private struct UnloadedChat: View {
+    let message: String
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.title2)
+                .foregroundStyle(.secondary)
+            Text("This conversation did not load")
+                .font(.headline)
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .padding(.horizontal, 32)
+        .padding(.top, 140)
+        .frame(maxWidth: .infinity)
+    }
+}
+
 private struct EmptyTranscript: View {
     /// "Good afternoon, Thilo" — the user, not the model. The model is already
     /// on the composer chip; what an empty screen should answer is "who is this
@@ -739,6 +770,12 @@ struct MessageRow: View {
         }
     }
 
+    private func copy(_ text: String) {
+        #if os(iOS)
+        UIPasteboard.general.string = text
+        #endif
+    }
+
     /// Called when the reader taps a file the model produced in its terminal
     /// sandbox. The row cannot fetch it itself: the sandbox is found by chat, and
     /// the row does not know which chat it is in.
@@ -871,10 +908,13 @@ struct MessageRow: View {
                     .foregroundStyle(.tertiary)
                     .accessibilityLabel("Try again")
                 }
-                Button {
-                    #if os(iOS)
-                    UIPasteboard.general.string = turn.text
-                    #endif
+                // Two flavours, because they are used for different things. Pasting
+                // an answer into Mail wants the sentence, not the `##` that was
+                // formatting it; pasting back into a chat or a README wants the
+                // markdown. The old single button could only do the second.
+                Menu {
+                    Button("Copy text") { copy(TextSanitizer.plain(turn.text)) }
+                    Button("Copy as Markdown") { copy(turn.text) }
                 } label: {
                     Image(systemName: "doc.on.doc")
                 }
@@ -908,22 +948,28 @@ struct MarkdownBlockView: View {
                 .padding(.top, level <= 2 ? 8 : 4)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
+        // Every block gets `textSelection`. The bullets and numbered items did not
+        // have it, which meant the most copy-worthy part of a typical answer — the
+        // list — could not be selected at all.
         case let .bullet(text):
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text("•").foregroundStyle(.secondary)
                 Text(Self.attributed(text))
+                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         case let .numbered(index, text):
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text("\(index).").foregroundStyle(.secondary).monospacedDigit()
                 Text(Self.attributed(text))
+                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         case let .quote(text):
             HStack(alignment: .top, spacing: 9) {
                 Rectangle().frame(width: 3).foregroundStyle(.quaternary)
                 Text(Self.attributed(text))
+                    .textSelection(.enabled)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
