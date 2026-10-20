@@ -124,12 +124,30 @@ struct MessageRow: View {
                 CallGroups(calls: turn.callsBeforeText, questionIncoming: turn.questionIncoming,
                            onResolve: onResolve)
                 #if os(iOS)
-                // One text view, not a stack of `Text`s. Selection in SwiftUI is
-                // scoped to a single `Text`, so an answer rendered as markdown
-                // blocks could only be copied one block at a time — a sentence
-                // that ran from a paragraph into a list came out in pieces.
-                SelectableAnswer(markdown: renderedText)
-                    .accessibilityIdentifier("answerText")
+                // Prose goes into one text view, so selection crosses headings and
+                // list items the way it does anywhere else on the phone. Code and
+                // tables are pulled out and given horizontal scroll: an ASCII
+                // diagram is layout, and wrapping it at the edge of the screen
+                // turns the box drawing into confetti.
+                ForEach(segments) { segment in
+                    switch segment {
+                    case .prose(let text):
+                        SelectableAnswer(markdown: text)
+                            .accessibilityIdentifier("answerText")
+                    case let .code(language, code):
+                        ScrollableCodeBlock(code: code, language: language) {
+                            UIPasteboard.general.string = code
+                        }
+                    case let .table(headers, rows):
+                        ScrollableTableView(headers: headers, rows: rows)
+                    case .rule:
+                        Rectangle()
+                            .fill(Color.separator)
+                            .frame(height: 0.5)
+                            .padding(.vertical, 4)
+                            .accessibilityHidden(true)
+                    }
+                }
                 #else
                 ForEach(Array(Markdown.blocks(TextSanitizer.clean(renderedText)).enumerated()), id: \.offset) { _, block in
                     MarkdownBlockView(block: block, streaming: turn.streaming)
@@ -191,6 +209,12 @@ struct MessageRow: View {
     }
 
     private var renderedText: String { lifted.text }
+
+    /// The answer split for rendering: prose runs, and code/tables that need
+    /// their own scrollable space.
+    private var segments: [AnswerSegment] {
+        AnswerSegment.segments(Markdown.blocks(TextSanitizer.clean(renderedText)))
+    }
 
     /// The fenced blocks, in order, for the copy menu.
     private var codeBlocks: [String] {

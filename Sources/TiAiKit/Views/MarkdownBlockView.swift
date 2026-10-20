@@ -9,6 +9,26 @@ struct MarkdownBlockView: View {
     let block: MarkdownBlock
     var streaming = false
 
+    /// The block's own markdown source, so a run of blocks can be handed to one
+    /// text view as one string and still have its headings and lists recognised.
+    ///
+    /// The block stores raw markdown — inline emphasis is applied by the renderer,
+    /// not before it — so rebuilding the source is lossless for everything that
+    /// stays in the prose run.
+    static func source(_ block: MarkdownBlock) -> String {
+        switch block {
+        case .prose(let text), .quote(let text): return text
+        case let .heading(level, text): return String(repeating: "#", count: level) + " " + text
+        case .bullet(let text): return "- " + text
+        case let .numbered(index, text): return "\(index). " + text
+        case let .task(done, text): return "- [\(done ? "x" : " ")] " + text
+        case .rule: return "---"
+        case let .code(_, code): return code
+        case let .table(headers, rows):
+            return ([headers] + rows).map { $0.joined(separator: " | ") }.joined(separator: "\n")
+        }
+    }
+
     var body: some View {
         switch block {
         case let .prose(text):

@@ -92,3 +92,25 @@ extension View {
         #endif
     }
 }
+
+extension Color {
+    /// Backdrop for fenced code and tables.
+    ///
+    /// Slightly darker than `fieldFill` so a block reads as an object sitting in
+    /// the answer rather than another paragraph with a tint behind it.
+    static var codeBlockBackground: Color {
+        #if os(iOS)
+        Color(uiColor: UIColor.secondarySystemBackground)
+        #else
+        Color(nsColor: .underPageBackgroundColor)
+        #endif
+    }
+
+    static var separator: Color {
+        #if os(iOS)
+        Color(uiColor: .separator)
+        #else
+        Color(nsColor: .separatorColor)
+        #endif
+    }
+}
