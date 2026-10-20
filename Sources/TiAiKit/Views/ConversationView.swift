@@ -40,6 +40,7 @@ public struct ConversationView: View {
     @State private var busyFile: String?
     @State private var failedFile: String?
     @State private var shareFile: SharedFile?
+    @State private var exportFailed = false
 
     /// Fetch a file the model left in its terminal sandbox and hand it to the
     /// share sheet, which is how you get it into Files, Books, or a print job.
@@ -529,9 +530,38 @@ public struct ConversationView: View {
     }
     #endif
 
+    /// Write the conversation out as a Markdown file and open it, so a chat can
+    /// leave the app in one action instead of six copy-pastes.
+    private func exportTranscript() {
+        let markdown = TranscriptMarkdown.render(
+            title: conversation.title,
+            turns: conversation.turns,
+            model: conversation.model,
+            server: session.client.server.baseURL)
+        let name = (conversation.title.isEmpty ? "conversation" : conversation.title)
+            .replacingOccurrences(of: "/", with: "-")
+            .prefix(40)
+        let out = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("\(name).md")
+        do {
+            try markdown.data(using: .utf8)?.write(to: out, options: .atomic)
+            shareFile = SharedFile(url: out)
+        } catch {
+            exportFailed = true
+        }
+    }
+
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
+            // Only once there is something to export: on an empty chat the button
+            // would produce a file with a heading and nothing in it.
+            if !conversation.turns.isEmpty {
+                Button(action: exportTranscript) {
+                    Label("Export as Markdown", systemImage: "square.and.arrow.up")
+                }
+                .accessibilityIdentifier("exportChat")
+            }
             if let onNewChat {
                 Button(action: onNewChat) {
                     Label("New chat", systemImage: "square.and.pencil")
