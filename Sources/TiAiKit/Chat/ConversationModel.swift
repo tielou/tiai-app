@@ -827,6 +827,14 @@ public final class ConversationModel {
         // server reads as "unread". Marking read on open is not enough for a chat
         // the app both asked and answered — nobody else needs to be told about it.
         if let chat = chatID, outcome.failure == nil { hub.markChatRead(chat) }
+        if outcome.failure == nil {
+            // Only worth saying when nobody is watching: announcing an answer the
+            // user is already reading is worse than silence, and the notifier
+            // checks that itself rather than trusting the caller to remember.
+            let finished = turns.first(where: { $0.id == assistantID })
+            CompletionNotifier.answerReady(
+                title: title, preview: finished?.text ?? "")
+        }
         phase = .ready
     }
 

@@ -16,13 +16,23 @@ public struct AppDefaults: Codable, Equatable, Sendable {
     /// nil means "whatever the server picked", which is the right default: a
     /// number chosen for one model is wrong for the next one.
     public var temperature: Double?
+    /// Ask to be told when an answer lands while the app is not the thing on
+    /// screen. Off by default: a chat app that notifies unprompted is a
+    /// notification app with a chat attached.
+    public var notifyWhenFinished: Bool
 
-    public init(systemPrompt: String = "", temperature: Double? = nil) {
+    public init(
+        systemPrompt: String = "", temperature: Double? = nil, notifyWhenFinished: Bool = false
+    ) {
         self.systemPrompt = systemPrompt
         self.temperature = temperature
+        self.notifyWhenFinished = notifyWhenFinished
     }
 
-    public var isEmpty: Bool { systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && temperature == nil }
+    public var isEmpty: Bool {
+        systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && temperature == nil && !notifyWhenFinished
+    }
 }
 
 @MainActor

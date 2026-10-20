@@ -16,6 +16,7 @@ public struct SettingsView: View {
     @State private var useTemperature = false
     @State private var temperature = 0.7
     @State private var confirmSignOut = false
+    @State private var notify = false
 
     public init(session: SessionStore, onSignOut: @escaping () -> Void) {
         self.session = session
@@ -108,10 +109,25 @@ public struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Toggle("Notify when an answer finishes", isOn: $notify)
+                .onChange(of: notify) { _, on in
+                    guard on else {
+                        store.defaults.notifyWhenFinished = false
+                        CompletionNotifier.isEnabled = false
+                        return
+                    }
+                    // Permission is asked for at the moment it was asked for, not
+                    // at launch. If it is refused the switch goes back on its own.
+                    Task {
+                        let granted = await CompletionNotifier.requestAuthorization()
+                        store.defaults.notifyWhenFinished = granted
+                        if !granted { notify = false }
+                    }
+                }
         } header: {
             Text("Defaults for new chats")
         } footer: {
-            Text("Stored on this device, per server. The web UI's own settings are left alone.")
+            Text("Notifications arrive when the app is not on screen — a long answer finishing while you are somewhere else. Stored on this device, per server; the web UI's own settings are left alone.")
         }
     }
 
@@ -145,6 +161,8 @@ public struct SettingsView: View {
         promptDraft = store.defaults.systemPrompt
         useTemperature = store.defaults.temperature != nil
         temperature = store.defaults.temperature ?? 0.7
+        notify = store.defaults.notifyWhenFinished
+        CompletionNotifier.isEnabled = store.defaults.notifyWhenFinished
     }
 
     private func commit() {
