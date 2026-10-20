@@ -743,9 +743,17 @@ struct MessageRow: View {
                         SettledCallsCard(calls: calls)
                     }
                 }
+                #if os(iOS)
+                // One text view, not a stack of `Text`s. Selection in SwiftUI is
+                // scoped to a single `Text`, so an answer rendered as markdown
+                // blocks could only be copied one block at a time — a sentence
+                // that ran from a paragraph into a list came out in pieces.
+                SelectableAnswer(markdown: renderedText)
+                #else
                 ForEach(Array(Markdown.blocks(TextSanitizer.clean(renderedText)).enumerated()), id: \.offset) { _, block in
                     MarkdownBlockView(block: block, streaming: turn.streaming)
                 }
+                #endif
                 ForEach(FileLink.extract(TextSanitizer.clean(turn.text)).links) { link in
                     FileLinkCard(link: link, busy: fileBusy == link.id,
                                  failed: fileFailed == link.id)
