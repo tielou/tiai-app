@@ -46,11 +46,14 @@ struct SelectableAnswer: UIViewRepresentable {
 
     func updateUIView(_ view: UITextView, context: Context) {
         context.coordinator.onLink = onLink
-        let next = AnswerText.attributed(markdown)
-        // Setting `attributedText` restarts the text view's layout and drops any
-        // selection the reader has in flight. While streaming, this runs on every
-        // coalesced delta, so only write when it actually changed.
-        if view.attributedText != next { view.attributedText = next }
+        // Guard on the string, not the attributed value. Streaming re-renders on
+        // every coalesced delta, and building the attributed string means parsing
+        // the whole answer again — comparing the *input* is free by comparison, and
+        // writing `attributedText` restarts layout and drops any selection the
+        // reader has in flight.
+        guard context.coordinator.lastMarkdown != markdown else { return }
+        context.coordinator.lastMarkdown = markdown
+        view.attributedText = AnswerText.attributed(markdown)
         context.coordinator.invalidateIntrinsic()
     }
 
@@ -65,6 +68,7 @@ struct SelectableAnswer: UIViewRepresentable {
 
     final class Coordinator: NSObject, UITextViewDelegate {
         var onLink: ((URL) -> Void)?
+        var lastMarkdown: String?
         private weak var view: UITextView?
 
         init(onLink: ((URL) -> Void)?) { self.onLink = onLink }

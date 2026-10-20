@@ -480,7 +480,7 @@ public struct ConversationView: View {
                     proxy.scrollTo(BottomAnchor.id, anchor: .bottom)
                 }
             }
-            .overlay(alignment: .bottom) {
+            .overlay(alignment: .bottomTrailing) {
                 // Scrolled up to re-read something, there is no obvious way back:
                 // the newest message can be a screen and a half below the fold and
                 // nothing on screen says so. The dot only exists while it is true.
@@ -498,6 +498,9 @@ public struct ConversationView: View {
                         .overlay(Circle().stroke(.quaternary))
                     }
                     .buttonStyle(.plain)
+                    // Trailing, not centred: centred it landed in the middle of the
+                    // text column and sat on top of the last line of the answer.
+                    .padding(.trailing, 4)
                     .padding(.bottom, 12)
                     .accessibilityLabel("Scroll to the latest message")
                     .transition(.opacity.combined(with: .scale(scale: 0.85)))
@@ -754,7 +757,7 @@ struct MessageRow: View {
                     MarkdownBlockView(block: block, streaming: turn.streaming)
                 }
                 #endif
-                ForEach(FileLink.extract(TextSanitizer.clean(turn.text)).links) { link in
+                ForEach(lifted.links) { link in
                     FileLinkCard(link: link, busy: fileBusy == link.id,
                                  failed: fileFailed == link.id)
                     { onOpenLink?(link) }
@@ -793,10 +796,16 @@ struct MessageRow: View {
     /// cannot open these links itself.
     var onOpenLink: ((FileLink) -> Void)? = nil
 
-    /// The answer with its file links lifted out, so a link is not drawn twice.
-    private var renderedText: String {
-        FileLink.extract(TextSanitizer.clean(turn.text)).text
+    /// The answer with its file links lifted out, and the links themselves.
+    ///
+    /// Computed once: the row needs both halves, and extracting twice meant two
+    /// regex passes over the whole answer on every render — which during streaming
+    /// is every coalesced delta.
+    private var lifted: (links: [FileLink], text: String) {
+        FileLink.extract(TextSanitizer.clean(turn.text))
     }
+
+    private var renderedText: String { lifted.text }
     /// Which sandbox file is downloading, and which failed. Owned by the screen,
     /// because the screen is the one doing the fetching.
     var fileBusy: String? = nil

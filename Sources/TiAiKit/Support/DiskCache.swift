@@ -20,7 +20,7 @@ public enum DiskCache {
     /// does not outlive its usefulness.
     private static let maxAge: TimeInterval = 7 * 24 * 3600
 
-    private struct Envelope: Codable {
+    private struct Envelope: Codable, Sendable {
         var saved: Date
         var payload: Data
     }
@@ -32,14 +32,21 @@ public enum DiskCache {
         return dir.appendingPathComponent("tiai-cache").appendingPathComponent(safe + ".json")
     }
 
-    public static func save<T: Encodable>(_ value: T, key: String) {
-        guard let url = file(for: key),
-              let payload = try? JSONEncoder().encode(value) else { return }
-        let envelope = Envelope(saved: .now, payload: payload)
-        guard let data = try? JSONEncoder().encode(envelope) else { return }
-        try? FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? data.write(to: url, options: .atomic)
+    public static func save<T: Encodable & Sendable>(_ value: T, key: String) {
+        guard let url = file(for: key) else { return }
+        // Encoding a whole transcript and writing it atomically is real work, and
+        // every caller is a view on the main actor — so a chat with a long answer
+        // cost a visible hitch at exactly the moment the answer appeared. Off the
+        // main thread instead, fire and forget: a key is only ever written with its
+        // newest value, so a late arrival is simply the newer one.
+        Task.detached(priority: .utility) {
+            guard let payload = try? JSONEncoder().encode(value) else { return }
+            let envelope = Envelope(saved: .now, payload: payload)
+            guard let data = try? JSONEncoder().encode(envelope) else { return }
+            try? FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: url, options: .atomic)
+        }
     }
 
     public static func load<T: Decodable>(_ type: T.Type, key: String) -> T? {
