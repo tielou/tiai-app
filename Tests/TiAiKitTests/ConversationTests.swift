@@ -237,17 +237,45 @@ extension Dictionary where Key == String {
 /// proceed: chat creation succeeds, the completion body stays open (as it does
 /// for real), and stop returns 200.
 final class ScriptedTransport: APITransport, @unchecked Sendable {
-    private(set) var paths: [String] = []
-    private(set) var completionBodies: [Data] = []
-    private(set) var uploads: [Data] = []
-    private(set) var resolveBodies: [Data] = []
-    var completionBody: Data? { completionBodies.last }
+    // `@unchecked Sendable` is a promise, not a guarantee, and this class was
+    // breaking it: the transport is written from the model's Task and read from
+    // the test's main actor, so the arrays were being appended on one thread
+    // while a test polled them on another. That is a data race, and it showed up
+    // the way data races do — an intermittent SIGSEGV/SIGABRT in the test
+    // process rather than a failed assertion, in whichever two long-running
+    // tests happened to overlap. Everything mutable goes through the lock.
+    private let lock = NSLock()
+    private func guarded<T>(_ body: () -> T) -> T {
+        lock.lock(); defer { lock.unlock() }; return body()
+    }
+
+    private var _paths: [String] = []
+    private var _completionBodies: [Data] = []
+    private var _uploads: [Data] = []
+    private var _resolveBodies: [Data] = []
+    private var _chatDetailOverride: Data?
+    private var _chatDetailQueue: [Data] = []
+
+    var paths: [String] { guarded { _paths } }
+    var completionBodies: [Data] { guarded { _completionBodies } }
+    var uploads: [Data] { guarded { _uploads } }
+    var resolveBodies: [Data] { guarded { _resolveBodies } }
+    var completionBody: Data? { guarded { _completionBodies.last } }
 
     /// Replaces what GET /chats/{id} returns, for tests that need a real tree.
-    var chatDetailOverride: Data?
+    var chatDetailOverride: Data? {
+        get { guarded { _chatDetailOverride } }
+        set { guarded { _chatDetailOverride = newValue } }
+    }
     /// Successive answers for GET /chats/{id}, for tests where the point is that
     /// the server's answer *changes* between reads.
-    var chatDetailQueue: [Data] = []
+    var chatDetailQueue: [Data] {
+        get { guarded { _chatDetailQueue } }
+        set { guarded { _chatDetailQueue = newValue } }
+    }
+    private func nextQueuedChatDetail() -> Data? {
+        guarded { _chatDetailQueue.isEmpty ? nil : _chatDetailQueue.removeFirst() }
+    }
 
     var chatDetail: Data {
         Data(
@@ -259,21 +287,21 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
 
     func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
         let path = request.url?.path ?? ""
-        paths.append(path)
+        guarded { _paths.append(path) }
         if path.hasSuffix("/chats/new") { return (chatDetailOverride ?? chatDetail, response(for: request, 200)) }
         if request.httpMethod == "GET", path.hasPrefix("/api/v1/chats/"),
            !path.hasSuffix("/messages") {
-            if !chatDetailQueue.isEmpty {
-                return (chatDetailQueue.removeFirst(), response(for: request, 200))
+            if let queued = nextQueuedChatDetail() {
+                return (queued, response(for: request, 200))
             }
             return (chatDetailOverride ?? chatDetail, response(for: request, 200))
         }
         if path.hasSuffix("/resolve") {
-            resolveBodies.append(request.httpBody ?? Data())
+            guarded { _resolveBodies.append(request.httpBody ?? Data()) }
             return (Data(#"{"status":true}"#.utf8), response(for: request, 200))
         }
         if path.hasSuffix("/files") || path.hasSuffix("/files/") {
-            uploads.append(request.httpBody ?? Data())
+            guarded { _uploads.append(request.httpBody ?? Data()) }
             return (Data(#"{"id":"file-1","filename":"notes.txt","type":"text/plain","updated_at":1}"#.utf8),
                     response(for: request, 200))
         }
@@ -282,8 +310,10 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
 
     func bytes(_ request: URLRequest) async throws -> (ByteStream, HTTPURLResponse) {
         let path = request.url?.path ?? ""
-        paths.append(path)
-        completionBodies.append(request.httpBody ?? Data())
+        guarded {
+            _paths.append(path)
+            _completionBodies.append(request.httpBody ?? Data())
+        }
         // The real one stays open for the whole generation and yields nothing;
         // an empty stream that ends at once would let a bug that ignores the
         // socket look correct, so it stays open until cancelled.
