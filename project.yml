@@ -68,6 +68,21 @@ targets:
         MARKETING_VERSION: "0.1"
         CURRENT_PROJECT_VERSION: "1"
 
+  # Drives the built app on a simulator. Skips itself on a machine that has
+  # never signed in, so it is a check on a dev box and a no-op in CI.
+  TiAiUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - Tests/TiAiUITests
+    dependencies:
+      - target: TiAi
+    settings:
+      base:
+        TEST_TARGET_NAME: TiAi
+        PRODUCT_BUNDLE_IDENTIFIER: co.wobker.tiai.uitests
+        GENERATE_INFOPLIST_FILE: YES
+
 # Committed as part of the definition so `xcodebuild -scheme TiAi` works straight
 # after `make project`, in CI and on a fresh clone. No test action: the tests
 # live in the SwiftPM package and run via `make test`, which is also the gate
@@ -79,5 +94,9 @@ schemes:
         TiAi: all
     run:
       config: Debug
+    test:
+      config: Debug
+      targets:
+        - TiAiUITests
     archive:
       config: Release

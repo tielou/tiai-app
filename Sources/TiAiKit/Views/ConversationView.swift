@@ -536,6 +536,7 @@ public struct ConversationView: View {
                 Button(action: onNewChat) {
                     Label("New chat", systemImage: "square.and.pencil")
                 }
+                .accessibilityIdentifier("newChat")
                 // Already staring at an empty chat: the button would only clear a
                 // draft nobody asked to lose.
                 .disabled(conversation.turns.isEmpty && conversation.draft.isEmpty)
@@ -548,6 +549,7 @@ public struct ConversationView: View {
                     "Incognito",
                     systemImage: conversation.incognito ? "eye.slash.fill" : "eye.slash")
             }
+            .accessibilityIdentifier("incognito")
             // Turning it on halfway through a saved chat cannot undo the messages
             // already written, and turning it off cannot bring a discarded chat
             // back. So it is a choice for the start of a conversation, which is

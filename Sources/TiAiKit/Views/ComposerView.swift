@@ -97,6 +97,7 @@ struct ComposerView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Add to chat")
+                .accessibilityIdentifier("addToChat")
 
                 modelChip
                 Spacer(minLength: 4)
@@ -435,6 +436,7 @@ struct ComposerView: View {
         .buttonStyle(.plain)
         .disabled(conversation.phase.isBusy)
         .accessibilityLabel("Model \(conversation.model)")
+        .accessibilityIdentifier("modelChip")
     }
 
     /// Which capabilities are on for this message, in the chip's secondary slot.

@@ -303,6 +303,7 @@ public struct ChatListView: View {
                                 if let onPick {
                                     Button { onPick(chat.id) } label: { rowLabel(chat) }
                                         .buttonStyle(.plain)
+                                        .accessibilityIdentifier("chatRow-\(chat.id)")
                                 } else {
                                     NavigationLink(value: chat.id) { rowLabel(chat) }
                                 }
@@ -554,6 +555,7 @@ public struct ChatHomeView: View {
                                 Button { openChats() } label: {
                                     Label("Chats", systemImage: "line.3.horizontal")
                                 }
+                                .accessibilityIdentifier("drawerToggle")
                             }
                         }
                 }

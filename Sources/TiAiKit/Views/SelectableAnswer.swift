@@ -23,8 +23,12 @@ struct SelectableAnswer: UIViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(onLink: onLink) }
 
-    func makeUIView(context: Context) -> UITextView {
-        let view = UITextView()
+    func makeUIView(context: Context) -> AnswerTextView {
+        let view = AnswerTextView()
+        // Set here rather than from the SwiftUI wrapper: the identifier has to
+        // land on the element the accessibility tree actually exposes, and that
+        // is the text view, not the representable around it.
+        view.accessibilityIdentifier = "answerText"
         view.isEditable = false
         view.isSelectable = true
         // Scrolling and self-sizing have to go, or the text view competes with the
@@ -34,6 +38,7 @@ struct SelectableAnswer: UIViewRepresentable {
         view.textContainer.lineFragmentPadding = 0
         view.backgroundColor = .clear
         view.delegate = context.coordinator
+        context.coordinator.attach(to: view)
         // Link taps go through the app rather than opening MobileSafari, which has
         // no session and would answer a file link with a 401.
         view.linkTextAttributes = [
@@ -44,7 +49,7 @@ struct SelectableAnswer: UIViewRepresentable {
         return view
     }
 
-    func updateUIView(_ view: UITextView, context: Context) {
+    func updateUIView(_ view: AnswerTextView, context: Context) {
         context.coordinator.onLink = onLink
         // Guard on the string, not the attributed value. Streaming re-renders on
         // every coalesced delta, and building the attributed string means parsing
@@ -58,7 +63,7 @@ struct SelectableAnswer: UIViewRepresentable {
     }
 
     func sizeThatFits(
-        _ proposal: ProposedViewSize, uiView view: UITextView, context: Context
+        _ proposal: ProposedViewSize, uiView view: AnswerTextView, context: Context
     ) -> CGSize? {
         let width = proposal.width ?? UIScreen.main.bounds.width
         guard width > 0 else { return nil }
@@ -73,14 +78,88 @@ struct SelectableAnswer: UIViewRepresentable {
 
         init(onLink: ((URL) -> Void)?) { self.onLink = onLink }
 
+        /// Our own long-press, because the built-in one never fires here.
+        ///
+        /// A `UITextView` inside a SwiftUI `ScrollView` loses the press to the
+        /// scroll view's gesture: the text view is selectable, the handles and
+        /// the loupe exist, and nothing on screen ever offered them — a long press
+        /// did nothing at all, which reads as "copy is broken". An explicit
+        /// recogniser on the text view itself wins, selects the word under the
+        /// finger, and the system callout follows on its own.
+        func attach(to view: UITextView) {
+            self.view = view
+            let press = UILongPressGestureRecognizer(target: self, action: #selector(longPress(_:)))
+            press.minimumPressDuration = 0.3
+            press.cancelsTouchesInView = false
+            press.delegate = self
+            view.addGestureRecognizer(press)
+        }
+
+        @objc private func longPress(_ gesture: UILongPressGestureRecognizer) {
+            guard gesture.state == .began, let view else { return }
+            let point = gesture.location(in: view)
+            guard let position = view.closestPosition(to: point) else { return }
+            view.becomeFirstResponder()
+            // Word under the finger, the way a long press works everywhere else
+            // on iOS. Falling back to a caret is better than selecting nothing.
+            view.selectedTextRange = word(at: position, in: view)
+                ?? view.textRange(from: position, to: position)
+        }
+
         func textView(_ textView: UITextView, shouldInteractWith URL: URL, in range: NSRange) -> Bool {
             guard let onLink else { return true }
             onLink(URL)
             return false
         }
 
+        /// The word under a long press, grown out from the caret position one
+        /// character at a time. The tokenizer APIs that do this have changed twice
+        /// and every spelling of them is either deprecated or awkward from Swift;
+        /// walking the string is short, obvious and cannot break on an OS bump.
+        private func word(at position: UITextPosition, in view: UITextView) -> UITextRange? {
+            guard let text = view.text as NSString?, text.length > 0 else { return nil }
+            let start = view.offset(from: view.beginningOfDocument, to: position)
+            guard start >= 0, start < text.length else { return nil }
+            func isWord(_ c: unichar) -> Bool {
+                guard let scalar = UnicodeScalar(c) else { return false }
+                return Character(scalar).isLetter || Character(scalar).isNumber
+            }
+            var from = start
+            while from > 0, isWord(text.character(at: from - 1)) { from -= 1 }
+            var to = start
+            while to < text.length, isWord(text.character(at: to)) { to += 1 }
+            guard let lo = view.position(from: view.beginningOfDocument, offset: from),
+                  let hi = view.position(from: view.beginningOfDocument, offset: to),
+                  to > from
+            else { return nil }
+            return view.textRange(from: lo, to: hi)
+        }
+
         func invalidateIntrinsic() { view?.invalidateIntrinsicContentSize() }
         func textViewDidChangeSelection(_ textView: UITextView) {}
+    }
+}
+
+extension SelectableAnswer.Coordinator: UIGestureRecognizerDelegate {
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+    ) -> Bool { true }
+}
+
+/// A text view that does not let the surrounding scroll view veto its gestures.
+final class AnswerTextView: UITextView {
+    override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        true
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRequireFailureOf otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        // The transcript's pan is for scrolling; it must not be a precondition for
+        // selecting a word.
+        otherGestureRecognizer is UIPanGestureRecognizer
     }
 }
 

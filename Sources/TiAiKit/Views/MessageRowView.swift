@@ -138,10 +138,12 @@ struct MessageRow: View {
                 // blocks could only be copied one block at a time — a sentence
                 // that ran from a paragraph into a list came out in pieces.
                 SelectableAnswer(markdown: renderedText)
+                    .accessibilityIdentifier("answerText")
                 #else
                 ForEach(Array(Markdown.blocks(TextSanitizer.clean(renderedText)).enumerated()), id: \.offset) { _, block in
                     MarkdownBlockView(block: block, streaming: turn.streaming)
                 }
+                .accessibilityIdentifier("answerText")
                 #endif
                 ForEach(lifted.links) { link in
                     FileLinkCard(link: link, busy: fileBusy == link.id,

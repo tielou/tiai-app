@@ -1,4 +1,4 @@
-.PHONY: build test probe app-check check project icon clean install ios ios-release
+.PHONY: build test probe app-check check project icon clean install ios ios-release uitest project-gen
 
 # The simulator the app is built for and installed onto.
 SIM_UDID = 92C09667-3F60-4C1B-A548-3C863E2B6E63
@@ -25,6 +25,17 @@ app-check: build
 ios:
 	xcodebuild -quiet -project TiAi.xcodeproj -scheme TiAi \
 	  -destination 'platform=iOS Simulator,name=iPhone 16e' build
+
+## Drives the built app on a simulator through the accessibility tree.
+##
+## These are the tests that catch a control which renders and does nothing — the
+## class of bug unit tests cannot see, because the request was correct and the
+## view never fired it. They skip themselves on a simulator that has never
+## signed in, so this is a developer command, not a CI gate.
+uitest: app
+	xcodebuild -project TiAi.xcodeproj -scheme TiAi \
+	  -destination 'platform=iOS Simulator,name=iPhone 16e' \
+	  -only-testing:TiAiUITests test
 
 ## Release configuration, which is the one TestFlight builds.
 ##

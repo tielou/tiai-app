@@ -28,16 +28,6 @@
 		<false/>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
-		<!-- An MCP sign-in does not stay on the server you configured: the OAuth
-		     dance hands the browser off to whatever the identity provider says
-		     next, and on a self-hosted stack that is often plain HTTP on a real
-		     hostname. `NSAllowsLocalNetworking` does not cover that — it only
-		     exempts .local and LAN addresses — so the hand-off died with "App
-		     Transport Security policy requires the use of a secure connection"
-		     and the login page never appeared. This relaxes the rule for web view
-		     content only; the app's own calls to your server still require TLS. -->
-		<key>NSAllowsArbitraryLoadsInWebContent</key>
-		<true/>
 	</dict>
 	<key>NSCameraUsageDescription</key>
 	<string>Attaching a photo you just took. The picture goes to your own server and nowhere else.</string>
