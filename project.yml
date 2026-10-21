@@ -63,6 +63,16 @@ targets:
           if you turn it on.
         NSSpeechRecognitionUsageDescription:
           Dictation for the composer is transcribed on this device.
+        # LiteLLM sits behind a TLS-terminating proxy and answers its login POST
+        # with `Location: http://llm.wobker.co/...`. The proxy would bounce that
+        # back to https with a 301, but ATS refuses the http attempt outright
+        # (-1022) so the redirect never happens — and WKWebView does not consult
+        # the navigation delegate for a server 3xx, so no app-side upgrade can
+        # intercept it either. Scoped to web content on purpose: the app's own
+        # API calls, which carry the session token, stay under full ATS.
+        # The real fix is X-Forwarded-Proto at the proxy; see ARCHITECTURE.md.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoadsInWebContent: true
         NSSupportsLiveActivities: true
         # The one way back into the app from outside: tapping the Live Activity,
         # and the share extension handing over a composed prompt.

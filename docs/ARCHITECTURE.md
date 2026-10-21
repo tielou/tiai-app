@@ -205,3 +205,28 @@ Fixtures in `Tests/TiAiKitTests/Fixtures/` are real captured payloads with the
 identifiers scrubbed, not hand-written idealisations — the value is in the parts
 nobody would invent, like a `content` that is a block array or a model record
 with no `info` at all.
+
+## When an MCP host's login dies with -1022
+
+Symptom: the sign-in sheet shows a LiteLLM login form, credentials go in, Login
+is pressed, and the sheet reports `some.host: The resource could not be loaded
+because the App Transport Security policy requires the use of a secure
+connection. (-1022)`.
+
+It is not a certificate problem. A TLS-terminating proxy is not telling the
+upstream it is there, so LiteLLM builds its post-login `Location` from the
+request it actually received — plain http. iOS refuses to make that request at
+all, so the proxy's own http→https 301 never runs. The delegate cannot help:
+WKWebView does not consult it for a server 3xx, which is why upgrading the scheme
+in `OAuthWebView` does not catch this.
+
+The cure is one line at the proxy, and it fixes every client, not just this one:
+
+```nginx
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header X-Forwarded-Host  $host;
+```
+
+`NSAllowsArbitraryLoadsInWebContent` is set in the app's Info.plist so the flow
+works while that is not configured. It is deliberately scoped to web content:
+the app's own API traffic, which carries the session token, stays under full ATS.
