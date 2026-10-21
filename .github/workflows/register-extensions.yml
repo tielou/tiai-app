@@ -1,0 +1,50 @@
+# One-time: register the two extension App IDs and mint their distribution
+# profiles, then store them for the release build.
+#
+# It runs here rather than on a laptop because the working App Store Connect API
+# key only exists as a repository secret — the copies on a dev machine are stale,
+# and nothing in this workflow ever prints a credential.
+#
+# Re-running is safe: existing App IDs are left alone and profiles are re-issued.
+name: tiAi Register Extensions
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  secrets: write
+
+jobs:
+  register:
+    runs-on: macos-14
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_API_KEY: ${{ secrets.ASC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          for v in ASC_KEY_ID ASC_ISSUER_ID ASC_API_KEY; do
+            if [ -z "${!v}" ]; then echo "$v is not set"; exit 1; fi
+          done
+          python3 -m pip install --quiet cryptography
+
+      - name: Register App IDs and mint profiles
+        run: python3 scripts/asc_setup.py
+
+      # One secret holding {profile name: base64}. Two separate secrets would do
+      # the same, but a map means a third extension is a line in a list rather
+      # than another secret and another line of the release workflow.
+      - name: Store the profiles
+        run: |
+          gh secret set EXT_PROFILES --body "$(cat profiles.json)"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Done
+        run: |
+          echo "Stored. The release workflow now installs these alongside the"
+          echo "app's own profile and points each extension target at its name."
