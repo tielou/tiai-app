@@ -232,12 +232,22 @@ jobs:
 
       # Kept even though the build is already uploaded: it is the artifact you
       # reach for when TestFlight processing stalls.
+      # hashFiles() only sees inside the workspace, so it always came back empty
+      # for a path under runner.temp and the artifact was silently skipped. The
+      # ipa is what you want when TestFlight processing stalls or you need to
+      # prove what a build actually contained.
+      - name: Stage ipa for the artifact
+        if: success()
+        run: |
+          mkdir -p dist
+          cp "$RUNNER_TEMP"/export/*.ipa dist/ 2>/dev/null || echo "no ipa to keep"
       - name: Save ipa
-        if: success() && hashFiles(format('{0}/export/*.ipa', runner.temp)) != ''
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: tiAi-build-${{ github.run_number }}
-          path: ${{ runner.temp }}/export/*.ipa
+          path: dist/*.ipa
+          if-no-files-found: warn
           retention-days: 14
 
       - name: Record what this build is
