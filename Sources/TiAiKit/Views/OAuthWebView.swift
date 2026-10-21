@@ -324,6 +324,33 @@ private struct SessionBrowser: UIViewControllerRepresentable {
             url.host.map { $0 + (url.path == "/" ? "" : url.path) } ?? url.absoluteString
         }
 
+        /// LiteLLM sits behind a TLS-terminating proxy and does not know it, so
+        /// the URLs it hands back — the login form's action, the next redirect —
+        /// come out as `http://llm.wobker.co/...`. iOS refuses those outright
+        /// with -1022, "App Transport Security policy requires the use of a
+        /// secure connection", which reads like a certificate problem and is
+        /// nothing of the sort: the host serves https fine, it just was not asked
+        /// for. Upgrading the scheme here fixes it for every MCP host that has
+        /// the same proxy habit, without opening the whole app to insecure
+        /// loads for the sake of one page.
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationAction: WKNavigationAction,
+            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        ) {
+            guard let url = navigationAction.request.url, url.scheme == "http",
+                  let https = URL(string: "https://" + url.absoluteString.dropFirst("http://".count))
+            else {
+                decisionHandler(.allow)
+                return
+            }
+            #if DEBUG
+            OWUIClient.debugLog("oauth upgrading to https \(https.host ?? "?")\(https.path)")
+            #endif
+            decisionHandler(.cancel)
+            webView.load(URLRequest(url: https))
+        }
+
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             #if DEBUG
             OWUIClient.debugLog("oauth done \(webView.url?.absoluteString ?? "nil")")
