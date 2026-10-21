@@ -703,7 +703,8 @@ public final class ConversationModel {
             : hub.frames(for: chat)
         let request = CompletionRequest(
             model: model,
-            messages: history,
+            messages: Self.systemPrefixed(history,
+                prompt: SettingsStore.shared.defaults.systemPrompt),
             // Absent, not null: the server reads a missing `chat_id` as "this is
             // a new chat" and only then offers to name it.
             chatID: newChat ? nil : chat,
@@ -1476,6 +1477,28 @@ public final class ConversationModel {
     /// message pointing at its parent. The message being (re)asked is included
     /// with the caller's text, since locally it is still the empty placeholder or
     /// the previous answer's text.
+    /// The system prompt, as the server wants it.
+    ///
+    /// Not as `params.system`. That key is read from the *model's* admin-configured
+    /// params (`routers/openai.py`: `params = model_info.params.model_dump()`, then
+    /// `params.pop('system')`); a value a client sends there is merged into
+    /// `form_data['params']` and recorded in `chat_context` for background runs,
+    /// but it never reaches the prompt. The carrier is a `system` role message in
+    /// `messages` — `utils/middleware.py` takes `get_system_message(form_data['messages'])`
+    /// and puts it in front of the history it rebuilds from the chat tree. Sending
+    /// it anywhere else looks correct on the wire and does nothing, which is
+    /// exactly how it behaved.
+    nonisolated static func systemPrefixed(_ history: [CompletionRequest.WireMessage],
+                               prompt: String) -> [CompletionRequest.WireMessage] {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !history.contains(where: { $0.role == "system" }) else {
+            return history
+        }
+        return [CompletionRequest.WireMessage(id: UUID().uuidString, role: "system",
+                                              content: .text(trimmed))]
+            + history
+    }
+
     private func wireHistory(through userMessageID: String, content: MessageContent)
         -> [CompletionRequest.WireMessage]
     {
