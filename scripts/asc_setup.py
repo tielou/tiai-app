@@ -64,13 +64,17 @@ def call(method: str, path: str, body=None):
 
 
 def fail(status, payload):
-    detail = payload.get("errors", [{}])[0] if isinstance(payload, dict) else {}
-    print(f"::error:: HTTP {status}: {detail.get('title', '')} {detail.get('detail', '')}",
-          file=sys.stderr)
+    # The whole body, not just the first field: Apple distinguishes a bad
+    # signature from a key that does not exist from a key with the wrong role,
+    # and the difference decides what to do next.
+    print(f"::error:: HTTP {status}: {json.dumps(payload)[:600]}", file=sys.stderr)
     sys.exit(1)
 
 
 def existing_bundle_ids():
+    # /v1/user is the cheapest way to learn whether the token itself is accepted.
+    probe = call("GET", "/v1/users?limit=1")
+    print(f"token probe: HTTP {probe[0]} {json.dumps(probe[1])[:300]}")
     status, data = call("GET", "/v1/bundleIds?limit=200")
     if status != 200:
         fail(status, data)
