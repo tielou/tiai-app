@@ -17,8 +17,10 @@ public struct AppDefaults: Codable, Equatable, Sendable {
     /// number chosen for one model is wrong for the next one.
     public var temperature: Double?
     /// Ask to be told when an answer lands while the app is not the thing on
-    /// screen. Off by default: a chat app that notifies unprompted is a
-    /// notification app with a chat attached.
+    /// screen. On by default: a long answer outlives the app switcher, and
+    /// sliding back to a transcript that has not moved is indistinguishable from
+    /// a hung one. The permission prompt is deferred to the first send rather
+    /// than launch, so it arrives at a moment where the request makes sense.
     public var notifyWhenFinished: Bool
     /// Voice for read-aloud. nil means "whatever the instance configured", which
     /// matters because voice names are not portable across engines — `alloy`
@@ -26,7 +28,7 @@ public struct AppDefaults: Codable, Equatable, Sendable {
     public var readAloudVoice: String?
 
     public init(
-        systemPrompt: String = "", temperature: Double? = nil, notifyWhenFinished: Bool = false,
+        systemPrompt: String = "", temperature: Double? = nil, notifyWhenFinished: Bool = true,
         readAloudVoice: String? = nil
     ) {
         self.systemPrompt = systemPrompt
@@ -35,9 +37,13 @@ public struct AppDefaults: Codable, Equatable, Sendable {
         self.readAloudVoice = readAloudVoice
     }
 
+    /// "Nothing here that the user chose." Compared against a fresh default
+    /// rather than against all-off: notifications are on by default now, so
+    /// turning them *off* is a preference worth remembering, not noise.
     public var isEmpty: Bool {
         systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && temperature == nil && !notifyWhenFinished && readAloudVoice == nil
+            && temperature == nil && readAloudVoice == nil
+            && notifyWhenFinished == AppDefaults().notifyWhenFinished
     }
 }
 

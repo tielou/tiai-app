@@ -35,7 +35,7 @@ public struct GenerationActivityAttributes: Codable, Hashable {
             case waiting = "Waiting"
             case thinking = "Thinking"
             case writing = "Writing"
-            case finished = "Finished"
+            case finished = "Done"
             case stopped = "Stopped"
         }
         public var phase: Phase
@@ -124,7 +124,12 @@ public final class GenerationActivity {
             phase: phase, characters: characters, startedAt: startedAt)
         self.activity = nil
         nonisolated(unsafe) let target = activity
-        await target.end(using: state, dismissalPolicy: .after(.now + 15))
+        // No sound here, deliberately. `ActivityContent` carries no alert
+        // parameter in this SDK — a Live Activity can only be made to chime by a
+        // push, which this app has no server for. The audible signal is a local
+        // notification instead; see CompletionNotifier.
+        // Held for 30s rather than 15: "Done" has to survive being noticed.
+        await target.end(using: state, dismissalPolicy: .after(.now + 30))
     }
 
     public func cancelIfRunning() async {

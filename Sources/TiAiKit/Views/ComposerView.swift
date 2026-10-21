@@ -548,27 +548,28 @@ struct AddToChatSheet: View {
                 if !tools.isEmpty {
                     Section {
                         ForEach(tools) { tool in
-                            HStack(alignment: .firstTextBaseline) {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(tool.name)
-                                    // The id is noise for an MCP server ("server:mcp:1"),
-                                    // so it only appears when there is nothing better.
-                                    if let detail = tool.detail {
-                                        Text(detail).font(.caption).foregroundStyle(.secondary)
-                                            .lineLimit(2)
-                                    }
+                            HStack(alignment: .center) {
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(tool.name).font(.callout)
+                                    // One caption line, not two. The id is noise
+                                    // for an MCP server ("server:mcp:1"), and an
+                                    // unsigned tool had a third stacked line for
+                                    // its sign-in link, which made every row tall
+                                    // and mostly empty.
                                     if tool.authenticated == false {
                                         // Not just a caption under the switch: an
                                         // explicit way to sign in. Leaving it as a
                                         // side effect of the toggle meant the only
-                                        // way to start sign-in was to switch on a tool
-                                        // you could not yet use, which reads as a bug
-                                        // and is easy to never discover.
+                                        // way to start sign-in was to switch on a
+                                        // tool you could not yet use.
                                         Button { startSignIn(tool) } label: {
                                             Label("Sign in to use", systemImage: "lock")
                                                 .font(.caption).foregroundStyle(.orange)
                                         }
                                         .buttonStyle(.plain)
+                                    } else if let detail = tool.detail {
+                                        Text(detail).font(.caption).foregroundStyle(.secondary)
+                                            .lineLimit(1)
                                     }
                                 }
                                 Spacer(minLength: 12)

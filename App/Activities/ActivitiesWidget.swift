@@ -23,7 +23,17 @@ struct GenerationActivityWidget: Widget {
                     Text("\(context.state.characters) chars")
                         .font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
                 }
-                ProgressView().progressViewStyle(.linear).tint(.primary)
+                if context.state.phase == .finished || context.state.phase == .stopped {
+                    // A bar that keeps filling after the run ended reads as a
+                    // bug. The number already stopped moving; say so in words.
+                    Label("\(context.state.characters) characters",
+                          systemImage: context.state.phase == .finished
+                              ? "checkmark.circle.fill" : "stop.circle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(context.state.phase == .finished ? .green : .secondary)
+                } else {
+                    ProgressView().progressViewStyle(.linear).tint(.primary)
+                }
             }
             .padding(12)
         } dynamicIsland: { context in
@@ -44,8 +54,15 @@ struct GenerationActivityWidget: Widget {
             } compactLeading: {
                 Image(systemName: "cat.fill")
             } compactTrailing: {
-                Text(context.state.phase == .writing ? "…" : String(context.state.phase.rawValue.prefix(1)))
-                    .font(.system(size: 11, weight: .semibold))
+                // "F" for Finished read as a glitch. A tick needs no legend at
+                // Island size; a letter does.
+                if context.state.phase == .finished {
+                    Image(systemName: "checkmark.circle.fill").font(.system(size: 12))
+                } else if context.state.phase == .stopped {
+                    Image(systemName: "stop.circle").font(.system(size: 12))
+                } else {
+                    Text("…").font(.system(size: 13, weight: .semibold))
+                }
             } minimal: {
                 Image(systemName: "cat.fill")
             }

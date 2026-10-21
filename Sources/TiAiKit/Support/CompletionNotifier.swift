@@ -36,7 +36,9 @@ public enum CompletionNotifier {
     ///
     /// Announcing an answer the user is already reading is worse than silence.
     public static func answerReady(title: String, preview: String) {
-        guard isEnabled else { return }
+        // Permission and preference are different questions: turning the setting
+        // off must silence it even though iOS still says yes.
+        guard isEnabled, SettingsStore.shared.defaults.notifyWhenFinished else { return }
         guard UIApplication.shared.applicationState != .active else { return }
         let content = UNMutableNotificationContent()
         content.title = title.isEmpty ? "Answer ready" : title
