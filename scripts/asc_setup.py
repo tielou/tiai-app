@@ -32,9 +32,12 @@ def _b64(data: bytes) -> str:
 
 
 def token() -> str:
-    key_id = os.environ["ASC_KEY_ID"]
-    issuer = os.environ["ASC_ISSUER_ID"]
-    pem = base64.b64decode(os.environ["ASC_API_KEY"])
+    # Stripped because a secret set from a shell heredoc often carries a trailing
+    # newline, and a `kid` of "ABC123\n" is a perfectly well-signed token that
+    # matches no key — which Apple reports as a generic 401, not as a bad kid.
+    key_id = os.environ["ASC_KEY_ID"].strip()
+    issuer = os.environ["ASC_ISSUER_ID"].strip()
+    pem = base64.b64decode(os.environ["ASC_API_KEY"].strip())
     key = serialization.load_pem_private_key(pem, password=None)
     now = int(time.time())
     header = _b64(json.dumps({"alg": "ES256", "kid": key_id, "typ": "JWT"}).encode())
@@ -74,7 +77,8 @@ def fail(status, payload):
 def existing_bundle_ids():
     # /v1/user is the cheapest way to learn whether the token itself is accepted.
     probe = call("GET", "/v1/users?limit=1")
-    print(f"token probe: HTTP {probe[0]} {json.dumps(probe[1])[:300]}")
+    print(f"token probe: HTTP {probe[0]} {json.dumps(probe[1])[:200]}")
+    print(f"key id length {len(os.environ['ASC_KEY_ID'])} (stripped {len(key := os.environ['ASC_KEY_ID'].strip())})")
     status, data = call("GET", "/v1/bundleIds?limit=200")
     if status != 200:
         fail(status, data)
