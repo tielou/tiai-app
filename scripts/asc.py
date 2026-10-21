@@ -23,8 +23,11 @@ def token() -> str:
     key = serialization.load_pem_private_key(KEY_PATH.read_bytes(), password=None)
     now = int(time.time())
     header = _b64(json.dumps({"alg": "ES256", "kid": KEY_ID, "typ": "JWT"}).encode())
-    payload = _b64(json.dumps({"iss": ISSUER_ID, "iat": now,
-                               "exp": now + 500}).encode())
+    # `aud` is not optional here. Apple's REST API rejects a token without it as
+    # a generic 401, which is a terrible error to get for a missing claim — and
+    # `notarytool` accepts the same key, which is what pointed here.
+    payload = _b64(json.dumps({"iss": ISSUER_ID, "aud": "appstoreconnect-v1",
+                               "iat": now, "exp": now + 500}).encode())
     # Kept as a str and encoded separately: an f-string over the bytes gives
     # "b'eyJ...'", which Apple rejects as a malformed bearer token.
     unsigned = f"{header}.{payload}"

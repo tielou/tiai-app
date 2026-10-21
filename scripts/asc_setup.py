@@ -13,6 +13,14 @@ What it does, idempotently:
 
 An App Store profile is bound to exactly one bundle id, so the app's existing
 profile cannot simply grow to cover the extensions — each needs its own.
+
+Step 2 does not work on this account: `GET/POST /v1/provisioningProfiles`
+answers 404 "the path provided does not match a defined resource type" for both
+API keys, Admin included, while every other endpoint works. So the profiles have
+to come from somewhere else — `xcodebuild -allowProvisioningUpdates` creates
+them during an archive, which is the path actually taken. Step 1 is what this
+script is for now, and it is the part that had to happen before Xcode could do
+the rest.
 """
 import base64, json, os, pathlib, sys, time, urllib.error, urllib.request
 from cryptography.hazmat.primitives import hashes, serialization
@@ -41,7 +49,11 @@ def token() -> str:
     key = serialization.load_pem_private_key(pem, password=None)
     now = int(time.time())
     header = _b64(json.dumps({"alg": "ES256", "kid": key_id, "typ": "JWT"}).encode())
-    payload = _b64(json.dumps({"iss": issuer, "iat": now, "exp": now + 500}).encode())
+    # `aud` is not optional here. Apple's REST API rejects a token without it as
+    # a generic 401 — a terrible error to get for a missing claim. `notarytool`
+    # accepted the same key, which is what pointed here.
+    payload = _b64(json.dumps({"iss": issuer, "aud": "appstoreconnect-v1",
+                               "iat": now, "exp": now + 500}).encode())
     unsigned = f"{header}.{payload}"
     der = key.sign(unsigned.encode(), ec.ECDSA(hashes.SHA256()))
     r, s = decode_dss_signature(der)
@@ -82,7 +94,11 @@ def existing_bundle_ids():
 
 
 def distribution_certificate():
-    status, data = call("GET", "/v1/certificates?filter[certificateType]=IOS_DISTRIBUTION")
+    # Brackets percent-encoded: unencoded they do not survive urllib's request
+    # line and Apple answers 404 "path does not match a defined resource type",
+    # which reads like a missing endpoint rather than a mangled query.
+    status, data = call("GET",
+                        "/v1/certificates?filter%5BcertificateType%5D=IOS_DISTRIBUTION")
     if status != 200:
         fail(status, data)
     certs = data.get("data", [])
