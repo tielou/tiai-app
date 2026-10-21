@@ -17,6 +17,10 @@ public struct ConversationView: View {
     private let session: SessionStore
     @State private var conversation: ConversationModel
     @State private var atBottom = true
+    /// Read-aloud. One player for the screen, not one per message: starting a
+    /// second answer while the first is speaking should take the voice, not talk
+    /// over it, and the audio session belongs to the app rather than a row.
+    @State private var speech: SpeechPlayer
     /// How far past the end of the content the reader has dragged, as a negative
     /// number. Zero whenever there is still content below the fold.
     @State private var overscroll: CGFloat = 0
@@ -146,6 +150,9 @@ public struct ConversationView: View {
     ) {
         self.session = session
         self.onNewChat = onNewChat
+        let player = SpeechPlayer(client: session.client)
+        player.setVoice(SettingsStore.shared.defaults.readAloudVoice)
+        _speech = State(initialValue: player)
         self._models = State(initialValue: models)
         _conversation = State(
             initialValue: ConversationModel(
@@ -238,6 +245,15 @@ public struct ConversationView: View {
                         OWUIClient.dump(url: URL(string: "https://dump/\(path)")!,
                                         method: "PROBE", data: data)
                     } catch { OWUIClient.debugLog("probe \(path) failed: \(error)") }
+                }
+            }
+            // Diagnostics: does this instance speak? Read-only, one short phrase.
+            if let phrase = ProcessInfo.processInfo.environment["TIAI_SPEECH_PROBE"] {
+                Task {
+                    do {
+                        let (data, type) = try await session.client.speech(text: phrase)
+                        OWUIClient.debugLog("speech probe ok: \(data.count) bytes, \(type)")
+                    } catch { OWUIClient.debugLog("speech probe failed: \(error)") }
                 }
             }
             // Diagnostics. The sheet that normally starts a sign-in cannot be
@@ -396,6 +412,7 @@ public struct ConversationView: View {
                             sibling: conversation.siblingPage(of: turn.id),
                             onSibling: { conversation.selectSibling(of: turn.id, direction: $0) },
                             fileLoader: { await conversation.fileData(id: $0) },
+                            speech: speech,
                             onOpenFile: openTerminalFile,
                             onOpenLink: openFileLink,
                             fileBusy: busyFile,

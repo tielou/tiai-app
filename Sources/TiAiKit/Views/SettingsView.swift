@@ -15,6 +15,8 @@ public struct SettingsView: View {
     @State private var promptDraft = ""
     @State private var useTemperature = false
     @State private var temperature = 0.7
+    @State private var voice: String? = nil
+    @State private var voices: [OWUIClient.Voice] = []
     @State private var confirmSignOut = false
     @State private var notify = false
 
@@ -150,6 +152,20 @@ public struct SettingsView: View {
                         if !granted { notify = false }
                     }
                 }
+            // Only offered when the instance actually has something to speak
+            // with. A picker of voices that all fail is worse than no picker, and
+            // the list is the server's because voice names are not portable.
+            if voices.count > 1 {
+                Picker("Read aloud with", selection: $voice) {
+                    Text("Server default").tag(String?.none)
+                    ForEach(voices) { option in
+                        Text(option.name).tag(String?.some(option.id))
+                    }
+                }
+                .onChange(of: voice) { _, new in
+                    store.defaults.readAloudVoice = new
+                }
+            }
         } header: {
             Text("Defaults for new chats")
         } footer: {
@@ -191,6 +207,12 @@ public struct SettingsView: View {
         useTemperature = store.defaults.temperature != nil
         temperature = store.defaults.temperature ?? 0.7
         notify = store.defaults.notifyWhenFinished
+        voice = store.defaults.readAloudVoice
+        if voices.isEmpty {
+            Task {
+                voices = ((try? await session.client.voices()) ?? []).filter { !$0.id.isEmpty }
+            }
+        }
         CompletionNotifier.isEnabled = store.defaults.notifyWhenFinished
     }
 

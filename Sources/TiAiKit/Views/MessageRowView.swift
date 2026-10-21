@@ -27,6 +27,8 @@ struct MessageRow: View {
     /// Loads the bytes of an attached file. The file route needs the bearer
     /// token, so this cannot be an `AsyncImage` with a URL.
     var fileLoader: ((String) async -> Data?)? = nil
+    /// Read-aloud, shared by the screen so only one answer speaks at a time.
+    @ObservedObject var speech: SpeechPlayer
 
     @State private var editing = false
     @State private var draft = ""
@@ -342,6 +344,25 @@ struct MessageRow: View {
                     .buttonStyle(.borderless)
                     .foregroundStyle(.tertiary)
                     .accessibilityLabel("Try again")
+                }
+                // Spoken, not copied: an answer you are cooking or driving past
+                // is still an answer. Only offered once the message has finished,
+                // because reading a half-written sentence and then the rest of it
+                // is worse than waiting.
+                if turn.isAssistant && !turn.streaming && !turn.text.isEmpty {
+                    Button {
+                        if speech.isPlaying {
+                            speech.stop()
+                        } else {
+                            speech.read(turn.text)
+                        }
+                    } label: {
+                        Image(systemName: speech.isPlaying
+                            ? "stop.circle.fill" : "speaker.wave.2")
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(speech.isPlaying ? .primary : .tertiary)
+                    .accessibilityLabel(speech.isPlaying ? "Stop reading" : "Read aloud")
                 }
                 // Two flavours, because they are used for different things. Pasting
                 // an answer into Mail wants the sentence, not the `##` that was

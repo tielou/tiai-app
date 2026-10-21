@@ -20,18 +20,24 @@ public struct AppDefaults: Codable, Equatable, Sendable {
     /// screen. Off by default: a chat app that notifies unprompted is a
     /// notification app with a chat attached.
     public var notifyWhenFinished: Bool
+    /// Voice for read-aloud. nil means "whatever the instance configured", which
+    /// matters because voice names are not portable across engines — `alloy`
+    /// means something to OpenAI and nothing to Edge.
+    public var readAloudVoice: String?
 
     public init(
-        systemPrompt: String = "", temperature: Double? = nil, notifyWhenFinished: Bool = false
+        systemPrompt: String = "", temperature: Double? = nil, notifyWhenFinished: Bool = false,
+        readAloudVoice: String? = nil
     ) {
         self.systemPrompt = systemPrompt
         self.temperature = temperature
         self.notifyWhenFinished = notifyWhenFinished
+        self.readAloudVoice = readAloudVoice
     }
 
     public var isEmpty: Bool {
         systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && temperature == nil && !notifyWhenFinished
+            && temperature == nil && !notifyWhenFinished && readAloudVoice == nil
     }
 }
 

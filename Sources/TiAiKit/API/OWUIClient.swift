@@ -592,6 +592,51 @@ public struct OWUIClient: Sendable {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    // MARK: - speech
+
+    /// A voice the instance can speak with.
+    ///
+    /// Names come from the server because they are not portable: `alloy` means
+    /// something to OpenAI and nothing to Edge or Azure, so hardcoding a list
+    /// would be a menu of options that fail on someone else's install.
+    public struct Voice: Identifiable, Codable, Sendable, Hashable {
+        public let id: String
+        public let name: String
+    }
+
+    public func voices() async throws -> [Voice] {
+        struct Wrapper: Decodable { let voices: [Voice]? }
+        let (data, http) = try await perform(
+            "GET", server.api("/audio/voices"), bodyData: nil, timeout: 30)
+        let wrapped = try Self.validate(data, http, as: Wrapper.self)
+        return wrapped.voices ?? []
+    }
+
+    /// Speech for one chunk of text, as audio bytes plus their type.
+    ///
+    /// The voice is omitted unless the user picked one: the server has its own
+    /// configured default, and sending a name the engine does not know is worse
+    /// than sending nothing. A 404 or 503 means no engine is configured, which
+    /// is a setting on the instance and not something this app can fix.
+    public func speech(text: String, voice: String? = nil) async throws
+        -> (Data, String) {
+        var payload: [String: String] = ["input": text]
+        if let voice, !voice.isEmpty { payload["voice"] = voice }
+        let body = try JSONEncoder().encode(payload)
+        let (data, http) = try await perform(
+            "POST", server.api("/audio/speech"), bodyData: body, timeout: 120)
+        switch http.statusCode {
+        case 200..<300:
+            let type = http.value(forHTTPHeaderField: "Content-Type") ?? "audio/mpeg"
+            return (data, type)
+        case 401: throw APIError.unauthorized
+        case 404, 503:
+            throw APIError.http(status: http.statusCode,
+                                message: "No text-to-speech engine is configured on this instance.")
+        default: throw APIError.http(status: http.statusCode, message: "\(http.statusCode)")
+        }
+    }
+
     // MARK: - notes
 
     /// Notes are a separate object from chats, with their own list and sharing.
