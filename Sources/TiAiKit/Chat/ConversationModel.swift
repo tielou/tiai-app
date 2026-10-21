@@ -414,6 +414,13 @@ public final class ConversationModel {
         // wait for a scheduling hop, and a caller that then awaits something
         // conditioned on the phase would otherwise race the run it just started.
         phase = .waiting
+        // Out-of-process progress. A long answer outlives the app switcher, and
+        // coming back to a transcript that has not moved is indistinguishable
+        // from a hung one; a ribbon that says "Writing · local-deep" settles it.
+        GenerationActivity.shared.start(
+            chatTitle: title.isEmpty ? "New Chat" : title,
+            model: modelIDs.first ?? "",
+            chatID: chatID)
         run = Task {
             // Taken *after* the wait, because until the upload answers there is
             // no file id to take.
@@ -827,6 +834,9 @@ public final class ConversationModel {
         // server reads as "unread". Marking read on open is not enough for a chat
         // the app both asked and answered — nobody else needs to be told about it.
         if let chat = chatID, outcome.failure == nil { hub.markChatRead(chat) }
+        GenerationActivity.shared.finish(
+            outcome.failure == nil ? .finished : .stopped,
+            characters: turns.first(where: { $0.id == assistantID })?.text.count ?? 0)
         if outcome.failure == nil {
             // Only worth saying when nobody is watching: announcing an answer the
             // user is already reading is worse than silence, and the notifier
@@ -941,6 +951,11 @@ public final class ConversationModel {
             if let messageID = frame.messageID, messageID != assistantID { continue }
             if let delta = frame.delta { pending?.text += delta }
             if let thinking = frame.reasoningDelta { pending?.reasoning += thinking }
+            if let pending {
+                GenerationActivity.shared.update(
+                    phase: pending.text.isEmpty ? .thinking : .writing,
+                    characters: pending.text.count)
+            }
             if let usage = frame.usage { pending?.usage = usage }
             // The server's own summary for the chat, when it got one mid-run.
             if let generated = frame.title {

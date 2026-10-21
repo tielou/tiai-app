@@ -558,6 +558,18 @@ public struct ChatHomeView: View {
                         session: session, chatID: chatID, models: models,
                         onNewChat: { startNewChat() })
                         .id("\(chatID ?? "new")-\(draft)")
+                        // Tapping the Live Activity should land in the chat that is
+                        // generating, not wherever the app happens to reopen.
+                        .onOpenURL { url in
+                            guard url.scheme == "tiai", url.host == "chat",
+                                  let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                                      .queryItems?
+                                      .first(where: { $0.name == "id" })?.value,
+                                  !id.isEmpty
+                            else { return }
+                            chatID = id
+                            showingChats = false
+                        }
                         .toolbar {
                             ToolbarItem(placement: .navigation) {
                                 Button { openChats() } label: {

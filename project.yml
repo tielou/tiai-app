@@ -30,7 +30,12 @@ targets:
     type: application
     platform: iOS
     sources:
-      - App
+      - path: App
+        # The Live Activity is a separate process with its own Info.plist. Left
+        # in here, both targets claim the same plist and the build fails with
+        # "multiple commands produce Info.plist".
+        excludes:
+          - "Activities/**"
     info:
       path: App/Info.plist
       properties:
@@ -59,12 +64,41 @@ targets:
           Dictation for the composer is transcribed on this device.
     dependencies:
       - package: TiAiKit
+      # The Live Activity lives in its own process, so it has to travel with the
+      # app; XcodeGen wires the embed phase from this.
+      - target: TiAiActivities
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: co.wobker.tiai
         TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_STYLE: Automatic
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+
+  # The Live Activity shown while an answer is generating. An app extension
+  # because that is the only way to get anything onto the Dynamic Island, and it
+  # runs out of process, so it gets its own bundle id.
+  TiAiActivities:
+    type: app-extension
+    platform: iOS
+    sources:
+      - App/Activities
+    info:
+      path: App/Activities/Info.plist
+      properties:
+        CFBundleDisplayName: tiAi Live Activity
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    dependencies:
+      - package: TiAiKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: co.wobker.tiai.activities
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
         MARKETING_VERSION: "0.1"
         CURRENT_PROJECT_VERSION: "1"
 
