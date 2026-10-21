@@ -278,11 +278,10 @@ private struct SessionBrowser: UIViewControllerRepresentable {
             withError error: Error
         ) {
             #if DEBUG
-            OWUIClient.debugLog("oauth provisional failure \(error.localizedDescription) "
-                + "host=\(self.host)")
+            OWUIClient.debugLog("oauth provisional failure \(Self.explain(error, url: webView.url))")
             #endif
             // ATS refusals and unreachable hosts used to leave a blank sheet.
-            onFailed((error as? LocalizedError)?.localizedDescription ?? error.localizedDescription)
+            onFailed(Self.explain(error, url: webView.url))
         }
 
         func webView(
@@ -291,9 +290,34 @@ private struct SessionBrowser: UIViewControllerRepresentable {
             withError error: Error
         ) {
             #if DEBUG
-            OWUIClient.debugLog("oauth navigation failure \(error.localizedDescription)")
+            OWUIClient.debugLog("oauth navigation failure \(Self.explain(error, url: webView.url))")
             #endif
-            onFailed((error as? LocalizedError)?.localizedDescription ?? error.localizedDescription)
+            onFailed(Self.explain(error, url: webView.url))
+        }
+
+        /// "The operation couldn't be completed. (NSURLSessionErrorDomain error
+        /// -1009.)" tells a user nothing and tells a developer almost nothing.
+        /// The host that failed and the code are the two things that decide
+        /// whether this is DNS, a dead port, a captive portal or a certificate —
+        /// so they go in the message instead of being thrown away.
+        private static func explain(_ error: Error, url: URL?) -> String {
+            let ns = error as NSError
+            let host = url?.host ?? "the sign-in page"
+            let text = (error as? LocalizedError)?.localizedDescription
+                ?? error.localizedDescription
+            guard ns.domain == NSURLErrorDomain else { return "\(host): \(text)" }
+            let why: String
+            switch ns.code {
+            case NSURLErrorCannotFindHost: why = "no such host"
+            case NSURLErrorCannotConnectToHost: why = "could not connect"
+            case NSURLErrorNotConnectedToInternet: why = "no network connection"
+            case NSURLErrorTimedOut: why = "timed out"
+            case NSURLErrorNetworkConnectionLost: why = "connection lost"
+            case NSURLErrorSecureConnectionFailed: why = "the secure connection failed"
+            case NSURLErrorCancelled: why = "cancelled"
+            default: why = text
+            }
+            return "\(host): \(why) (\(ns.code))"
         }
 
         private static func describe(_ url: URL) -> String {

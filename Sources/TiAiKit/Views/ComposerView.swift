@@ -114,7 +114,7 @@ struct ComposerView: View {
         .overlay(RoundedRectangle(cornerRadius: 22).stroke(.quaternary))
         .padding(.horizontal)
         .padding(.bottom, 8)
-        .sheet(item: $sheet) { which in
+        .sheet(item: $sheet, onDismiss: flushPending) { which in
             switch which {
             case .add:
                 AddToChatSheet(
@@ -243,8 +243,14 @@ struct ComposerView: View {
 
     /// Opens a picker after the `+` sheet has finished closing. Presenting during
     /// the dismiss animation is silently ignored, which looks like a dead button.
+    ///
+    /// The sign-in browser waits for `onDismiss` rather than a guessed delay: a
+    /// fixed sleep is a race with an animation whose length is not ours to know,
+    /// and losing it looked exactly like a login button that did nothing. The
+    /// first tap lost the race, the second found the sheet already gone.
     private func hand(_ which: Pending) {
         pending = which
+        if case .authorize = which { return }
         Task {
             try? await Task.sleep(for: .milliseconds(400))
             switch which {
@@ -270,6 +276,13 @@ struct ComposerView: View {
                 pending = nil
             }
         }
+    }
+
+    /// Runs whatever the `+` sheet asked for, once it is genuinely off screen.
+    private func flushPending() {
+        guard case let .authorize(url, done)? = pending else { return }
+        pending = nil
+        onAuthorize(url, done)
     }
 
     #if os(iOS)
