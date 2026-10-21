@@ -1150,8 +1150,25 @@ enum AskUserFixture {
         "a chat that is supposed to vanish must not leave memories behind")
 }
 
-@Test @MainActor func incognitoIsAChoiceOnlyAtTheStart() {
-    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+/// The web UI leaves web search on for new chats, and that preference lives in
+/// browser localStorage — there is nothing on the server to read (model
+/// `default_feature_ids` is null, `/users/user/settings` returns only `ui`).
+/// The capability is the only signal a client can see, so a model that advertises
+/// search starts with it switched on.
+@Test @MainActor func webSearchIsOnByDefaultWhereTheModelHasIt() {
+    let searcher = ChatModel.stub("local-personal", caps: ["web_search": true])
+    #expect(ConversationModel.seedFeatures(for: searcher)[ChatFeature.webSearch.rawValue] == true)
+
+    let plain = ChatModel.stub("local-quick", caps: ["web_search": false])
+    #expect(ConversationModel.seedFeatures(for: plain)[ChatFeature.webSearch.rawValue] != true,
+            "a model that cannot search must not come with the toggle switched on")
+
+    let incognito = ConversationModel.seedFeatures(for: searcher, incognito: true)
+    #expect(incognito[ChatFeature.webSearch.rawValue] != true,
+            "incognito should not be phoning a search engine")
+}
+
+@Test @MainActor func incognitoIsAChoiceOnlyAtTheStart() {    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
     #expect(ConversationModel.canChangeIncognito(given: []))
     #expect(!ConversationModel.canChangeIncognito(given: [Turn(id: "u1", role: "user", text: "sent")]),
             "messages already on the server cannot be unsent by switching it on now")

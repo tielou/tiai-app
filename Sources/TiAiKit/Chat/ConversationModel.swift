@@ -169,6 +169,17 @@ public final class ConversationModel {
         // in a chat that is supposed to vanish is the opposite of the request.
         if model.supports(.memory) && !incognito { seeded[ChatFeature.memory.rawValue] = true }
         if model.supports(.codeInterpreter) { seeded[ChatFeature.codeInterpreter.rawValue] = true }
+        // Web search joins memory rather than staying off until asked. There is
+        // nothing on the server to inherit: `default_feature_ids` is null for
+        // every model here, and `/users/user/settings` carries only `ui` — the
+        // browser's "on for new chats" is localStorage, which no client can
+        // read. So the capability is the only honest signal, and a model that
+        // advertises search should offer it switched on rather than three taps
+        // deep in a sheet. Incognito gets the same treatment as memory: a chat
+        // that is meant to leave no trace should not be phoning a search engine.
+        if model.supports(.webSearch) && !incognito {
+            seeded[ChatFeature.webSearch.rawValue] = true
+        }
         return seeded
     }
 
