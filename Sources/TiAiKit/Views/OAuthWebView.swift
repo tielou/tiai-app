@@ -41,36 +41,39 @@ struct OAuthWebView: View {
         return host
     }
 
+    /// One line, not two blocks. Both messages are asides about the page below,
+    /// and stacked as full-width filled panels they ate a third of the sheet —
+    /// worst when a login form was on it, because the panels pushed the fields
+    /// down while saying nothing that needed that much room. An error outranks
+    /// the note: if the page failed, where it is hosted is no longer the point.
+    private var statusMessage: (text: String, symbol: String, colour: Color)? {
+        if let failure {
+            return (failure, "exclamationmark.triangle.fill", .orange)
+        }
+        guard let foreign else { return nil }
+        // A tool served by an MCP gateway needs a sign-in at *that* gateway, not
+        // at Open WebUI, and nothing on the page says so — it just shows someone
+        // else's login form and looks like a broken button.
+        return ("\(foreign) wants its own password, not your \(domain) one.",
+                "person.badge.key", .secondary)
+    }
+
+    @ViewBuilder private var statusStrip: some View {
+        if let message = statusMessage {
+            Label(message.text, systemImage: message.symbol)
+                .font(.caption2)
+                .foregroundStyle(message.colour)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12).padding(.vertical, 5)
+                .background(message.colour.opacity(message.colour == .orange ? 0.12 : 0.06))
+        }
+    }
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // A hand-off that goes wrong fails silently by default: the sheet
-                // just sits there and the only honest description is "nothing
-                // happened". Both of these turn that into something to act on.
-                if let failure {
-                    Label(failure, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 12).padding(.vertical, 6)
-                        .background(.orange.opacity(0.12))
-                }
-                // A tool served by an MCP gateway needs a sign-in at *that*
-                // gateway, not at Open WebUI, and nothing on the page says so —
-                // it just shows someone else's login form and looks like a broken
-                // button. Naming the host turns a mystery into a task.
-                if let foreign {
-                    Label(
-                        "This tool is served by \(foreign), which asks for its own "
-                        + "sign-in — not your \(domain) password.",
-                        systemImage: "person.badge.key"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 12).padding(.vertical, 6)
-                    .background(.quaternary.opacity(0.5))
-                }
+                statusStrip
                 SessionBrowser(
                     url: url, token: token, domain: domain,
                     onURL: { whereAmI = $0; foreign = Self.foreignHost($0, configured: domain) },
@@ -314,6 +317,11 @@ private struct SessionBrowser: UIViewControllerRepresentable {
             case NSURLErrorTimedOut: why = "timed out"
             case NSURLErrorNetworkConnectionLost: why = "connection lost"
             case NSURLErrorSecureConnectionFailed: why = "the secure connection failed"
+            // Apple's sentence is 15 words long and blames a policy rather than
+            // the http URL that tripped it. In a one-line strip that length is the
+            // whole problem: it wrapped to three lines and pushed the login form
+            // off screen.
+            case -1022: why = "an insecure redirect was blocked"
             case NSURLErrorCancelled: why = "cancelled"
             default: why = text
             }
