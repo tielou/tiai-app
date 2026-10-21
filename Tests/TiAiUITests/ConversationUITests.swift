@@ -165,6 +165,29 @@ final class ConversationUITests: XCTestCase {
         first.tap()
         settle(1.5)
     }
+
+    /// The jump-to-latest dot has to read as floating over the page, not glued to
+    /// the edge of it. Flush right it looked like a stray control; centred is
+    /// where the eye looks for "where did the conversation get to".
+    func testJumpToLatestFloatsInTheMiddle() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["TIAI_OPEN_CHAT"] = "3005a9f1-f009-4e2c-8725-744a39e5445a"
+        app.launch()
+        if app.secureTextFields.count > 0 { throw XCTSkip("not signed in") }
+        Thread.sleep(forTimeInterval: 7)
+
+        let dot = app.buttons["Scroll to the latest message"]
+        for _ in 0..<6 {
+            app.swipeDown()
+            Thread.sleep(forTimeInterval: 0.7)
+            if dot.exists { break }
+        }
+        // A chat short enough to fit on screen never shows it, and that is not a
+        // failure — the dot is only supposed to exist while it is true.
+        guard dot.exists else { throw XCTSkip("nothing to scroll back to") }
+        XCTAssertEqual(dot.frame.midX, app.windows.firstMatch.frame.midX, accuracy: 6,
+                       "the dot should sit centred above the composer")
+    }
 }
 
 private extension XCUIElement {

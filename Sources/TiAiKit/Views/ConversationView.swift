@@ -481,7 +481,7 @@ public struct ConversationView: View {
                     proxy.scrollTo(BottomAnchor.id, anchor: .bottom)
                 }
             }
-            .overlay(alignment: .bottomTrailing) {
+            .overlay(alignment: .bottom) {
                 // Scrolled up to re-read something, there is no obvious way back:
                 // the newest message can be a screen and a half below the fold and
                 // nothing on screen says so. The dot only exists while it is true.
@@ -499,10 +499,14 @@ public struct ConversationView: View {
                         .overlay(Circle().stroke(.quaternary))
                     }
                     .buttonStyle(.plain)
-                    // Trailing, not centred: centred it landed in the middle of the
-                    // text column and sat on top of the last line of the answer.
-                    .padding(.trailing, 4)
-                    .padding(.bottom, 12)
+                    // Centred, floating, with a shadow: flush against the trailing
+                    // edge it read like a stray control glued to the side of the
+                    // screen, and off-centre it is not where the eye looks for
+                    // "where did the conversation get to". The shadow is what makes
+                    // it safe to sit over a line of text — it reads as above the
+                    // page rather than printed on it.
+                    .shadow(color: .black.opacity(0.12), radius: 5, y: 2)
+                    .padding(.bottom, 14)
                     .accessibilityLabel("Scroll to the latest message")
                     .transition(.opacity.combined(with: .scale(scale: 0.85)))
                 }
