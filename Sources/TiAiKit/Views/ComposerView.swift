@@ -409,6 +409,9 @@ struct ComposerView: View {
         .buttonStyle(.plain)
         .disabled(!conversation.phase.isBusy && !conversation.canSend)
         .accessibilityLabel(conversation.phase.isBusy ? "Stop" : "Send")
+        // The label alone is ambiguous once a chat is running: the stop control
+        // carries the same word, and a UI test asking for "Send" gets two.
+        .accessibilityIdentifier(conversation.phase.isBusy ? "stopGeneration" : "sendButton")
     }
 
     /// The model, always visible, and the way into the model sheet.

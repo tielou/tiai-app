@@ -106,6 +106,7 @@ public struct SettingsView: View {
                         .strokeBorder(.separator, lineWidth: 0.5)
                 )
                 .onChange(of: promptDraft) { _, new in commit() }
+                .accessibilityIdentifier("systemPromptField")
                 Text("Applies to new conversations on this server only.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
