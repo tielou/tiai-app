@@ -64,7 +64,18 @@ ios-release: app
 
 ## The gate. Everything that runs without Xcode, and therefore everything that
 ## runs on any machine, including the one you are on.
-check: build app-check test
+## Parses project.yml. The gate otherwise never looks at it — `swift test` builds
+## the kit, and a stale generated project keeps compiling — so a malformed spec
+## used to surface only at the export step of a TestFlight run. It is cheap to
+## catch here and expensive to catch there.
+project-check:
+	@if command -v xcodegen >/dev/null 2>&1; then \
+	  xcodegen --spec project.yml --quiet >/dev/null && echo "project.yml parses"; \
+	else \
+	  echo "skip: xcodegen not installed (CI runs it for real)"; \
+	fi
+
+check: build app-check test project-check
 
 ## Runs the contract probe. Needs a server:
 ##   TIAI_URL=https://chat.example.co TIAI_TOKEN=… make probe

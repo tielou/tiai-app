@@ -133,7 +133,7 @@ targets:
           # predicate, not a list of flags. Text or a link, one item, every
           # attachment matching; anything else would arrive and be dropped.
           NSExtensionAttributes:
-            NSExtensionActivationRule: "SUBQUERY(extensionItems, $item, SUBQUERY($item.attachments, $att, (ANY $att.registeredTypeIdentifiers UTI-CONFORMS-TO "public.plain-text" || ANY $att.registeredTypeIdentifiers UTI-CONFORMS-TO "public.url")).@count == $item.attachments.@count).@count == 1"
+            NSExtensionActivationRule: 'SUBQUERY(extensionItems, $item, SUBQUERY($item.attachments, $att, (ANY $att.registeredTypeIdentifiers UTI-CONFORMS-TO "public.plain-text" || ANY $att.registeredTypeIdentifiers UTI-CONFORMS-TO "public.url")).@count == $item.attachments.@count).@count == 1'
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: co.wobker.tiai.share
