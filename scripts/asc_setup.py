@@ -75,10 +75,6 @@ def fail(status, payload):
 
 
 def existing_bundle_ids():
-    # /v1/user is the cheapest way to learn whether the token itself is accepted.
-    probe = call("GET", "/v1/users?limit=1")
-    print(f"token probe: HTTP {probe[0]} {json.dumps(probe[1])[:200]}")
-    print(f"key id length {len(os.environ['ASC_KEY_ID'])} (stripped {len(key := os.environ['ASC_KEY_ID'].strip())})")
     status, data = call("GET", "/v1/bundleIds?limit=200")
     if status != 200:
         fail(status, data)
