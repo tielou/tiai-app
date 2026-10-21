@@ -11,13 +11,13 @@ name: tiAi Register Extensions
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
-  secrets: write
-
 jobs:
   register:
     runs-on: macos-14
+    # `secrets` is only accepted at job scope, not workflow scope.
+    permissions:
+      contents: read
+      secrets: write
     env:
       ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
       ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
