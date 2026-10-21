@@ -36,6 +36,7 @@ targets:
         # "multiple commands produce Info.plist".
         excludes:
           - "Activities/**"
+          - "Share/**"
     info:
       path: App/Info.plist
       properties:
@@ -62,11 +63,20 @@ targets:
           if you turn it on.
         NSSpeechRecognitionUsageDescription:
           Dictation for the composer is transcribed on this device.
+        NSSupportsLiveActivities: true
+        # The one way back into the app from outside: tapping the Live Activity,
+        # and the share extension handing over a composed prompt.
+        CFBundleURLTypes:
+          - CFBundleURLName: co.wobker.tiai
+            CFBundleURLSchemes:
+              - tiai
+            CFBundleTypeRole: Editor
     dependencies:
       - package: TiAiKit
       # The Live Activity lives in its own process, so it has to travel with the
       # app; XcodeGen wires the embed phase from this.
       - target: TiAiActivities
+      - target: TiAiShare
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: co.wobker.tiai
@@ -97,6 +107,33 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: co.wobker.tiai.activities
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+
+  # The share sheet: hand tiAi a link or some text from Safari, Notes, anywhere.
+  # Text and URLs only, so it needs no shared container and no extra capability.
+  TiAiShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - App/Share
+    info:
+      path: App/Share/Info.plist
+      properties:
+        CFBundleDisplayName: Ask tiAi
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).ShareViewController"
+          NSExtensionActivationRule:
+            NSSupportsActivityTextType: true
+            NSSupportsActivityWebURL: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: co.wobker.tiai.share
         TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_STYLE: Automatic
         MARKETING_VERSION: "0.1"

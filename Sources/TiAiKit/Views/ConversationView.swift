@@ -146,7 +146,8 @@ public struct ConversationView: View {
 
     public init(
         session: SessionStore, chatID: String?, title: String = "New Chat",
-        models: [ChatModel] = [], onNewChat: (() -> Void)? = nil
+        models: [ChatModel] = [], onNewChat: (() -> Void)? = nil,
+        initialDraft: String = ""
     ) {
         self.session = session
         self.onNewChat = onNewChat
@@ -154,13 +155,17 @@ public struct ConversationView: View {
         player.setVoice(SettingsStore.shared.defaults.readAloudVoice)
         _speech = State(initialValue: player)
         self._models = State(initialValue: models)
-        _conversation = State(
-            initialValue: ConversationModel(
-                chatID: chatID,
-                title: title,
-                models: models,
-                client: session.client,
-                hub: session.eventHub()))
+        let model = ConversationModel(
+            chatID: chatID,
+            title: title,
+            models: models,
+            client: session.client,
+            hub: session.eventHub())
+        // Something shared from another app arrives as a composed prompt. It
+        // lands in the composer rather than being sent: "share to my assistant"
+        // is a request to be shown, not a licence to post.
+        model.draft = initialDraft
+        _conversation = State(initialValue: model)
     }
 
     public var body: some View {

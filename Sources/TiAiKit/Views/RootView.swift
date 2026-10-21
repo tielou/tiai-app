@@ -498,6 +498,8 @@ public struct ChatHomeView: View {
     @State private var refreshBadge = 0
     /// Live drag offset while closing the drawer by hand. Negative, in points.
     @State private var drag: CGFloat = 0
+    /// Text handed over by the share extension, waiting to become a draft.
+    @State private var shared: String? = nil
 
     private var host: String { session.client.server.baseURL.host ?? "local" }
 
@@ -556,19 +558,34 @@ public struct ChatHomeView: View {
                 NavigationStack {
                     ConversationView(
                         session: session, chatID: chatID, models: models,
-                        onNewChat: { startNewChat() })
-                        .id("\(chatID ?? "new")-\(draft)")
-                        // Tapping the Live Activity should land in the chat that is
-                        // generating, not wherever the app happens to reopen.
+                        onNewChat: { startNewChat() },
+                        initialDraft: shared ?? "")
+                        // The shared text is part of the identity so a second share
+                        // into a running app rebuilds the screen with the new text
+                        // instead of landing on a chat that already has a draft.
+                        .id("\(chatID ?? "new")-\(draft)-\(shared?.hashValue ?? 0)")
+                        // Two things can open the app from outside: tapping the Live
+                        // Activity (go to that chat) and the share extension (start
+                        // a chat with this text in the composer).
                         .onOpenURL { url in
-                            guard url.scheme == "tiai", url.host == "chat",
-                                  let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?
-                                      .queryItems?
-                                      .first(where: { $0.name == "id" })?.value,
-                                  !id.isEmpty
-                            else { return }
-                            chatID = id
-                            showingChats = false
+                            guard url.scheme == "tiai" else { return }
+                            let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                                .queryItems ?? []
+                            switch url.host {
+                            case "chat":
+                                guard let id = items.first(where: { $0.name == "id" })?.value,
+                                      !id.isEmpty else { return }
+                                chatID = id
+                                showingChats = false
+                            case "share":
+                                guard let text = items.first(where: { $0.name == "text" })?.value,
+                                      !text.isEmpty else { return }
+                                chatID = nil
+                                shared = text
+                                draft += 1
+                            default:
+                                break
+                            }
                         }
                         .toolbar {
                             ToolbarItem(placement: .navigation) {
