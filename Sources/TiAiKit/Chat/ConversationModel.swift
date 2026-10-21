@@ -417,10 +417,15 @@ public final class ConversationModel {
         // Out-of-process progress. A long answer outlives the app switcher, and
         // coming back to a transcript that has not moved is indistinguishable
         // from a hung one; a ribbon that says "Writing · local-deep" settles it.
-        GenerationActivity.shared.start(
-            chatTitle: title.isEmpty ? "New Chat" : title,
-            model: modelIDs.first ?? "",
-            chatID: chatID)
+        // `send` is synchronous — a button press should not wait on anything —
+        // so the ribbon is raised on the main actor rather than awaited here.
+        let ribbonTitle = title.isEmpty ? "New Chat" : title
+        let ribbonModel = modelIDs.first ?? ""
+        let ribbonChat = chatID
+        Task { @MainActor in
+            await GenerationActivity.shared.start(chatTitle: ribbonTitle,
+                                                 model: ribbonModel, chatID: ribbonChat)
+        }
         run = Task {
             // Taken *after* the wait, because until the upload answers there is
             // no file id to take.
@@ -834,7 +839,7 @@ public final class ConversationModel {
         // server reads as "unread". Marking read on open is not enough for a chat
         // the app both asked and answered — nobody else needs to be told about it.
         if let chat = chatID, outcome.failure == nil { hub.markChatRead(chat) }
-        GenerationActivity.shared.finish(
+        await GenerationActivity.shared.finish(
             outcome.failure == nil ? .finished : .stopped,
             characters: turns.first(where: { $0.id == assistantID })?.text.count ?? 0)
         if outcome.failure == nil {
@@ -952,7 +957,7 @@ public final class ConversationModel {
             if let delta = frame.delta { pending?.text += delta }
             if let thinking = frame.reasoningDelta { pending?.reasoning += thinking }
             if let pending {
-                GenerationActivity.shared.update(
+                await GenerationActivity.shared.update(
                     phase: pending.text.isEmpty ? .thinking : .writing,
                     characters: pending.text.count)
             }

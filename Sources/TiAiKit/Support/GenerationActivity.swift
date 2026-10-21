@@ -31,7 +31,7 @@ public struct GenerationActivityAttributes: Codable, Hashable {
     }
 
     public struct ContentState: Codable, Hashable {
-        public enum Phase: String, Codable, Hashable {
+        public enum Phase: String, Codable, Hashable, Sendable {
             case waiting = "Waiting"
             case thinking = "Thinking"
             case writing = "Writing"
@@ -55,6 +55,11 @@ public struct GenerationActivityAttributes: Codable, Hashable {
 #if canImport(ActivityKit) && os(iOS)
 extension GenerationActivityAttributes: ActivityAttributes {}
 
+/// Every field is a value type, so this is a real conformance rather than an
+/// unchecked one. Without it the state cannot cross into `Activity`'s async
+/// methods at all.
+extension GenerationActivityAttributes.ContentState: Sendable {}
+
 /// Starts, updates and ends the Live Activity for a run.
 ///
 /// Every method is safe to call when the feature is unavailable, unsupported or
@@ -72,23 +77,27 @@ public final class GenerationActivity {
 
     public static var isSupported: Bool { ActivityAuthorizationInfo().areActivitiesEnabled }
 
-    public func start(chatTitle: String, model: String, chatID: String? = nil) {
+    // Async rather than fire-and-forget. `Activity` is not `Sendable`, so the
+    // obvious `Task { activity.update(...) }` is a data race by the compiler's
+    // reckoning — and it is right, the object would be crossing isolation. Awaiting
+    // in place keeps it on the main actor, which is where it already lives.
+    public func start(chatTitle: String, model: String, chatID: String? = nil) async {
         guard GenerationActivity.isSupported, activity == nil else { return }
         startedAt = .now
+        lastPhase = .waiting
+        lastCharacters = 0
         let attributes = GenerationActivityAttributes(chatTitle: chatTitle, model: model,
                                                      chatID: chatID)
         let state = GenerationActivityAttributes.ContentState(
             phase: .waiting, characters: 0, startedAt: startedAt)
-        Task { [weak self] in
-            guard let self else { return }
-            self.activity = try? await Activity.request(
-                attributes: attributes,
-                content: .init(state: state, staleDate: .now + 300),
-                pushType: nil)
-        }
+        activity = try? await Activity.request(
+            attributes: attributes,
+            content: .init(state: state, staleDate: .now + 300),
+            pushType: nil)
     }
 
-    public func update(phase: GenerationActivityAttributes.ContentState.Phase, characters: Int) {
+    public func update(phase: GenerationActivityAttributes.ContentState.Phase,
+                       characters: Int) async {
         // Re-posting the same phase on every token would hammer the system and
         // buy nothing; the character count is what moves.
         guard let activity else { return }
@@ -98,27 +107,31 @@ public final class GenerationActivity {
         lastCharacters = characters
         let state = GenerationActivityAttributes.ContentState(
             phase: phase, characters: characters, startedAt: startedAt)
-        Task { try? await activity.update(.init(state: state, staleDate: .now + 300)) }
+        // `Activity` is not `Sendable` in the SDK — an Apple gap, not a real
+        // hazard here: the handle is only ever touched from the main actor, and
+        // the await is a call into ActivityKit, not a hand-off to another thread.
+        nonisolated(unsafe) let target = activity
+        try? await target.update(.init(state: state, staleDate: .now + 300))
     }
     private var lastCharacters = 0
 
     /// Ends it, and leaves it on screen briefly so a finished run is visible
     /// rather than vanished the instant it lands.
     public func finish(_ phase: GenerationActivityAttributes.ContentState.Phase,
-                       characters: Int) {
+                       characters: Int) async {
         guard let activity else { return }
         let state = GenerationActivityAttributes.ContentState(
             phase: phase, characters: characters, startedAt: startedAt)
-        Task {
-            await activity.end(using: state, dismissalPolicy: .after(.now + 15))
-        }
         self.activity = nil
+        nonisolated(unsafe) let target = activity
+        await target.end(using: state, dismissalPolicy: .after(.now + 15))
     }
 
-    public func cancelIfRunning() {
+    public func cancelIfRunning() async {
         guard let activity else { return }
-        Task { await activity.end(using: nil, dismissalPolicy: .immediate) }
         self.activity = nil
+        nonisolated(unsafe) let target = activity
+        await target.end(using: nil, dismissalPolicy: .immediate)
     }
 }
 
@@ -128,10 +141,11 @@ public final class GenerationActivity {
 public final class GenerationActivity {
     public static let shared = GenerationActivity()
     public static var isSupported: Bool { false }
-    public func start(chatTitle: String, model: String, chatID: String? = nil) {}
-    public func update(phase: GenerationActivityAttributes.ContentState.Phase, characters: Int) {}
+    public func start(chatTitle: String, model: String, chatID: String? = nil) async {}
+    public func update(phase: GenerationActivityAttributes.ContentState.Phase,
+                       characters: Int) async {}
     public func finish(_ phase: GenerationActivityAttributes.ContentState.Phase,
-                       characters: Int) {}
-    public func cancelIfRunning() {}
+                       characters: Int) async {}
+    public func cancelIfRunning() async {}
 }
 #endif
