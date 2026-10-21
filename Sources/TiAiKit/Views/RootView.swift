@@ -386,6 +386,12 @@ public struct ChatListView: View {
             // a chat started in the browser, one deleted elsewhere — and it is
             // already open on screen, so the refresh is invisible rather than a
             // spinner in front of an empty drawer.
+            //
+            // Nothing on `.background`. Clearing the parsed-answer cache here was
+            // tried and removed: the whole cache is a couple of megabytes, which is
+            // noise against the memory limit, and emptying it guarantees the first
+            // frame after resuming re-parses the entire transcript — the exact cost
+            // the cache exists to remove, moved to the most visible moment.
             guard phase == .active else { return }
             Task { await chats.refresh() }
         }

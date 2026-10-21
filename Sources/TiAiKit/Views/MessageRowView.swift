@@ -162,7 +162,7 @@ struct MessageRow: View {
                 // lost the thing the user is waiting for.
                 CallGroups(calls: turn.callsAfterText, questionIncoming: turn.questionIncoming,
                            onResolve: onResolve)
-                ForEach(lifted.links) { link in
+                ForEach(parsed.links) { link in
                     FileLinkCard(link: link, busy: fileBusy == link.id,
                                  failed: fileFailed == link.id)
                     { onOpenLink?(link) }
@@ -201,29 +201,22 @@ struct MessageRow: View {
     /// cannot open these links itself.
     var onOpenLink: ((FileLink) -> Void)? = nil
 
-    /// The answer with its file links lifted out, and the links themselves.
+    /// The parsed answer: links lifted out, prose runs, code/tables that need
+    /// their own scrollable space, and the fenced blocks for the copy menu.
     ///
-    /// Computed once: the row needs both halves, and extracting twice meant two
-    /// regex passes over the whole answer on every render — which during streaming
-    /// is every coalesced delta.
-    private var lifted: (links: [FileLink], text: String) {
-        FileLink.extract(TextSanitizer.clean(turn.text))
+    /// Memoised by source text. These used to be three separate computed
+    /// properties, each re-parsing the whole answer on every render, and the
+    /// transcript re-renders every row on every streaming delta — see
+    /// `AnswerRender`.
+    private var parsed: AnswerRender.Parsed {
+        AnswerRender.parse(turn.text, cacheable: !turn.streaming)
     }
 
-    private var renderedText: String { lifted.text }
+    private var renderedText: String { parsed.text }
 
-    /// The answer split for rendering: prose runs, and code/tables that need
-    /// their own scrollable space.
-    private var segments: [AnswerSegment] {
-        AnswerSegment.segments(Markdown.blocks(TextSanitizer.clean(renderedText)))
-    }
+    private var segments: [AnswerSegment] { parsed.segments }
 
-    /// The fenced blocks, in order, for the copy menu.
-    private var codeBlocks: [String] {
-        Markdown.blocks(TextSanitizer.clean(turn.text)).compactMap {
-            if case .code(_, let code) = $0 { return code } else { return nil }
-        }
-    }
+    private var codeBlocks: [String] { parsed.codeBlocks }
     /// Which sandbox file is downloading, and which failed. Owned by the screen,
     /// because the screen is the one doing the fetching.
     var fileBusy: String? = nil
@@ -327,6 +320,9 @@ struct MessageRow: View {
     }
 
     @ViewBuilder private var footer: some View {
+        // Bound once: `codeBlocks` is a dictionary lookup keyed by the whole
+        // answer, and reading it four times hashes the answer four times.
+        let blocks = codeBlocks
         if !turn.streaming, turn.isUser == false {
             HStack(spacing: 8) {
                 if let model = turn.model {
@@ -350,19 +346,7 @@ struct MessageRow: View {
                 // because reading a half-written sentence and then the rest of it
                 // is worse than waiting.
                 if turn.isAssistant && !turn.streaming && !turn.text.isEmpty {
-                    Button {
-                        if speech.isPlaying {
-                            speech.stop()
-                        } else {
-                            speech.read(turn.text)
-                        }
-                    } label: {
-                        Image(systemName: speech.isPlaying
-                            ? "stop.circle.fill" : "speaker.wave.2")
-                    }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(speech.isPlaying ? .primary : .tertiary)
-                    .accessibilityLabel(speech.isPlaying ? "Stop reading" : "Read aloud")
+                    ReadAloudButton(speech: speech, text: turn.text)
                 }
                 // Two flavours, because they are used for different things. Pasting
                 // an answer into Mail wants the sentence, not the `##` that was
@@ -375,11 +359,11 @@ struct MessageRow: View {
                     // a fenced block in the middle of a long answer is a drag and
                     // two handles. One tap to take the whole block is what people
                     // actually want when they say "copy the code".
-                    if codeBlocks.count == 1 {
-                        Button("Copy code") { copy(codeBlocks[0]) }
-                    } else if !codeBlocks.isEmpty {
+                    if blocks.count == 1 {
+                        Button("Copy code") { copy(blocks[0]) }
+                    } else if !blocks.isEmpty {
                         Divider()
-                        ForEach(Array(codeBlocks.enumerated()), id: \.offset) { index, code in
+                        ForEach(Array(blocks.enumerated()), id: \.offset) { index, code in
                             Button("Copy code \(index + 1)") { copy(code) }
                         }
                     }
@@ -399,3 +383,52 @@ struct MessageRow: View {
 /// `Text(markdown:)` handles inline markdown only, and answers are mostly fenced
 /// blocks — so the split happens in `Markdown.blocks`, including the case that
 /// matters most here: a fence that has not been closed yet.
+
+/// The read-aloud control, kept apart because it observes the player.
+///
+/// `MessageRow` is `Equatable` so unchanged rows skip their body, which means the
+/// row must not read anything that moves on its own. This view subscribes to
+/// `SpeechPlayer` directly, so the icon still flips when playback starts or stops
+/// even when the row around it was skipped.
+private struct ReadAloudButton: View {
+    @ObservedObject var speech: SpeechPlayer
+    let text: String
+
+    var body: some View {
+        Button {
+            if speech.isPlaying {
+                speech.stop()
+            } else {
+                speech.read(text)
+            }
+        } label: {
+            Image(systemName: speech.isPlaying ? "stop.circle.fill" : "speaker.wave.2")
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(speech.isPlaying ? .primary : .tertiary)
+        .accessibilityLabel(speech.isPlaying ? "Stop reading" : "Read aloud")
+    }
+}
+
+/// Rows that have not changed do not need their body evaluated.
+///
+/// The transcript is a non-lazy stack, so one streaming delta re-renders every
+/// turn in the chat. Parsing is memoised now, but not parsing beats looking a
+/// parse up, and this is what keeps a very long chat cheap: only the row whose
+/// text actually changed runs `body`, so the cache's capacity stops mattering.
+///
+/// The closures are ignored on purpose. They are rebuilt on every parent render,
+/// so they can never compare equal, and each one closes over the model rather
+/// than over anything that moves independently of the values compared here — a
+/// skipped body cannot show a stale action. Anything observable is either a plain
+/// value compared below or lives in a child view that subscribes for itself.
+extension MessageRow: @MainActor Equatable {
+    static func == (lhs: MessageRow, rhs: MessageRow) -> Bool {
+        lhs.turn == rhs.turn
+            && lhs.rating == rhs.rating
+            && lhs.fileBusy == rhs.fileBusy
+            && lhs.fileFailed == rhs.fileFailed
+            && lhs.sibling?.index == rhs.sibling?.index
+            && lhs.sibling?.total == rhs.sibling?.total
+    }
+}

@@ -80,11 +80,21 @@ final class SystemPromptLiveTests: XCTestCase {
             let value = view.value as? String ?? ""
             return value.isEmpty ? view.label : value
         }
+        // Two identical reads is not "settled" on a busy box: a cold prefill can
+        // leave the first token sitting alone for longer than the poll interval,
+        // and the loop broke on "The". Three consecutive identical reads, and only
+        // once there is something to read.
         var last = ""
-        for _ in 0..<40 {
+        var stable = 0
+        for _ in 0..<60 {
             settle(2)
             let text = text(answers.element(boundBy: answers.count - 1))
-            if text == last, !text.isEmpty { break }
+            if text == last, !text.isEmpty {
+                stable += 1
+                if stable >= 3 { break }
+            } else {
+                stable = 0
+            }
             last = text
         }
         let answer = text(answers.element(boundBy: answers.count - 1))

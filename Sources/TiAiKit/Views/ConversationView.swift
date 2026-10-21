@@ -423,6 +423,7 @@ public struct ConversationView: View {
                             fileBusy: busyFile,
                             fileFailed: failedFile
                         )
+                            .equatable()
                             .id(turn.id)
                     }
                     // Reserves room so the last line is not hidden behind the
