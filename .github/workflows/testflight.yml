@@ -121,17 +121,17 @@ jobs:
             printf '%s' "$DISTR_PROFILE" | base64 --decode \
               > "$HOME/Library/MobileDevice/Provisioning Profiles/$DISTR_PROFILE_NAME.mobileprovision"
           fi
-          # The extensions' profiles travel as one JSON map of
-          # {bundle id: base64 profile}. A profile is bound to a single App ID,
-          # so there is one per target and no way around that.
+          # One JSON map, {bundle id: {"name": ..., "profile": base64}}. The name
+          # matters as much as the bytes: manual signing resolves a profile by the
+          # name it was given in the developer portal, not by its contents.
           if [ -n "${EXT_PROFILES:-}" ]; then
             python3 - "$HOME/Library/MobileDevice/Provisioning Profiles" <<'PY'
           import base64, json, os, pathlib, sys
           where = pathlib.Path(sys.argv[1])
-          for bundle, blob in json.loads(os.environ["EXT_PROFILES"]).items():
-              file = where / f"{bundle}.mobileprovision"
-              file.write_bytes(base64.b64decode(blob))
-              print("installed profile for", bundle)
+          for bundle, entry in json.loads(os.environ["EXT_PROFILES"]).items():
+              file = where / f"{entry['name']}.mobileprovision"
+              file.write_bytes(base64.b64decode(entry["profile"]))
+              print("installed", entry["name"], "for", bundle)
           PY
           fi
 
@@ -182,7 +182,8 @@ jobs:
           profiles = {"co.wobker.tiai": os.environ["DISTR_PROFILE_NAME"]}
           extra = os.environ.get("EXT_PROFILES") or ""
           if extra.strip():
-              profiles.update(json.loads(extra))
+              for bundle, entry in json.loads(extra).items():
+                  profiles[bundle] = entry["name"]
           else:
               print("::warning:: EXT_PROFILES is not set; extension targets will "
                     "not sign and the archive will fail if they are in the build")
@@ -241,11 +242,11 @@ jobs:
           if [ -n "${EXT_PROFILES:-}" ]; then
             python3 - <<'PY'
           import json, os, subprocess
-          for bundle, _ in json.loads(os.environ["EXT_PROFILES"]).items():
+          for bundle, entry in json.loads(os.environ["EXT_PROFILES"]).items():
               subprocess.run(["/usr/libexec/PlistBuddy", "-c",
-                              f"Add :provisioningProfiles:{bundle} string {bundle}",
+                              f"Add :provisioningProfiles:{bundle} string {entry['name']}",
                               "export-options.plist"], check=True)
-              print("export will use", bundle)
+              print("export will use", bundle, "with", entry["name"])
           PY
           fi
           plutil -p export-options.plist
