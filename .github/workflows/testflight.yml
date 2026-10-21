@@ -55,6 +55,9 @@ jobs:
       # below is the one that works.
       DISTR_PROFILE: ${{ secrets.DISTR_PROFILE }}
       DISTR_PROFILE_NAME: ${{ secrets.DISTR_PROFILE_NAME }}
+      # {bundle id: base64 profile} for the app extensions. One profile per App
+      # ID is not a choice — an App Store profile is bound to exactly one.
+      EXT_PROFILES: ${{ secrets.EXT_PROFILES }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
       ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
@@ -113,10 +116,23 @@ jobs:
             -k "$KEYCHAIN" -P "$DISTR_P12_PASSWORD" -T /usr/bin/codesign
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
           security find-identity -v -p codesigning "$KEYCHAIN"
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           if [ -n "${DISTR_PROFILE:-}" ]; then
-            mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
             printf '%s' "$DISTR_PROFILE" | base64 --decode \
               > "$HOME/Library/MobileDevice/Provisioning Profiles/$DISTR_PROFILE_NAME.mobileprovision"
+          fi
+          # The extensions' profiles travel as one JSON map of
+          # {bundle id: base64 profile}. A profile is bound to a single App ID,
+          # so there is one per target and no way around that.
+          if [ -n "${EXT_PROFILES:-}" ]; then
+            python3 - "$HOME/Library/MobileDevice/Provisioning Profiles" <<'PY'
+          import base64, json, os, pathlib, sys
+          where = pathlib.Path(sys.argv[1])
+          for bundle, blob in json.loads(os.environ["EXT_PROFILES"]).items():
+              file = where / f"{bundle}.mobileprovision"
+              file.write_bytes(base64.b64decode(blob))
+              print("installed profile for", bundle)
+          PY
           fi
 
       - name: Generate Xcode project
@@ -147,38 +163,91 @@ jobs:
       # signing blocks and both belong to the app, so patching those reaches the
       # app and nothing else. A named profile is also required: with Manual style
       # and no specifier Xcode refuses to invent one.
-      - name: Scope manual signing to the app target
+      # Each bundle id needs its own App Store profile: a profile is bound to
+      # exactly one App ID, and handing the app's profile to an extension fails
+      # with "has app ID co.wobker.tiai, which does not match the bundle ID
+      # co.wobker.tiai.activities". So the patch is per target, keyed on the
+      # PRODUCT_BUNDLE_IDENTIFIER inside each build configuration block rather
+      # than on a string that happens to appear once per target.
+      - name: Sign each target with its own profile
         if: env.DISTR_P12 != '' && env.DISTR_PROFILE != ''
         env:
           DISTR_PROFILE_NAME: ${{ secrets.DISTR_PROFILE_NAME }}
+          EXT_PROFILES: ${{ secrets.EXT_PROFILES }}
         run: |
           python3 - <<'PY'
-          import os
+          import json, os, re, sys
           path = "TiAi.xcodeproj/project.pbxproj"
-          name = os.environ["DISTR_PROFILE_NAME"]
           text = open(path).read()
-          patched = text.replace('CODE_SIGN_IDENTITY = "iPhone Developer";',
-                                 'CODE_SIGN_IDENTITY = "iPhone Distribution";')
-          patched = patched.replace('CODE_SIGN_STYLE = Automatic;',
-                                    'CODE_SIGN_STYLE = Manual;\n\t\t\t\t'
-                                    'PROVISIONING_PROFILE_SPECIFIER = "%s";' % name)
-          if patched == text:
-              raise SystemExit("no signing settings found to patch — the project "
-                               "layout changed and this step is now doing nothing")
-          open(path, "w").write(patched)
-          print("app target now signs manually with profile:", name)
+          profiles = {"co.wobker.tiai": os.environ["DISTR_PROFILE_NAME"]}
+          extra = os.environ.get("EXT_PROFILES") or ""
+          if extra.strip():
+              profiles.update(json.loads(extra))
+          else:
+              print("::warning:: EXT_PROFILES is not set; extension targets will "
+                    "not sign and the archive will fail if they are in the build")
+
+          patched_blocks = 0
+          def fix(block: str) -> str:
+              nonlocal patched_blocks
+              match = re.search(r"PRODUCT_BUNDLE_IDENTIFIER = ([^;]+);", block)
+              if not match:
+                  return block
+              bundle = match.group(1).strip().strip('"')
+              name = profiles.get(bundle)
+              if not name:
+                  return block
+              block = block.replace('CODE_SIGN_IDENTITY = "iPhone Developer";',
+                                    'CODE_SIGN_IDENTITY = "iPhone Distribution";')
+              if "CODE_SIGN_STYLE" in block:
+                  block = block.replace("CODE_SIGN_STYLE = Automatic;", "CODE_SIGN_STYLE = Manual;")
+              else:
+                  block = block.replace("PRODUCT_BUNDLE_IDENTIFIER",
+                                        "CODE_SIGN_STYLE = Manual;\n\t\t\t\tPRODUCT_BUNDLE_IDENTIFIER", 1)
+              if "PROVISIONING_PROFILE_SPECIFIER" in block:
+                  block = re.sub(r'PROVISIONING_PROFILE_SPECIFIER = "[^"]*";',
+                                 'PROVISIONING_PROFILE_SPECIFIER = "%s";' % name, block)
+              else:
+                  block = block.replace("PRODUCT_BUNDLE_IDENTIFIER",
+                                        'PROVISIONING_PROFILE_SPECIFIER = "%s";\n\t\t\t\tPRODUCT_BUNDLE_IDENTIFIER' % name, 1)
+              patched_blocks += 1
+              return block
+
+          # Build configuration blocks are the unit that carries signing, and
+          # each one names exactly one product bundle id.
+          parts = re.split(r"(?=/\*\* Begin XCBuildConfiguration section \*/)", text)
+          head, body = parts[0], parts[-1]
+          blocks = re.split(r"(?<=\};\n)(?=\t[A-Z0-9]+ /\* .* \*/ = \{\n\t\t\tisa = XCBuildConfiguration;)", body)
+          body = "".join(fix(b) for b in blocks)
+          text = head + body
+          if patched_blocks == 0:
+              sys.exit("no signing settings found to patch — the project layout "
+                       "changed and this step is now doing nothing")
+          open(path, "w").write(text)
+          print(f"signed {patched_blocks} build configurations:",
+                ", ".join(f"{k} -> {v}" for k, v in sorted(profiles.items())))
           PY
 
       # `xcodebuild -exportArchive` takes its distribution behaviour from this
       # plist alone, so the manual settings have to be stated there too.
       - name: Point the export at the distribution profile
         if: env.DISTR_P12 != '' && env.DISTR_PROFILE != ''
-        env:
-          DISTR_PROFILE_NAME: ${{ secrets.DISTR_PROFILE_NAME }}
         run: |
           /usr/libexec/PlistBuddy -c "Set :signingStyle manual" export-options.plist
           /usr/libexec/PlistBuddy -c "Add :provisioningProfiles dict" export-options.plist
           /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:co.wobker.tiai string $DISTR_PROFILE_NAME" export-options.plist
+          # Every extension has to be named here as well, or the export step
+          # re-signs the .appex with whatever it guesses.
+          if [ -n "${EXT_PROFILES:-}" ]; then
+            python3 - <<'PY'
+          import json, os, subprocess
+          for bundle, _ in json.loads(os.environ["EXT_PROFILES"]).items():
+              subprocess.run(["/usr/libexec/PlistBuddy", "-c",
+                              f"Add :provisioningProfiles:{bundle} string {bundle}",
+                              "export-options.plist"], check=True)
+              print("export will use", bundle)
+          PY
+          fi
           plutil -p export-options.plist
 
       - name: Archive
