@@ -169,65 +169,11 @@ jobs:
       # co.wobker.tiai.activities". So the patch is per target, keyed on the
       # PRODUCT_BUNDLE_IDENTIFIER inside each build configuration block rather
       # than on a string that happens to appear once per target.
+      # Each bundle id needs its own App Store profile, and the patch has to be
+      # per target: a profile is bound to exactly one App ID.
       - name: Sign each target with its own profile
         if: env.DISTR_P12 != '' && env.DISTR_PROFILE != ''
-        env:
-          DISTR_PROFILE_NAME: ${{ secrets.DISTR_PROFILE_NAME }}
-          EXT_PROFILES: ${{ secrets.EXT_PROFILES }}
-        run: |
-          python3 - <<'PY'
-          import json, os, re, sys
-          path = "TiAi.xcodeproj/project.pbxproj"
-          text = open(path).read()
-          profiles = {"co.wobker.tiai": os.environ["DISTR_PROFILE_NAME"]}
-          extra = os.environ.get("EXT_PROFILES") or ""
-          if extra.strip():
-              for bundle, entry in json.loads(extra).items():
-                  profiles[bundle] = entry["name"]
-          else:
-              print("::warning:: EXT_PROFILES is not set; extension targets will "
-                    "not sign and the archive will fail if they are in the build")
-
-          patched_blocks = 0
-          def fix(block: str) -> str:
-              nonlocal patched_blocks
-              match = re.search(r"PRODUCT_BUNDLE_IDENTIFIER = ([^;]+);", block)
-              if not match:
-                  return block
-              bundle = match.group(1).strip().strip('"')
-              name = profiles.get(bundle)
-              if not name:
-                  return block
-              block = block.replace('CODE_SIGN_IDENTITY = "iPhone Developer";',
-                                    'CODE_SIGN_IDENTITY = "iPhone Distribution";')
-              if "CODE_SIGN_STYLE" in block:
-                  block = block.replace("CODE_SIGN_STYLE = Automatic;", "CODE_SIGN_STYLE = Manual;")
-              else:
-                  block = block.replace("PRODUCT_BUNDLE_IDENTIFIER",
-                                        "CODE_SIGN_STYLE = Manual;\n\t\t\t\tPRODUCT_BUNDLE_IDENTIFIER", 1)
-              if "PROVISIONING_PROFILE_SPECIFIER" in block:
-                  block = re.sub(r'PROVISIONING_PROFILE_SPECIFIER = "[^"]*";',
-                                 'PROVISIONING_PROFILE_SPECIFIER = "%s";' % name, block)
-              else:
-                  block = block.replace("PRODUCT_BUNDLE_IDENTIFIER",
-                                        'PROVISIONING_PROFILE_SPECIFIER = "%s";\n\t\t\t\tPRODUCT_BUNDLE_IDENTIFIER' % name, 1)
-              patched_blocks += 1
-              return block
-
-          # Build configuration blocks are the unit that carries signing, and
-          # each one names exactly one product bundle id.
-          parts = re.split(r"(?=/\*\* Begin XCBuildConfiguration section \*/)", text)
-          head, body = parts[0], parts[-1]
-          blocks = re.split(r"(?<=\};\n)(?=\t[A-Z0-9]+ /\* .* \*/ = \{\n\t\t\tisa = XCBuildConfiguration;)", body)
-          body = "".join(fix(b) for b in blocks)
-          text = head + body
-          if patched_blocks == 0:
-              sys.exit("no signing settings found to patch — the project layout "
-                       "changed and this step is now doing nothing")
-          open(path, "w").write(text)
-          print(f"signed {patched_blocks} build configurations:",
-                ", ".join(f"{k} -> {v}" for k, v in sorted(profiles.items())))
-          PY
+        run: python3 scripts/sign_targets.py
 
       # `xcodebuild -exportArchive` takes its distribution behaviour from this
       # plist alone, so the manual settings have to be stated there too.
