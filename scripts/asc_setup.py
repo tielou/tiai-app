@@ -33,8 +33,17 @@ def _b64(data: bytes) -> str:
 def token() -> str:
     key_id = os.environ["ASC_KEY_ID"]
     issuer = os.environ["ASC_ISSUER_ID"]
-    pem = base64.b64decode(os.environ["ASC_API_KEY"])
+    raw = os.environ["ASC_API_KEY"]
+    pem = base64.b64decode(raw)
+    # Diagnostics that leak nothing: shape and key class only. The failure this
+    # guards against is a secret stored as the PEM itself rather than base64 of
+    # it, which decodes into bytes that still parse as *a* key but not the right
+    # kind, and then fails as "unsupported signature algorithm" far from here.
+    print(f"ASC_API_KEY: {len(raw)} chars, decoded {len(pem)} bytes, "
+          f"starts {pem[:28]!r}")
     key = serialization.load_pem_private_key(pem, password=None)
+    print(f"loaded key: {type(key).__name__} "
+          f"curve={getattr(key, 'curve', None)}")
     now = int(time.time())
     header = _b64(json.dumps({"alg": "ES256", "kid": key_id, "typ": "JWT"}).encode())
     payload = _b64(json.dumps({"iss": issuer, "iat": now, "exp": now + 500}).encode())
