@@ -14,10 +14,12 @@ on:
 jobs:
   register:
     runs-on: macos-14
-    # `secrets` is only accepted at job scope, not workflow scope.
+    # The secrets endpoints fall under the `actions` scope in a permissions
+    # block; `secrets: write` is what the docs call it in the UI, but the parser
+    # rejects it as a key here.
     permissions:
       contents: read
-      secrets: write
+      actions: write
     env:
       ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
       ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
