@@ -134,7 +134,11 @@ public struct Turn: Identifiable, Equatable, Sendable {
     static func reconciling(_ calls: [ToolCall], done: Bool) -> [ToolCall] {
         guard done else { return calls }
         return calls.map { call in
-            guard call.isAwaitingUser else { return call }
+            // Every unsettled call, not just the ones waiting on a tap. A tool
+            // left `pending` in the live transcript kept drawing a working
+            // state after the run had ended, and the only cure was leaving the
+            // chat and coming back — where the refetched record had it right.
+            guard !call.isSettled else { return call }
             var settled = call
             settled.status = call.failureText == nil ? .completed : .failed
             return settled
