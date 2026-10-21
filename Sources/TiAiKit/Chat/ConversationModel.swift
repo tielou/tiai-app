@@ -868,6 +868,13 @@ public final class ConversationModel {
             CompletionNotifier.answerReady(
                 title: title, preview: finished?.text ?? "")
         }
+        // Whatever the frame stream believed, the run is over. A turn left
+    // flagged as streaming keeps drawing the working indicator, and the only
+    // cure was leaving the chat and coming back — which is exactly what the user
+    // reported: still "working" long after the answer had landed.
+        if let index = turns.firstIndex(where: { $0.id == assistantID }) {
+            turns[index].streaming = false
+        }
         phase = .ready
     }
 
@@ -1373,6 +1380,12 @@ public final class ConversationModel {
         // if neither the answer nor the reasoning has moved in half a minute,
         // nothing is coming.
         var watch = RunWatch(stallLimit: reconcileStallLimit)
+        // How many ticks an open tool call has been allowed to buy. Without a
+        // cap a call that never settles in the record — the server moved on, the
+        // worker died, the status string means something we have not seen —
+        // holds the run "working" for the whole budget, which is five minutes of
+        // spinner on an answer that finished in nine seconds.
+        var toolGrace = 0
         for _ in 0..<reconcileBudget {
             guard let detail = try? await client.chat(id: chat) else {
                 // A failed read says nothing about the run, so it must not end
@@ -1399,7 +1412,8 @@ public final class ConversationModel {
             // fetching — and an empty answer at that point became "the server
             // sent nothing". An unsettled call is proof of life: keep waiting
             // and forget the stall clock.
-            if Turn(message).calls.contains(where: { !$0.isSettled }) {
+            if toolGrace < toolAliveTicks, Turn(message).calls.contains(where: { !$0.isSettled }) {
+                toolGrace += 1
                 watch = RunWatch(stallLimit: reconcileStallLimit)
                 try? await Task.sleep(for: reconcileInterval)
                 continue
@@ -1418,6 +1432,10 @@ public final class ConversationModel {
 
     /// Tuning for `reconcileUntilClosed`, split out so the stall behaviour is
     /// testable without a test that waits half a minute.
+    /// Two minutes of grace for an unsettled tool call: long enough for a slow
+    /// Notion fetch, short enough that a call which never settles does not leave
+    /// the chat pretending to work for five minutes.
+    var toolAliveTicks = 60
     var reconcileInterval: Duration = .seconds(2)
     var reconcileStallLimit = 15
     var reconcileBudget = 150

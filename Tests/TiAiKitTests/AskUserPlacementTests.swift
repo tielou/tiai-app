@@ -43,3 +43,22 @@ func toolCallBeforeTheAnswerStaysAbove() throws {
     #expect(turn.callsBeforeText.count == 1)
     #expect(turn.callsAfterText.isEmpty)
 }
+
+// Tool cards belong above the answer — they are the work that produced it. Only
+// `ask_user` is position-sensitive, because a question asked after an answer has
+// to sit under it or the user scrolls back to find what was asked.
+@Test func ordinaryToolCallsStayAboveTheAnswer() throws {
+    func call(_ id: String, _ name: String) throws -> ToolCall {
+        let text = "{\"type\":\"function_call\",\"call_id\":\"\(id)\",\"name\":\"\(name)\",\"arguments\":\"{}\"}"
+        return try #require(ToolCall(JSONDecoder().decode(JSONValue.self, from: Data(text.utf8))))
+    }
+    var turn = Turn(id: "m1", role: "assistant")
+    turn.calls = try [call("c1", "sonos"), call("c2", "ask_user")].map {
+        var c = $0; c.afterText = true; return c
+    }
+    #expect(turn.calls.first { $0.id == "c2" }?.isAskUser == true)
+    #expect(turn.callsBeforeText.map(\.id) == ["c1"],
+            "a tool that ran after the text still belongs at the top")
+    #expect(turn.callsAfterText.map(\.id) == ["c2"],
+            "only the question stays where it was asked")
+}

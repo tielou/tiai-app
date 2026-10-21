@@ -113,8 +113,12 @@ public struct Turn: Identifiable, Equatable, Sendable {
     /// asked once the answer was written belongs below, next to the reply it
     /// follows — otherwise a long answer pushes the question off the top of the
     /// screen and the app looks like it dropped it.
-    public var callsBeforeText: [ToolCall] { calls.filter { !$0.afterText } }
-    public var callsAfterText: [ToolCall] { calls.filter(\.afterText) }
+    /// Ordinary tool calls always go above the answer: they are the work that
+    /// produced it, and reading the result before the tool card is the wrong way
+    /// round. `ask_user` is the exception — a question asked after an answer has
+    /// to sit under it, or the user is scrolling back to find what was asked.
+    public var callsBeforeText: [ToolCall] { calls.filter { !$0.afterText || !$0.isAskUser } }
+    public var callsAfterText: [ToolCall] { calls.filter { $0.afterText && $0.isAskUser } }
 
     /// A finished message is not waiting on anyone.
     ///
