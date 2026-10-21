@@ -16,6 +16,7 @@ profile cannot simply grow to cover the extensions — each needs its own.
 """
 import base64, json, os, pathlib, sys, time, urllib.error, urllib.request
 from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
 BASE = "https://api.appstoreconnect.apple.com"
@@ -33,22 +34,13 @@ def _b64(data: bytes) -> str:
 def token() -> str:
     key_id = os.environ["ASC_KEY_ID"]
     issuer = os.environ["ASC_ISSUER_ID"]
-    raw = os.environ["ASC_API_KEY"]
-    pem = base64.b64decode(raw)
-    # Diagnostics that leak nothing: shape and key class only. The failure this
-    # guards against is a secret stored as the PEM itself rather than base64 of
-    # it, which decodes into bytes that still parse as *a* key but not the right
-    # kind, and then fails as "unsupported signature algorithm" far from here.
-    print(f"ASC_API_KEY: {len(raw)} chars, decoded {len(pem)} bytes, "
-          f"starts {pem[:28]!r}")
+    pem = base64.b64decode(os.environ["ASC_API_KEY"])
     key = serialization.load_pem_private_key(pem, password=None)
-    print(f"loaded key: {type(key).__name__} "
-          f"curve={getattr(key, 'curve', None)}")
     now = int(time.time())
     header = _b64(json.dumps({"alg": "ES256", "kid": key_id, "typ": "JWT"}).encode())
     payload = _b64(json.dumps({"iss": issuer, "iat": now, "exp": now + 500}).encode())
     unsigned = f"{header}.{payload}"
-    der = key.sign(unsigned.encode(), hashes.SHA256())
+    der = key.sign(unsigned.encode(), ec.ECDSA(hashes.SHA256()))
     r, s = decode_dss_signature(der)
     sig = _b64(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
     return f"{unsigned}.{sig}"
