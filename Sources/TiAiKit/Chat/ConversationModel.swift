@@ -800,11 +800,17 @@ public final class ConversationModel {
                 // server closes the message, parks on a question, or the answer
                 // genuinely stops growing.
                 await reconcileUntilClosed(messageID: assistantID)
-                if turns.first(where: { $0.id == assistantID })?.text.isEmpty ?? true {
-                    // The server's own reason beats our guess. "The server sent
-                    // nothing" is true but useless next to "Empty reply from
-                    // server", which names the thing that actually broke.
-                    outcome.failure = outcome.reportedError ?? "The server sent nothing."
+                let settled = turns.first(where: { $0.id == assistantID })?.text ?? ""
+                if settled.isEmpty {
+                    // "The server sent nothing" is an accusation, and it was
+                    // being made about the wrong party. iOS kills the socket on
+                    // a background sojourn; if the server record still says the
+                    // message is unfinished, the answer is on its way and the
+                    // thing that failed was our connection. Saying so is the
+                    // difference between a bug report and a dead end.
+                    outcome.failure = Self.emptyAnswerFailure(
+                        reported: outcome.reportedError,
+                        serverStillWriting: detail?.messages[assistantID].map { !$0.done } ?? false)
                 } else {
                     leafID = assistantID
                 }
@@ -1346,6 +1352,19 @@ public final class ConversationModel {
     /// Two seconds is slow enough to be invisible and fast enough that a
     /// continuation lands before the user has looked away. Five minutes is
     /// longer than any run seen here.
+    /// What to say when a run ends with no answer.
+    ///
+    /// Three different situations used to produce one message, and one of them
+    /// was a false accusation: iOS kills the socket on a background sojourn, so
+    /// an unfinished message on the server means the answer is still coming and
+    /// the thing that failed was our connection, not the model.
+    nonisolated static func emptyAnswerFailure(reported: String?, serverStillWriting: Bool) -> String {
+        if let reported { return reported }
+        return serverStillWriting
+            ? "Still working — the connection dropped. Keep this chat open, or pull to refresh."
+            : "The server sent nothing."
+    }
+
     private func reconcileUntilClosed(messageID: String) async {
         guard let chat = chatID else { return }
         // A chat abandoned server-side — browser closed mid-run, worker died —
@@ -1374,6 +1393,16 @@ public final class ConversationModel {
                     turns[$0].streaming = false
                 }
                 return
+            }
+            // A tool that is running produces no text and no new output items,
+            // so the size-based stall below would fire while Sonos was still
+            // fetching — and an empty answer at that point became "the server
+            // sent nothing". An unsettled call is proof of life: keep waiting
+            // and forget the stall clock.
+            if Turn(message).calls.contains(where: { !$0.isSettled }) {
+                watch = RunWatch(stallLimit: reconcileStallLimit)
+                try? await Task.sleep(for: reconcileInterval)
+                continue
             }
             if watch.observe(size: message.content.text.count + message.output.count) {
                 // Nothing has moved in half a minute. Leave the answer on screen

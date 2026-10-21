@@ -66,7 +66,13 @@ public final class ChatEventHub {
     }
 
     /// How long the socket may be down before runs stop waiting for it.
-    static let reconnectGrace: Duration = .seconds(4)
+    ///
+    /// Four seconds was too impatient: a phone resuming from background has to
+    /// bring the radio back and redo the websocket handshake, and expiring the
+    /// run at 4s meant a stream was declared dead about five seconds before the
+    /// socket that would have fed it arrived. Still far short of the 60s silence
+    /// watchdog, so a genuinely dead run does not hang.
+    static let reconnectGrace: Duration = .seconds(10)
 
     /// Ends every listener. A run whose stream ends this way has seen no terminal
     /// frame, so its caller reconciles against the server instead of hanging.

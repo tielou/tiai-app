@@ -1734,3 +1734,19 @@ enum AskUserFixture {
     #expect(!model.supports(.codeInterpreter))
     #expect(ConversationModel.seedFeatures(for: model)[ChatFeature.codeInterpreter.rawValue] == nil)
 }
+
+// An empty answer used to get one message whatever happened, and the commonest
+// cause — iOS killing the socket during a background sojourn while the server
+// carries on writing — was reported as the server having failed.
+@Test func anUnfinishedMessageIsNotBlamedOnTheServer() {
+    #expect(ConversationModel.emptyAnswerFailure(reported: nil, serverStillWriting: true)
+        .contains("connection dropped"),
+        "our dead socket must not be reported as the server sending nothing")
+    #expect(ConversationModel.emptyAnswerFailure(reported: nil, serverStillWriting: false)
+        == "The server sent nothing.",
+        "a message the server itself closed empty really is the server's fault")
+    #expect(ConversationModel.emptyAnswerFailure(reported: "Empty reply from server",
+                                                 serverStillWriting: true)
+        == "Empty reply from server",
+        "the server's own reason always wins over our guess")
+}
