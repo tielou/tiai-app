@@ -410,6 +410,15 @@ public final class ConversationModel {
     /// user has already pressed go.
     public func attach(data: Data, name: String, mimeType: String) {
         guard !name.isEmpty else { return }
+        // A camera or photoPicker callback can land while a run is in flight —
+        // the picker was opened before the send, the answer arrived in the
+        // meantime. Attaching into a busy chat used to sweep the late pick into
+        // whatever message sent next, which is a picture filed under the wrong
+        // question. Refuse it where it lands, and say so.
+        guard !phase.isBusy else {
+            error = "Wait for the current answer to finish before adding attachments."
+            return
+        }
         uploading = true
         error = nil
         uploadsInFlight += 1
@@ -430,6 +439,7 @@ public final class ConversationModel {
                 attachments.append(
                     PendingAttachment(id: file.id, name: file.filename, mimeType: mimeType, data: data))
             } catch {
+                uploadFailureCount += 1
                 self.error = "Could not attach \(name): \(error.localizedDescription)"
             }
         })
@@ -447,6 +457,16 @@ public final class ConversationModel {
     private var uploadsInFlight = 0
     /// Of those, the ones that are images — all the image budget counts.
     private var uploadsInFlightImages = 0
+    /// Uploads that have failed, ever. A failed upload never lands in
+    /// `attachments` — the chip simply never appears — so without a counter a
+    /// later send would quietly ship the reduced set: the multi-photo partial
+    /// of the misrouted-pictures bug. `send` aborts when this has moved.
+    private var uploadFailureCount = 0
+    /// The failure count as of the last send that got cleanly past its upload
+    /// wait. Sticky across sends on purpose: a failure that happened *before*
+    /// the send press must still abort that send, so the baseline is taken
+    /// after `waitForUploads()` inside the run, never at the button press.
+    private var uploadFailuresAtLastSend = 0
 
     private func waitForUploads() async {
         guard !pendingUploads.isEmpty else { return }
@@ -515,6 +535,18 @@ public final class ConversationModel {
             error = refusal
             return
         }
+        // A model that has *said* — capabilities present and `vision: false` —
+        // that it cannot see images must not be handed a picture to drop.
+        // `modelSupportsVision` fails open on unknown, so this is the only
+        // blind case left, and it gets refused out loud rather than silently
+        // stripped. Same outgoing set the cap guard counts: landed attachments
+        // plus images still on the wire. Placed after the cap check so a
+        // both-broken send reports the cap, which is the harder fact.
+        if !modelSupportsVision,
+           attachments.contains(where: \.isImage) || uploadsInFlightImages > 0 {
+            error = "\(model) can't see images — remove the picture or pick a vision model."
+            return
+        }
         draft = ""
         error = nil
         // Set here rather than inside the task: the button's feedback should not
@@ -529,7 +561,11 @@ public final class ConversationModel {
         let ribbonTitle = title.isEmpty ? "New Chat" : title
         let ribbonModel = modelIDs.first ?? ""
         let ribbonChat = chatID
-        Task { @MainActor in
+        // Captured, not discarded: the abort path below has to await the raise
+        // before it can close the ribbon, or the finish runs while `start` is
+        // still queued behind this task and no-ops on a nil activity —
+        // leaving an orphaned "Waiting" ribbon when the start finally runs.
+        let ribbon = Task { @MainActor in
             await GenerationActivity.shared.start(chatTitle: ribbonTitle,
                                                  model: ribbonModel, chatID: ribbonChat)
         }
@@ -537,6 +573,38 @@ public final class ConversationModel {
             // Taken *after* the wait, because until the upload answers there is
             // no file id to take.
             await self.waitForUploads()
+            // A failed upload is invisible in `attachments` — the chip never
+            // appeared — so a send that simply carried on would ship a silently
+            // reduced set. The checkpoint is compared here, after the wait, and
+            // not at the button press: a failure that happened *before* the
+            // press must still abort this send, and a failure whose upload is
+            // still on the wire is counted by the wait above. On abort the
+            // checkpoint is re-synced rather than left behind, or one old
+            // failure would block every later send forever; the landed
+            // attachments stay put so a retry is one more press away — with
+            // the failed file now the user's decision, not the app's.
+            let sawNewFailure = uploadFailureCount > uploadFailuresAtLastSend
+            uploadFailuresAtLastSend = uploadFailureCount
+            if sawNewFailure {
+                phase = .ready
+                // Restore only if the draft is still empty: a message typed
+                // during a long `waitForUploads` must not be clobbered by the
+                // text of the send that just aborted.
+                if draft.isEmpty { draft = text }
+                // With no attachment on hand the "remove the failed one" fix
+                // makes no sense — the failure is stale, from before the
+                // press. Name the actual choice.
+                error = attachments.isEmpty
+                    ? "A previous upload failed — press send again to send without it, or re-attach the file."
+                    : "Upload failed — message not sent. Remove the failed attachment and send again."
+                // The sticky-failure path never suspends in `waitForUploads`,
+                // so the ribbon raise may still be sitting in the main-actor
+                // queue. Await it first, then close the ribbon directly —
+                // this task already runs on the main actor.
+                await ribbon.value
+                await GenerationActivity.shared.finish(.stopped, characters: 0)
+                return
+            }
             let files = self.attachments
             self.attachments = []
             await self.exchange(text: text, regenerating: nil, files: files)
@@ -719,8 +787,23 @@ public final class ConversationModel {
     }
 
     /// Whether the current model can be shown a picture at all.
+    ///
+    /// Fails open on unknown, deliberately: the model list may not be loaded
+    /// yet, and the selected id can come from the server's own report of the
+    /// chat (`apply` sets `model` from `detail.models.first`), so "not in the
+    /// list" is common and means *no metadata*, not blindness — the same
+    /// idiom as `ChatModel.supports(_ feature:)`, where an empty capability
+    /// map is "the server didn't say", not "it can't". The old `?? false`
+    /// conflated the two and silently dropped every image block from the
+    /// *persisted* message: the photo rendered locally, the server stored a
+    /// text-only turn, and the rebuilt history fell back to an older picture.
+    /// A wrong yes costs a visible server-side complaint; a wrong no loses a
+    /// photo with no error anywhere. So only an explicit `vision: false` is an
+    /// honest no — a map that merely lacks the key, empty or not, is unknown
+    /// and gets the benefit of the doubt. `send` refuses the explicit-false
+    /// case out loud instead of stripping the picture quietly.
     private var modelSupportsVision: Bool {
-        models.first { $0.id == model }?.supportsVision ?? false
+        models.first(where: { $0.id == model })?.capabilities["vision"] != false
     }
 
     /// The user message as the server needs it.

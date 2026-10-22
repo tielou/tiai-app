@@ -255,6 +255,30 @@ private func makeConversation(
     #expect(conversation.draft == "all of these")
 }
 
+@Test @MainActor func aBlindModelRefusesPhotosStillUploading() async throws {
+    // The blind guard counts the same outgoing set the cap guard counts: a
+    // photo still on the wire is an outgoing photo. The attach busy-guard is
+    // not in play here — uploads do not make the phase busy — so the send
+    // reaches the guard and the refusal is the blind one, not a cap hit.
+    let transport = HangingTransport(hangUploads: true)
+    let conversation = ConversationModel(
+        chatID: nil,
+        models: [ChatModel.stub("local-deep", caps: ["vision": false])],
+        client: OWUIClient(server: testServer(), transport: transport),
+        hub: ChatEventHub(server: testServer()))
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "p.png", mimeType: "image/png")
+    #expect(conversation.phase == .ready, "uploads in flight do not make the phase busy")
+    conversation.draft = "look at this"
+    conversation.send()
+    try await Task.sleep(for: .milliseconds(300))
+
+    let message = try #require(conversation.error)
+    #expect(message.contains("can't see images"), "\(message)")
+    #expect(transport.completionBodies.isEmpty, "a refused send must not post")
+    #expect(conversation.phase == .ready)
+    #expect(conversation.draft == "look at this", "nothing was consumed")
+}
+
 @Test @MainActor func aTextOnlySendInAnOverCapBranchIsRefusedToo() async throws {
     // No text-only bypass: the history alone exceeds the cap, because the
     // server rebuilds the engine's messages from the persisted tree — the

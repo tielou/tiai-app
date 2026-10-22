@@ -233,6 +233,9 @@ extension Dictionary where Key == String {
     var hasNullParent: Bool { keys.contains("parent_id") && self["parent_id"] is NSNull }
 }
 
+/// Thrown by `ScriptedTransport` when `failUploads` is set.
+struct UploadFailure: Error {}
+
 /// A transport that records the calls and answers well enough for a run to
 /// proceed: chat creation succeeds, the completion body stays open (as it does
 /// for real), and stop returns 200.
@@ -255,6 +258,14 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     private var _resolveBodies: [Data] = []
     private var _chatDetailOverride: Data?
     private var _chatDetailQueue: [Data] = []
+    private var _failUploads = false
+
+    /// When set, POST /files throws — the failed-upload path. Settable so a
+    /// test can let the first upload land and fail the second.
+    var failUploads: Bool {
+        get { guarded { _failUploads } }
+        set { guarded { _failUploads = newValue } }
+    }
 
     var paths: [String] { guarded { _paths } }
     var completionBodies: [Data] { guarded { _completionBodies } }
@@ -301,6 +312,7 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
             return (Data(#"{"status":true}"#.utf8), response(for: request, 200))
         }
         if path.hasSuffix("/files") || path.hasSuffix("/files/") {
+            if failUploads { throw UploadFailure() }
             guarded { _uploads.append(request.httpBody ?? Data()) }
             return (Data(#"{"id":"file-1","filename":"notes.txt","type":"text/plain","updated_at":1}"#.utf8),
                     response(for: request, 200))
@@ -468,25 +480,230 @@ extension ChatModel {
     // the model. A file URL would have to be resolved and re-authenticated
     // server-side, which is a second thing to get wrong.
     #expect(url.hasPrefix("data:image/jpeg;base64,"))
+}
 
-    // And a model without vision is not sent a picture it cannot read.
-    // A fresh transport: the assertion is about this request, not the last one.
-    let blindTransport = ScriptedTransport()
-    let blind = ConversationModel(
+// The explicit-blind half of the old picture test, split out with a new
+// contract: a model that has *said* it cannot see images (`vision: false` in a
+// non-empty capability map) used to get the picture silently stripped from the
+// persisted message. Silent loss is not an option — the send is refused out
+// loud and nothing is consumed.
+@Test @MainActor func aBlindModelIsRefusedThePictureItCannotSee() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
         chatID: "chat-1",
         models: [ChatModel.stub("local-deep", caps: ["vision": false])],
-        client: OWUIClient(server: server, transport: blindTransport),
+        client: OWUIClient(server: server, transport: transport),
         hub: ChatEventHub(server: server))
-    blind.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "shot.jpg", mimeType: "image/jpeg")
-    try await waitUntil { blind.attachments.count == 1 }
-    blind.draft = "and this?"
-    blind.send()
-    try await blindTransport.awaitCompletion()
-    let after = try #require(blindTransport.completionBody)
-    let blindJSON = try #require(JSONSerialization.jsonObject(with: after) as? [String: Any])
-    let blindMessages = try #require(blindJSON["messages"] as? [[String: Any]])
-    let blindUser = try #require(blindMessages.last { ($0["role"] as? String) == "user" })
-    #expect(blindUser["content"] as? String == "and this?")
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "shot.jpg", mimeType: "image/jpeg")
+    try await waitUntil { conversation.attachments.count == 1 }
+    conversation.draft = "and this?"
+    conversation.send()
+    // Give a wrongly-started run a chance to put anything on the wire.
+    try await Task.sleep(for: .milliseconds(300))
+
+    #expect(transport.completionBodies.isEmpty, "a refused send must not reach the server")
+    #expect(conversation.phase == .ready)
+    // Nothing was consumed: the user can pick a vision model and press send
+    // again with everything still in the composer.
+    #expect(conversation.draft == "and this?")
+    #expect(conversation.attachments.count == 1)
+    let message = try #require(conversation.error)
+    #expect(message.contains("can't see images"), "\(message)")
+}
+
+// The screenshot regression: a model with *no* capability metadata is not a
+// blind model. The old `?? false` treated "the server didn't say" as "it can't
+// see", dropped the image blocks from the persisted message, and the photo
+// vanished with no error anywhere. Empty capabilities means unknown — fail
+// open, same idiom as `ChatModel.supports(_ feature:)`.
+@Test @MainActor func aModelWithNoCapabilityMetadataStillGetsThePicture() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-quick", caps: [:])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: ChatEventHub(server: server))
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "shot.jpg", mimeType: "image/jpeg")
+    try await waitUntil { conversation.attachments.count == 1 }
+    conversation.draft = "what is in this?"
+    conversation.send()
+    try await transport.awaitCompletion()
+
+    let raw = try #require(transport.completionBody)
+    let json = try #require(JSONSerialization.jsonObject(with: raw) as? [String: Any])
+    let messages = try #require(json["messages"] as? [[String: Any]])
+    let user = try #require(messages.last { ($0["role"] as? String) == "user" })
+    let blocks = try #require(user["content"] as? [[String: Any]],
+                              "an unknown model gets the picture, not a text-only message")
+    #expect(blocks.contains { ($0["type"] as? String) == "image_url" })
+}
+
+// The selected model id can be absent from `models` entirely — the list may
+// not be loaded yet, or the id came from somewhere the picker never saw.
+// Unknown is not blind.
+@Test @MainActor func aModelTheAppHasNoMetadataForStillGetsThePicture() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1", models: [],
+        client: OWUIClient(server: server, transport: transport),
+        hub: ChatEventHub(server: server))
+    conversation.model = "mystery-model"
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "shot.jpg", mimeType: "image/jpeg")
+    try await waitUntil { conversation.attachments.count == 1 }
+    conversation.draft = "what is in this?"
+    conversation.send()
+    try await transport.awaitCompletion()
+
+    let raw = try #require(transport.completionBody)
+    let json = try #require(JSONSerialization.jsonObject(with: raw) as? [String: Any])
+    let messages = try #require(json["messages"] as? [[String: Any]])
+    let user = try #require(messages.last { ($0["role"] as? String) == "user" })
+    let blocks = try #require(user["content"] as? [[String: Any]])
+    #expect(blocks.contains { ($0["type"] as? String) == "image_url" })
+}
+
+// The id actually sent is often the one the server reported for the chat
+// (`apply` takes `detail.models.first`), which may name a model the app's
+// model list does not contain. That must not silently drop the picture either.
+@Test @MainActor func aServerReportedModelMissingFromTheListStillGetsThePicture() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let transport = ScriptedTransport()
+    transport.chatDetailOverride = Data(
+        """
+        {"id":"chat-vision-unknown","title":"T","updated_at":1,"created_at":1,
+         "chat":{"models":["some-unknown"],"history":{"currentId":null,"messages":{}}}}
+        """.utf8)
+    let conversation = ConversationModel(
+        chatID: "chat-vision-unknown",
+        models: [ChatModel.stub("local-personal", caps: ["vision": true])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: ChatEventHub(server: server))
+    await conversation.load()
+    // The server's answer won, and the app has no metadata for it.
+    #expect(conversation.model == "some-unknown")
+
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "shot.jpg", mimeType: "image/jpeg")
+    try await waitUntil { conversation.attachments.count == 1 }
+    conversation.draft = "what is in this?"
+    conversation.send()
+    try await transport.awaitCompletion()
+
+    let raw = try #require(transport.completionBody)
+    let json = try #require(JSONSerialization.jsonObject(with: raw) as? [String: Any])
+    let messages = try #require(json["messages"] as? [[String: Any]])
+    let user = try #require(messages.last { ($0["role"] as? String) == "user" })
+    let blocks = try #require(user["content"] as? [[String: Any]])
+    #expect(blocks.contains { ($0["type"] as? String) == "image_url" })
+}
+
+// A failed upload never lands in `attachments`, so a send that carried on
+// would ship a silently reduced set — the misrouted-pictures bug's second
+// path. The send has to abort, put the draft back, and say so.
+@Test @MainActor func aSendAbortsWhenAnUploadFailed() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: nil,
+        models: [ChatModel.stub("local-personal", caps: ["vision": true])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: ChatEventHub(server: server))
+    conversation.draft = "what is in this?"
+    transport.failUploads = true
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "shot.jpg", mimeType: "image/jpeg")
+    try await waitUntil { !conversation.uploading && conversation.error != nil }
+
+    conversation.send()
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(transport.completionBodies.isEmpty, "a send with a failed upload must not post")
+    #expect(conversation.phase == .ready)
+    #expect(conversation.draft == "what is in this?", "the draft comes back, not into the void")
+    // The failed photo never landed, so there is no chip to "remove" — the
+    // message has to name the actual choice: press again without it, or
+    // re-attach.
+    let message = try #require(conversation.error)
+    #expect(message.contains("previous upload failed"), "\(message)")
+    #expect(message.contains("press send again"), "\(message)")
+
+    // A second send proceeds: the abort cleared the checkpoint, so one old
+    // failure cannot block the chat forever. The user has been told once.
+    conversation.send()
+    try await transport.awaitCompletion()
+}
+
+// The multi-photo partial: one upload lands, one fails, and the message must
+// not go out with just the lucky photo.
+@Test @MainActor func oneFailedUploadAmongTwoPhotosAbortsTheWholeSend() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: nil,
+        models: [ChatModel.stub("local-personal", caps: ["vision": true])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: ChatEventHub(server: server))
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "a.jpg", mimeType: "image/jpeg")
+    try await waitUntil { conversation.attachments.count == 1 }
+    transport.failUploads = true
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "b.jpg", mimeType: "image/jpeg")
+    try await waitUntil { !conversation.uploading }
+
+    conversation.draft = "two photos"
+    conversation.send()
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(transport.completionBodies.isEmpty, "the landed photo must not go out alone")
+    #expect(conversation.phase == .ready)
+    #expect(conversation.attachments.count == 1, "the landed attachment is kept for a retry")
+    #expect(conversation.draft == "two photos")
+    // A chip *is* on screen here, so the fix names it — unlike the no-
+    // attachment abort, where there is nothing to remove.
+    let message = try #require(conversation.error)
+    #expect(message.contains("Remove the failed attachment"), "\(message)")
+}
+
+// A camera or fileImporter callback can land while a run is in flight; the
+// pick must not be swept into whatever message sends next.
+@Test @MainActor func attachIsRefusedWhileARunIsInFlight() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-personal", caps: ["vision": true])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: ChatEventHub(server: server))
+    conversation.draft = "go"
+    conversation.send()
+    try await transport.awaitCompletion()
+    // No terminal frame sent: the run is still open, the phase is busy.
+    #expect(conversation.phase.isBusy)
+
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "late.jpg", mimeType: "image/jpeg")
+    #expect(conversation.error?.contains("Wait for the current answer") == true,
+            "\(conversation.error ?? "nil")")
+    #expect(transport.uploads.isEmpty, "the pick never went to the server")
+    #expect(conversation.attachments.isEmpty)
+}
+
+// MARK: - userContent, directly
+
+// The static function keeps its contract (refusal happens at send); these pin
+// the block shapes, including the image-only message with no text.
+@Test @MainActor func anImageOnlyMessageIsBlocksToo() {
+    let shot = ConversationModel.PendingAttachment(
+        id: "f-1", name: "shot.jpg", mimeType: "image/jpeg", data: Data([0xFF, 0xD8, 0xFF]))
+    guard case .blocks(let blocks) = ConversationModel.userContent(text: "", files: [shot], vision: true)
+    else { Issue.record("empty text with an image is still a blocks message"); return }
+    #expect(blocks.count == 1, "no empty text block alongside the picture")
+    guard case .object(let block) = blocks.first else { Issue.record("expected an object block"); return }
+    #expect(block["type"] == .string("image_url"))
+}
+
+@Test @MainActor func userContentWithoutVisionKeepsOnlyTheText() {
+    let shot = ConversationModel.PendingAttachment(
+        id: "f-1", name: "shot.jpg", mimeType: "image/jpeg", data: Data([0xFF, 0xD8, 0xFF]))
+    let content = ConversationModel.userContent(text: "hi", files: [shot], vision: false)
+    #expect(content == .text("hi"))
 }
 
 @Test @MainActor func memoryIsOnByDefaultWhereTheModelHasIt() {
