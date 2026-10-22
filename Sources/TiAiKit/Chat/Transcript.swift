@@ -40,6 +40,14 @@ public struct Turn: Identifiable, Equatable, Sendable {
     /// Files the model produced in its terminal sandbox and offered with
     /// `display_file`. Fetched by path, not by file id — see `TerminalFile`.
     public var terminalFiles: [TerminalFile] = []
+    /// Every `image_url` target in the stored message body, whatever the scheme.
+    ///
+    /// `attachments` is built for the transcript and only ever shows `data:`
+    /// content images; the image budget has to count what the *engine* will
+    /// see, which includes `file_id://` and http(s) image blocks the file
+    /// chips never showed. Kept apart from `attachments` so nothing about the
+    /// UI's file chips changes.
+    public var contentImageURLs: [String] = []
     public var createdAt: Date
 
     public init(
@@ -103,6 +111,7 @@ public struct Turn: Identifiable, Equatable, Sendable {
         calls = Turn.reconciling(message.toolCalls, done: message.done)
         sources = message.citedSources
         attachments = message.messageAttachments
+        contentImageURLs = message.contentImageURLs
         terminalFiles = message.terminalFiles
         createdAt = message.timestamp ?? .now
     }

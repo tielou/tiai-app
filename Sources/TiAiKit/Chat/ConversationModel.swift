@@ -100,6 +100,76 @@ public final class ConversationModel {
     /// which is the difference between a smooth stream and a stuttering one.
     static let flushInterval: Duration = .milliseconds(60)
 
+    /// The most images one completion may carry.
+    ///
+    /// The inference engine hard-rejects anything above 64 images ("IMG count
+    /// outside 0..64", surfaced as a litellm 500), and the client cannot trim
+    /// the history the server rebuilds from the persisted chat tree — the
+    /// outgoing `messages` carry no historical images at all. So a send that
+    /// would cross the cap is refused with a clear error before anything is
+    /// touched. 50 rather than 64 leaves headroom for the count drift that
+    /// cannot be measured exactly: server-side additions and the
+    /// files-vs-content double-count below.
+    nonisolated static let maxImagesPerRequest = 50
+
+    /// The images the next completion would put in front of the engine: every
+    /// image already on the loaded branch, plus what the message being sent
+    /// adds.
+    ///
+    /// Per message, the content `image_url` blocks are counted one by one — two
+    /// identical photos in one message are two images to the engine, so they are
+    /// two images here too. The only dedup is a block that *is* one of the
+    /// message's own files: `file_id://X` is normalised to the file id `X`, and a
+    /// `data:` block a file chip was built from already carries that id, so each
+    /// file absorbs at most one matching block. A picture the app sent itself is
+    /// stored as a file *and* a `data:` block with unrelated identifiers, so it
+    /// counts twice: over-counting refuses a send early, under-counting
+    /// reproduces the engine's opaque 500, and only one of those is recoverable.
+    /// Counted regardless of whether the current model has vision — the cap is
+    /// about the stored conversation the server rebuilds, not this model's eyes.
+    nonisolated static func imageCount(in turns: [Turn], outgoing: [PendingAttachment]) -> Int {
+        func key(for url: String) -> String {
+            let prefix = "file_id://"
+            return url.hasPrefix(prefix) ? String(url.dropFirst(prefix.count)) : url
+        }
+        var total = 0
+        for turn in turns {
+            let imageFiles = turn.attachments.filter(\.isImage).map(\.id)
+            var files = Set(imageFiles)
+            var count = imageFiles.count
+            for url in turn.contentImageURLs {
+                // A block that is one of this message's files is that file and
+                // not an extra image — but it absorbs only one block, so a
+                // second identical block still counts.
+                if files.remove(key(for: url)) != nil { continue }
+                count += 1
+            }
+            total += count
+        }
+        return total + outgoing.filter(\.isImage).count
+    }
+
+    /// The refusal shown when the next request would cross
+    /// `maxImagesPerRequest`, nil when it fits.
+    ///
+    /// The wording carries the actual numbers and the only way out. There is no
+    /// "continue without the pictures" to offer: the server rebuilds the
+    /// engine's messages from the persisted tree, so a text-only send in an
+    /// over-cap branch is still over the cap on history alone.
+    ///
+    /// `uploadsInFlightImages` is part of the projection because a photo still
+    /// on the wire is an image the next request will carry: `attachments` only
+    /// gains its entry when the upload answers.
+    private func imageLimitMessage(outgoing: [PendingAttachment]) -> String? {
+        let inFlight = uploadsInFlightImages
+        let count = Self.imageCount(in: turns, outgoing: outgoing) + inFlight
+        guard count > Self.maxImagesPerRequest else { return nil }
+        let subject = outgoing.contains(where: \.isImage) || inFlight > 0
+            ? "This message would send \(count) images"
+            : "This chat already contains \(count) images"
+        return "\(subject) — the model can see at most \(Self.maxImagesPerRequest) per request. Start a new chat to keep using images."
+    }
+
     /// A chat that is never saved.
     ///
     /// Open WebUI's contract, read out of its own frontend bundle: a chat id of
@@ -191,7 +261,9 @@ public final class ConversationModel {
         // Uploading counts as content for the same reason send() waits for it:
         // the picture is coming, and greying the button out until it lands is
         // honest in a way that sending without it is not.
-        return (hasText || !attachments.isEmpty || uploading) && !phase.isBusy
+        // `.loading` too: until the branch is on screen the image budget can
+        // only see this message, so a send now could cross the cap unseen.
+        return (hasText || !attachments.isEmpty || uploading) && !phase.isBusy && phase != .loading
     }
 
     public func setModels(_ models: [ChatModel]) {
@@ -341,8 +413,15 @@ public final class ConversationModel {
         uploading = true
         error = nil
         uploadsInFlight += 1
+        // Counted as an image straight away, from the mime type the picker
+        // already handed over: `attachments` only gains its entry when the
+        // upload answers, so a batch of photos picked a second ago would be
+        // invisible to the image budget for the length of the upload.
+        let countsAsImage = mimeType.hasPrefix("image/")
+        if countsAsImage { uploadsInFlightImages += 1 }
         pendingUploads.append(Task {
             defer {
+                if countsAsImage { uploadsInFlightImages -= 1 }
                 uploadsInFlight -= 1
                 uploading = uploadsInFlight > 0
             }
@@ -366,6 +445,8 @@ public final class ConversationModel {
     /// "I sent a photo and the backend never got it".
     private var pendingUploads: [Task<Void, Never>] = []
     private var uploadsInFlight = 0
+    /// Of those, the ones that are images — all the image budget counts.
+    private var uploadsInFlightImages = 0
 
     private func waitForUploads() async {
         guard !pendingUploads.isEmpty else { return }
@@ -418,7 +499,22 @@ public final class ConversationModel {
         // `uploading` counts as content. A picture that is still on the wire is
         // not an absent picture, and refusing to send until it lands is better
         // than sending a message that quietly lost it.
-        guard !(text.isEmpty && attachments.isEmpty && !uploading), !phase.isBusy else { return }
+        // `.loading` is not `.isBusy`, and on an uncached chat the branch is not
+        // on screen yet: counting over an empty `turns` would see only this
+        // message and let a certain 500 through. The composer is disabled for
+        // the same reason (`canSend`); this is the same gate for every other
+        // caller. Silent, because there is nothing wrong to report — the chat is
+        // simply not ready yet.
+        guard !(text.isEmpty && attachments.isEmpty && !uploading), !phase.isBusy, phase != .loading
+        else { return }
+        // Refused before anything is touched: the draft and the attachments are
+        // still in the composer because nothing has been consumed, and the
+        // phase never left `.ready`. Deliberately here rather than in
+        // `exchange`, which runs after the draft is cleared.
+        if let refusal = imageLimitMessage(outgoing: attachments) {
+            error = refusal
+            return
+        }
         draft = ""
         error = nil
         // Set here rather than inside the task: the button's feedback should not
@@ -464,8 +560,17 @@ public final class ConversationModel {
     /// survives, which is the whole point of editing rather than deleting.
     public func edit(messageID: String, text: String) {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty, !phase.isBusy, let index = turns.firstIndex(where: { $0.id == messageID })
+        guard !clean.isEmpty, !phase.isBusy, phase != .loading,
+            let index = turns.firstIndex(where: { $0.id == messageID })
         else { return }
+        // The same gate as send and regenerate, before the server update and
+        // before any local mutation: a refused edit must leave everything as it
+        // was. The tail about to be removed is counted too — over-counting is
+        // the safe direction.
+        if let refusal = imageLimitMessage(outgoing: []) {
+            error = refusal
+            return
+        }
         error = nil
         turns[index].text = clean
         // Everything after the edited message belongs to the branch being
@@ -538,7 +643,16 @@ public final class ConversationModel {
     /// turn — which is what makes the web UI's "2/3" possible, and costs nothing
     /// here because the app already knows the id.
     public func regenerate() {
-        guard !phase.isBusy, let index = turns.lastIndex(where: \.isUser) else { return }
+        guard !phase.isBusy, phase != .loading, let index = turns.lastIndex(where: \.isUser) else { return }
+        // Counted over the whole branch, tail included — the tail is about to
+        // be truncated and would not really be re-sent, so this over-counts,
+        // which is the safe direction. Checking after the truncation would let
+        // a refused regenerate destroy the very answer it was only meant to
+        // re-run.
+        if let refusal = imageLimitMessage(outgoing: []) {
+            error = refusal
+            return
+        }
         let last = turns[index]
         error = nil
         turns.removeSubrange(turns.index(after: index)..<turns.endIndex)
@@ -1130,6 +1244,12 @@ public final class ConversationModel {
         }
         if model.turns[at].attachments.isEmpty, !stored.messageAttachments.isEmpty {
             model.turns[at].attachments = stored.messageAttachments
+        }
+        // The Turn invariant: `contentImageURLs` mirrors the stored message's
+        // image blocks (the image budget counts it). A stored message that
+        // knows its image blocks has to leave them on the turn on screen.
+        if !stored.contentImageURLs.isEmpty {
+            model.turns[at].contentImageURLs = stored.contentImageURLs
         }
         // If the stored answer is longer than what arrived, the run outlived the
         // stream. Adopt the stored text rather than leaving half an answer up.
