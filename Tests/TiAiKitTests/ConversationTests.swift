@@ -141,6 +141,105 @@ private typealias Frame = ChatEventSocket.Frame
     #expect(conversation.turns.last?.text == "1 2 3")
 }
 
+/// Regression for the flaky stop race (issue #3).
+///
+/// `finishLocally` used to set `phase = .ready` while the streamed deltas were
+/// still only in the drain buffer (`pending`); the buffer reached `turns` only
+/// via the 60 ms flusher or drain's final flush, and under parallel-suite load
+/// an observer of the first `.ready` could land in between and read the empty
+/// placeholder turn. Two gates make that window the whole point of the test:
+/// the stop POST is held so `finishLocally` cannot run early (when it wins
+/// that race on its own the terminal frame is dropped and the bug hides), and
+/// drain is then parked inside the `GET /chats/{id}` that `serverStillOpen`
+/// does for the finish frame. Only then is the stop POST let through:
+/// `finishLocally` declares `.ready` while drain — and with it the final flush
+/// — is provably still stuck mid-round-trip, so whatever `turns` holds at the
+/// first `.ready` is exactly what `.ready` is promising. The flusher is put
+/// far out of reach (`flushInterval = .seconds(30)`) so it can never tick
+/// during the test: the only thing allowed to publish the buffer at `.ready`
+/// is `finishLocally` itself.
+@Test @MainActor func stopPublishesTheBufferedTextBeforeDeclaringReady() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub)
+    // Longer than the whole test: a 60 ms flusher ticking under parallel load
+    // would publish "1 2 3" on its own and let the buggy code pass by luck.
+
+    conversation.flushInterval = .seconds(30)
+    conversation.draft = "count to a hundred"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let assistantID = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-1", messageID: assistantID,
+                               inner: ["type": "response.output_text.delta", "delta": "1 2 3"]))
+
+    // Hold the stop POST so `finishLocally` runs only when the test says so,
+    // and park the chat fetch the finish frame triggers inside
+    // `serverStillOpen`. Both waits are continuations, not sleeps, on
+    // purpose: `finishLocally` cancels the run's Task, and a cancellable
+    // wait would wake at once, let drain run its final flush, and hide the
+    // very window this test exists to expose.
+    transport.gateNextStop()
+    transport.gateNextChatFetch()
+    // Release on the way out no matter how the test ends: a failed #expect
+    // must not leave a parked request (and its continuation) hanging the
+    // suite.
+    defer { transport.releaseStopGate(); transport.releaseChatFetchGate() }
+
+    conversation.stop()
+    #expect(conversation.phase == .stopping)
+    try await waitUntil { transport.paths.contains("/api/tasks/chat/chat-1/stop") }
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: assistantID,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    // Drain has now taken the finish frame and is suspended in its
+    // "is the server still open?" fetch — the buffer cannot be published
+    // from here any more than the flusher's next tick.
+    try await waitUntil { transport.isChatFetchGateParked }
+
+    // Let the stop POST land: `finishLocally` now cancels the run, expires
+    // the stream and declares `.ready` — while drain is still parked.
+    transport.releaseStopGate()
+
+    // Capture the text in the same main-actor hop as the first observation of
+    // `.ready`, so the assertion measures what `.ready` implies rather than
+    // whatever a later poll happens to see.
+    var textAtFirstReady: String?
+    try await waitUntil {
+        guard conversation.phase == .ready else { return false }
+        textAtFirstReady = conversation.turns.last?.text
+        return true
+    }
+    // `.ready` must mean "the buffer is published": anything that reacts to
+    // the first `.ready` — the UI, or this test — reads `turns`, and it must
+    // not find the empty placeholder there.
+    #expect(textAtFirstReady == "1 2 3")
+
+    // The snapshot alone is not enough: drain is still parked, and its final
+    // flush lands *after* `.ready`. Let it run and re-check the settled state
+    // — a `pending = nil` in `finishLocally` would pass the snapshot above and
+    // then flush an empty Turn over it here. Releasing the gate is idempotent;
+    // the `defer` stays as the safety net for a failed #expect above.
+    transport.releaseChatFetchGate()
+    // The third GET /chats/{id} is the proof drain is on its way out: the
+    // fixture never stores the message, so `serverStillOpen` burns all three
+    // of its attempts (the parked one was the first; the cancelled run makes
+    // the inter-attempt sleeps throw instantly). After the third response,
+    // break → final flush is one main-actor hop away — the short settle below
+    // gives it room to land before the re-check.
+    try await waitUntil(timeout: .seconds(5)) {
+        transport.paths.filter { $0 == "/api/v1/chats/chat-1" }.count >= 3
+    }
+    try await Task.sleep(for: .milliseconds(150))
+    #expect(conversation.turns.last?.text == "1 2 3")
+    #expect(conversation.turns.last?.streaming == false)
+}
+
 @Test @MainActor func regenerateReusesTheUserMessageSoTheServerFilesASibling() async throws {
     let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
     let hub = ChatEventHub(server: server)
@@ -288,6 +387,75 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
         guarded { _chatDetailQueue.isEmpty ? nil : _chatDetailQueue.removeFirst() }
     }
 
+    // MARK: - request gates
+    //
+    // Let a test park a request inside the transport at a chosen point — for
+    // instance drain's `serverStillOpen` fetch, which is where a stop races
+    // the finish frame. The wait is a `CheckedContinuation`, not a
+    // `Task.sleep`, deliberately: `finishLocally` cancels the run's Task, and
+    // a cancellable sleep would wake at once (the `try?` at those call sites
+    // swallows it), drain would final-flush, and the race the gates exist to
+    // expose would be papered over.
+    private let chatFetchGate = OneShotGate()
+    private let stopGate = OneShotGate()
+
+    /// Makes the *next* GET /chats/{id} wait until `releaseChatFetchGate()`.
+    func gateNextChatFetch() { chatFetchGate.arm() }
+    /// True while a chat fetch is parked at the gate.
+    var isChatFetchGateParked: Bool { chatFetchGate.isParked }
+    /// Resumes the parked chat fetch (and disarms an unused gate).
+    /// Safe to call any number of times, from anywhere.
+    func releaseChatFetchGate() { chatFetchGate.release() }
+
+    /// Makes the *next* POST …/stop wait until `releaseStopGate()`.
+    func gateNextStop() { stopGate.arm() }
+    /// Resumes the parked stop request (and disarms an unused gate).
+    func releaseStopGate() { stopGate.release() }
+
+    /// A one-shot gate: `arm()` makes the next `parkIfArmed()` wait until
+    /// `release()`. Cancelling the waiting task does not wake it — see the
+    /// comment on the gates above for why that is the whole point.
+    fileprivate final class OneShotGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var armed = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func arm() {
+            lock.lock(); armed = true; lock.unlock()
+        }
+
+        func parkIfArmed() async {
+            await withCheckedContinuation { (resume: CheckedContinuation<Void, Never>) in
+                // Consume the arm and register the waiter in one atomic step,
+                // and resume on the spot when no gate is armed — so un-gated
+                // requests pay only the lock they already paid.
+                lock.lock()
+                if armed {
+                    armed = false
+                    waiters.append(resume)
+                    lock.unlock()
+                } else {
+                    lock.unlock()
+                    resume.resume()
+                }
+            }
+        }
+
+        var isParked: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return !waiters.isEmpty
+        }
+
+        func release() {
+            lock.lock()
+            armed = false
+            let parked = waiters
+            waiters = []
+            lock.unlock()
+            for waiter in parked { waiter.resume() }
+        }
+    }
+
     var chatDetail: Data {
         Data(
             """
@@ -302,10 +470,15 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
         if path.hasSuffix("/chats/new") { return (chatDetailOverride ?? chatDetail, response(for: request, 200)) }
         if request.httpMethod == "GET", path.hasPrefix("/api/v1/chats/"),
            !path.hasSuffix("/messages") {
+            await chatFetchGate.parkIfArmed()
             if let queued = nextQueuedChatDetail() {
                 return (queued, response(for: request, 200))
             }
             return (chatDetailOverride ?? chatDetail, response(for: request, 200))
+        }
+        if path.hasSuffix("/stop") {
+            await stopGate.parkIfArmed()
+            return (Data("{}".utf8), response(for: request, 200))
         }
         if path.hasSuffix("/resolve") {
             guarded { _resolveBodies.append(request.httpBody ?? Data()) }

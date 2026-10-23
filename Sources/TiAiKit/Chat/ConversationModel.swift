@@ -763,8 +763,35 @@ public final class ConversationModel {
         hub.expire(chatID: chatID)
         // A brand new chat may still be waiting for its id when stop is pressed.
         hub.expireWaitingListeners()
-        if let index = turns.lastIndex(where: \.isAssistant) {
+        // One index for both jobs below: the buffer's own turn while a buffer
+        // is in flight (the id match is the truth — a regenerate can have
+        // replaced the tail), the last assistant turn otherwise (drain already
+        // flushed, or the run never got a buffer).
+        let bufferIndex = pending.flatMap { p in turns.firstIndex(where: { $0.id == p.id }) }
+        if let index = bufferIndex ?? turns.lastIndex(where: \.isAssistant) {
             turns[index].streaming = false
+        }
+        // Publish the buffer *before* declaring ready: any first-`.ready`
+        // observer — the UI, a test — reads `turns`, so `.ready` has to imply
+        // "the buffer is published". Without this, an observer landing here
+        // while drain was still in flight read the empty placeholder turn: the
+        // streamed deltas were still only in `pending`, visible in `turns`
+        // only once the 60 ms flusher happened to have ticked.
+        //
+        // The non-final `publishPending`, not `flush(final: true)`: when drain
+        // is still in flight, its final flush runs after this and stays
+        // authoritative for error, streaming and usage; in the common ordering
+        // drain already ran and `pending` is nil — which is what the
+        // `if let pending` guard below is for.
+        //
+        // And `pending` must NOT be nilled here: drain's final flush reads it
+        // (`var finished = pending ?? Turn(...)`), so clearing it would flush an
+        // empty Turn over the text published just above.
+        if let pending, let at = bufferIndex {
+            // The non-final flush flips `.stopping` back to `.streaming` when
+            // the buffer is non-empty (`flush`'s phase rule); unobservable —
+            // `phase = .ready` follows in the same synchronous main-actor turn.
+            publishPending(keeping: pending.id, index: at)
         }
         phase = .ready
     }
@@ -1161,7 +1188,7 @@ public final class ConversationModel {
         }
         let flusher = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: Self.flushInterval)
+                try? await Task.sleep(for: self?.flushInterval ?? Self.flushInterval)
                 guard !Task.isCancelled else { return }
                 self?.publishPending(keeping: assistantID, index: index)
             }
@@ -1642,6 +1669,12 @@ public final class ConversationModel {
     var reconcileInterval: Duration = .seconds(2)
     var reconcileStallLimit = 15
     var reconcileBudget = 150
+
+    /// Tuning for the drain flush timer, same reasoning as `reconcileInterval`:
+    /// a test that has to prove the flusher did *not* tick cannot sit out a
+    /// 60 ms timer, so the interval is an instance knob. The static stays the
+    /// production default.
+    var flushInterval: Duration = ConversationModel.flushInterval
 
     /// A failed POST is reported only if the run has not already ended on its own
     /// terms — a stream closed by `stop()` errors on the way out, and calling
