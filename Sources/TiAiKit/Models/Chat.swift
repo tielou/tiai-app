@@ -175,7 +175,8 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
                 || ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif"]
                     .contains((name as NSString).pathExtension.lowercased())
             return MessageAttachment(
-                id: id, name: name, isImage: looksLikeImage || mime.hasPrefix("image/"))
+                id: id, name: name, isImage: looksLikeImage || mime.hasPrefix("image/"),
+                mimeType: mime)
         }
         // ...and a picture the sender put straight into the message, which is
         // where a vision model is actually handed its image. The app's own
@@ -190,11 +191,7 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
 
     /// `image_url` targets inside a multipart message body, in order.
     public var contentImageURLs: [String] {
-        content.blocks?
-            .compactMap { block in
-                guard block["type"]?.stringValue == "image_url" else { return nil }
-                return block["image_url"]?["url"]?.stringValue
-            } ?? []
+        content.imageURLs
     }
 
     /// What this message cites, flattened to a name and an optional url.
@@ -323,6 +320,20 @@ public enum MessageContent: Codable, Equatable, Sendable {
         if case let .blocks(values) = self { values } else { nil }
     }
 
+    /// The `image_url` targets inside the block array, in order, whatever the
+    /// scheme (`data:`, `file_id://`, http(s)). Empty for plain-text content.
+    ///
+    /// This is *the* extraction. `ChatMessage.contentImageURLs` and the
+    /// regenerate/edit resend in `ConversationModel` both go through here, so
+    /// the "same extraction" is structural and not a duplicated loop.
+    public var imageURLs: [String] {
+        blocks?
+            .compactMap { block in
+                guard block["type"]?.stringValue == "image_url" else { return nil }
+                return block["image_url"]?["url"]?.stringValue
+            } ?? []
+    }
+
     public init(text: String) {
         self = .text(text)
     }
@@ -401,13 +412,20 @@ public struct MessageAttachment: Identifiable, Equatable, Sendable {
     public var id: String
     public var name: String
     public var isImage: Bool
+    /// The stored `meta.content_type`, kept so a regenerate/edit can resend the
+    /// file entry byte-for-byte instead of guessing a type the server already
+    /// told us. Empty when the source record did not carry one.
+    public var mimeType: String
     /// Set when the bytes travel with the message instead of being fetched by id.
     public var dataURL: String?
 
-    public init(id: String, name: String, isImage: Bool, dataURL: String? = nil) {
+    public init(
+        id: String, name: String, isImage: Bool, dataURL: String? = nil, mimeType: String = ""
+    ) {
         self.id = id
         self.name = name
         self.isImage = isImage
         self.dataURL = dataURL
+        self.mimeType = mimeType
     }
 }

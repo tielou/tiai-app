@@ -640,14 +640,27 @@ public final class ConversationModel {
             return
         }
         error = nil
+        // Capture the pre-edit turn before the mutation below: its images are
+        // what the updateMessage write and the completion have to resend, or
+        // the server's overwrite drops them from the stored record.
+        let carried = turns[index]
         turns[index].text = clean
         // Everything after the edited message belongs to the branch being
         // replaced; leaving it on screen would show an answer to a question that
         // no longer says that.
         turns.removeSubrange(turns.index(after: index)..<turns.endIndex)
         leafID = messageID
+        // Only the text is replaced locally: the turn keeps its attachments and
+        // image URLs so the UI still shows the picture.
+        let content = Self.resentUserContent(text: clean, imageURLs: carried.contentImageURLs)
+        let resentFiles = Self.resentFilePayload(carried.attachments)
+        let files = resentFiles.isEmpty ? nil : resentFiles
         run = Task {
-            do { try await client.updateMessage(chatID: chatID ?? "", messageID: messageID, content: clean) }
+            do {
+                try await client.updateMessage(
+                    chatID: chatID ?? "", messageID: messageID,
+                    content: content, files: files)
+            }
             catch { self.error = error.localizedDescription; return }
             await self.exchange(text: clean, regenerating: messageID, files: [])
         }
@@ -870,20 +883,68 @@ public final class ConversationModel {
     /// shorter way of saying the same thing.
     static func filePayload(_ files: [PendingAttachment]) -> [JSONValue] {
         files.map { file in
-            .object([
-                "type": .string("file"),
-                "id": .string(file.id),
-                "name": .string(file.name),
-                "file": .object([
-                    "id": .string(file.id),
-                    "filename": .string(file.name),
-                    "meta": .object([
-                        "name": .string(file.name),
-                        "content_type": .string(file.mimeType),
-                    ]),
-                ]),
-            ])
+            fileRow(id: file.id, name: file.name, mimeType: file.mimeType)
         }
+    }
+
+    /// One `files` entry. Shared by the send path (`PendingAttachment`) and the
+    /// regenerate/edit resend (`MessageAttachment`) so the two can never drift.
+    private static func fileRow(id: String, name: String, mimeType: String) -> JSONValue {
+        .object([
+            "type": .string("file"),
+            "id": .string(id),
+            "name": .string(name),
+            "file": .object([
+                "id": .string(id),
+                "filename": .string(name),
+                "meta": .object([
+                    "name": .string(name),
+                    "content_type": .string(mimeType),
+                ]),
+            ]),
+        ])
+    }
+
+    /// The user message as it goes back on a regenerate or an edit.
+    ///
+    /// The completion handler *overwrites* the stored user message with
+    /// whatever this request carries, so a resend that says `content: "text"`
+    /// does not merely fail to add a picture — it deletes the one that was
+    /// stored, and every later request rebuilds a history without it. The
+    /// URLs travel verbatim from the local turn (`data:`, `file_id://`,
+    /// http(s) alike): no refetch, no decoding, and deliberately no vision
+    /// gate — this is storage preservation, not a picture for the current
+    /// model's eyes, so even an explicitly blind model gets the image back.
+    /// Text-only stays a bare string, never an empty-blocks array.
+    static func resentUserContent(text: String, imageURLs: [String]) -> MessageContent {
+        guard !imageURLs.isEmpty else { return .text(text) }
+        var blocks: [JSONValue] = []
+        if !text.isEmpty {
+            blocks.append(.object(["type": .string("text"), "text": .string(text)]))
+        }
+        for url in imageURLs {
+            blocks.append(
+                .object([
+                    "type": .string("image_url"),
+                    "image_url": .object(["url": .string(url)]),
+                ]))
+        }
+        return .blocks(blocks)
+    }
+
+    /// The `files` list for a regenerate/edit resend, rebuilt from the turn's
+    /// stored attachments.
+    ///
+    /// Every attachment that is *not* content-derived, images included: the
+    /// server's overwrite drops whatever this list omits, so a PDF left out
+    /// here is a PDF destroyed. The content-derived pseudo-attachments
+    /// `Chat.swift` synthesizes from `data:` blocks are the only ones skipped:
+    /// they are not file ids, and sending one under `files` is garbage the
+    /// server cannot resolve.
+    static func resentFilePayload(_ attachments: [MessageAttachment]) -> [JSONValue] {
+        attachments
+            .filter { $0.dataURL == nil && !$0.id.hasPrefix("data:") }
+            .map { fileRow(id: $0.id, name: $0.name, mimeType: $0.mimeType) }
     }
 
     private func exchange(text: String, regenerating: String?, files: [PendingAttachment]) async {
@@ -905,15 +966,44 @@ public final class ConversationModel {
         let assistantID = UUID().uuidString
         let parentID = regenerating ?? leafID
 
+        let content: MessageContent
+        let wireFiles: [JSONValue]?
         if regenerating == nil {
-            turns.append(
-                Turn(
-                    id: userMessageID, role: "user", text: text,
-                    attachments: files.map {
-                        MessageAttachment(id: $0.id, name: $0.name, isImage: $0.isImage)
-                    }))
+            content = Self.userContent(text: text, files: files, vision: modelSupportsVision)
+            var turn = Turn(
+                id: userMessageID, role: "user", text: text,
+                attachments: files.map {
+                    MessageAttachment(
+                        id: $0.id, name: $0.name, isImage: $0.isImage, mimeType: $0.mimeType)
+                })
+            // The Turn invariant, applied at send time and not only at adopt:
+            // `contentImageURLs` mirrors what the message body carries. A
+            // regenerate right after a stopped or errored stream has no stored
+            // message to adopt from (`adoptStoredMessage` even refuses to
+            // touch attachments that are already set), so without this the
+            // resend below would rebuild from empty state and ship text-only.
+            turn.contentImageURLs = content.imageURLs
+            turns.append(turn)
+            wireFiles = files.isEmpty ? nil : Self.filePayload(files)
+        } else if let carried = turns.first(where: { $0.id == userMessageID }) {
+            // Regenerate and edit: resend the carried turn's images verbatim so
+            // the server's overwrite keeps the stored record multimodal.
+            content = Self.resentUserContent(
+                text: text, imageURLs: carried.contentImageURLs)
+            let resent = Self.resentFilePayload(carried.attachments)
+            wireFiles = resent.isEmpty ? nil : resent
+        } else {
+            // Unreachable from either regenerating call site
+            // (`regenerate()` and `edit()`): each passes the id of a turn that
+            // is still in `turns` — they only truncate the range *after* that
+            // turn — so the lookup above hits. A main-actor interleave (e.g.
+            // `selectSibling` rebuilding `turns` before this Task body runs)
+            // could still miss; the fallback handles it. If the invariant ever
+            // broke, the pre-issue-#7 text-only rewrite remains: it can drop
+            // images, but guessing a body for a turn we cannot find is worse.
+            content = .text(text)
+            wireFiles = nil
         }
-        let content = Self.userContent(text: text, files: files, vision: modelSupportsVision)
         let history = wireHistory(through: userMessageID, content: content)
         turns.append(Turn(id: assistantID, role: "assistant", streaming: true))
         let assistantIndex = turns.count - 1
@@ -949,7 +1039,7 @@ public final class ConversationModel {
                 parentID: parentID, model: model),
             messageID: assistantID,
             features: Self.debugFeatureOverrides(base: features),
-            files: files.isEmpty ? nil : Self.filePayload(files),
+            files: wireFiles,
             // `ask` is what makes the server park on a tool call and wait for a
             // tap. Left unset the server runs every tool without asking, which is
             // right for a headless client and wrong for one in the hand.

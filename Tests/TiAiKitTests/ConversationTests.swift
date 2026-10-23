@@ -355,6 +355,7 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     private var _completionBodies: [Data] = []
     private var _uploads: [Data] = []
     private var _resolveBodies: [Data] = []
+    private var _messageUpdateBodies: [Data] = []
     private var _chatDetailOverride: Data?
     private var _chatDetailQueue: [Data] = []
     private var _failUploads = false
@@ -370,6 +371,8 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     var completionBodies: [Data] { guarded { _completionBodies } }
     var uploads: [Data] { guarded { _uploads } }
     var resolveBodies: [Data] { guarded { _resolveBodies } }
+    /// Bodies of POST /chats/{id}/messages/{id} — the `updateMessage` (edit) calls.
+    var messageUpdateBodies: [Data] { guarded { _messageUpdateBodies } }
     var completionBody: Data? { guarded { _completionBodies.last } }
 
     /// Replaces what GET /chats/{id} returns, for tests that need a real tree.
@@ -483,6 +486,10 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
         if path.hasSuffix("/resolve") {
             guarded { _resolveBodies.append(request.httpBody ?? Data()) }
             return (Data(#"{"status":true}"#.utf8), response(for: request, 200))
+        }
+        if request.httpMethod == "POST", path.contains("/messages/") {
+            guarded { _messageUpdateBodies.append(request.httpBody ?? Data()) }
+            return (Data("{}".utf8), response(for: request, 200))
         }
         if path.hasSuffix("/files") || path.hasSuffix("/files/") {
             if failUploads { throw UploadFailure() }
@@ -2139,4 +2146,404 @@ enum AskUserFixture {
                                                  serverStillWriting: true)
         == "Empty reply from server",
         "the server's own reason always wins over our guess")
+}
+
+// MARK: - regenerate/edit keep the pictures (issue #7)
+//
+// The completion handler *overwrites* the stored user message with whatever
+// `user_message` and `files` the request carries. A regenerate or edit that
+// resent `content: "text"` with `files: []` therefore did not merely fail to
+// add a picture — it deleted the one that was stored, and every later request
+// rebuilt a history without it.
+
+/// A chat detail whose user message carries a `data:` image block in `content`
+/// *and* a `files` entry — the shape the server actually stores for an
+/// app-sent photo. (`imageChatDetail` in ImageBudgetTests has no `files`
+/// entries, and the `files` half is where part of the bug lived.)
+private func imageMessageChatDetail(chatID: String) -> Data {
+    Data(
+        """
+        {"id":"\(chatID)","title":"T","updated_at":1,"created_at":1,"chat":{"models":["local-personal"],
+         "history":{"currentId":"assistant-1","messages":{
+           "user-1":{"id":"user-1","role":"user","done":true,"childrenIds":["assistant-1"],
+             "content":[{"type":"text","text":"what is in this pic"},
+                        {"type":"image_url","image_url":{"url":"data:image/png;base64,QUlE"}}],
+             "files":[{"type":"file","id":"file-img","name":"shot.png",
+                       "file":{"id":"file-img","filename":"shot.png",
+                               "meta":{"name":"shot.png","content_type":"image/png"}}}]},
+           "assistant-1":{"id":"assistant-1","role":"assistant","done":true,"parentId":"user-1",
+                          "childrenIds":[],"content":"a cat"}}}}}
+        """.utf8)
+}
+
+/// Simulates the server's overwrite semantics.
+///
+/// The completion handler stores the user message from `user_message` plus the
+/// top-level `files`, replacing the stored row wholesale. Asserting only the
+/// outgoing body proves the request; decoding what the server would have
+/// *stored* from that body is what proves the acceptance criterion — the
+/// stored record still carries the image.
+private func storedUserMessage(id: String, content: Any?, files: Any?) throws -> ChatMessage {
+    var record: [String: Any] = ["id": id, "role": "user", "content": content ?? ""]
+    if let files { record["files"] = files }
+    return try JSONDecoder().decode(
+        ChatMessage.self, from: JSONSerialization.data(withJSONObject: record))
+}
+
+/// The record as the server would store it after this completion request.
+private func storedUserMessage(afterCompletionBody body: Data) throws -> ChatMessage {
+    let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    let userMessage = try #require(json["user_message"] as? [String: Any])
+    return try storedUserMessage(
+        id: try #require(userMessage["id"] as? String),
+        content: userMessage["content"], files: json["files"])
+}
+
+/// The record as the server would store it after this updateMessage request.
+private func storedUserMessage(afterUpdateBody body: Data, messageID: String) throws -> ChatMessage {
+    let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    return try storedUserMessage(id: messageID, content: json["content"], files: json["files"])
+}
+
+private func imageURLs(inContent content: Any?) -> [String] {
+    guard let blocks = content as? [[String: Any]] else { return [] }
+    return blocks.compactMap { $0["image_url"] as? [String: Any] }.compactMap { $0["url"] as? String }
+}
+
+/// The acceptance assertion: what the server would store after this request
+/// still knows about the image, in the content blocks and in the file list.
+private func expectStoredImage(_ message: ChatMessage, _ source: String) {
+    #expect(!message.contentImageURLs.isEmpty,
+            "\(source): the stored user message lost its image block")
+    #expect(message.messageAttachments.contains { $0.isImage },
+            "\(source): the stored user message lost its image file")
+}
+
+/// (a) The primary repro: regenerate in-session, without a reload in between.
+/// The carried turn is the one appended locally at send time — no stored
+/// message was ever adopted (the adopt fetch finds nothing in the default
+/// transport fixture), so the resend has to work from local state alone.
+@Test @MainActor func regenerateResendsTheImagesOfTheMessageItReRuns() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-7-regen-insession",
+        models: [ChatModel.stub("local-personal", caps: ["vision": true])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub)
+
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "shot.png", mimeType: "image/png")
+    try await waitUntil { conversation.attachments.count == 1 }
+    conversation.draft = "what is in this pic"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let assistant = try #require(transport.assistantMessageID)
+    for frame in Frames.run(chat: "chat-7-regen-insession", message: assistant, answer: "a cat") {
+        hub.receive(frame)
+    }
+    try await waitUntil { conversation.phase == .ready }
+
+    conversation.regenerate()
+    try await transport.awaitCompletion(2)
+    let body = try #require(transport.completionBodies.dropFirst().first)
+    let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    let userMessage = try #require(json["user_message"] as? [String: Any])
+
+    let urls = imageURLs(inContent: userMessage["content"])
+    #expect(urls.count == 1,
+            "the regenerated user message must carry its image block, got: \(userMessage["content"] ?? "nil")")
+    #expect(urls.first?.hasPrefix("data:image/png;base64,") == true,
+            "the image is resent verbatim, not refetched or re-encoded: \(urls)")
+    let blocks = try #require(userMessage["content"] as? [[String: Any]])
+    #expect(blocks.contains { ($0["text"] as? String) == "what is in this pic" },
+            "the edited-free text survives alongside the image")
+    let files = try #require(json["files"] as? [[String: Any]],
+                            "the file entry has to be resent or the server drops it")
+    #expect(files.first?["id"] as? String == "file-1")
+
+    expectStoredImage(try storedUserMessage(afterCompletionBody: body), "regenerate completion")
+}
+
+/// (b) Regenerate after the stream errored: the adopt that would copy the
+/// stored message onto the turn is skipped for failed runs, so again only the
+/// locally-appended turn's state is available to the resend.
+@Test @MainActor func regenerateAfterAnErroredStreamStillResendsTheImages() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-7-regen-errored",
+        models: [ChatModel.stub("local-personal", caps: ["vision": true])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub)
+
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "shot.png", mimeType: "image/png")
+    try await waitUntil { conversation.attachments.count == 1 }
+    conversation.draft = "what is in this pic"
+    conversation.send()
+    try await transport.awaitCompletion()
+    hub.expire(chatID: "chat-7-regen-errored")  // what the silence watchdog does
+    try await waitUntil { conversation.phase == .ready }
+    #expect(conversation.error != nil, "the errored run is what skips the adopt")
+
+    conversation.regenerate()
+    try await transport.awaitCompletion(2)
+    let body = try #require(transport.completionBodies.dropFirst().first)
+    let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    let userMessage = try #require(json["user_message"] as? [String: Any])
+    #expect(imageURLs(inContent: userMessage["content"]).count == 1,
+            "a regenerate after a dead stream must still carry the image")
+    expectStoredImage(try storedUserMessage(afterCompletionBody: body), "post-error regenerate")
+}
+
+/// (c) The resend is about the *stored* record, not this model's eyes: even a
+/// model that explicitly reports `vision: false` must get the image back, or
+/// regenerating under a blind model destroys a picture a sighted model will
+/// later need. (The send path refuses blind models out loud; regenerate is
+/// storage preservation, so it fails open.)
+@Test @MainActor func regenerateWithABlindModelStillResendsTheStoredImages() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-7-regen-blind",
+        models: [ChatModel.stub("local-blind", caps: ["vision": false])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub)
+    transport.chatDetailOverride = imageMessageChatDetail(chatID: "chat-7-regen-blind")
+    await conversation.load()
+    #expect(conversation.turns.count == 2)
+
+    conversation.regenerate()
+    try await transport.awaitCompletion()
+    let body = try #require(transport.completionBody)
+    let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    let userMessage = try #require(json["user_message"] as? [String: Any])
+    #expect(imageURLs(inContent: userMessage["content"]) == ["data:image/png;base64,QUlE"],
+            "the stored image block is passed through verbatim")
+    // The `data:` pseudo-attachment Chat.swift synthesizes from the content
+    // block is content-derived, not a file id — sending it under `files` is
+    // garbage. Only the real file entry goes back.
+    let files = try #require(json["files"] as? [[String: Any]])
+    #expect(files.count == 1)
+    #expect(files.first?["id"] as? String == "file-img")
+    expectStoredImage(try storedUserMessage(afterCompletionBody: body), "blind-model regenerate")
+}
+
+/// (d) Text-only regenerate must stay exactly what it was: a bare string, not
+/// a one-block array.
+@Test @MainActor func textOnlyRegenerateStaysPlainText() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-7-regen-textonly",
+        models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub)
+
+    conversation.draft = "plain question"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let assistant = try #require(transport.assistantMessageID)
+    for frame in Frames.run(chat: "chat-7-regen-textonly", message: assistant, answer: "plain answer") {
+        hub.receive(frame)
+    }
+    try await waitUntil { conversation.phase == .ready }
+
+    conversation.regenerate()
+    try await transport.awaitCompletion(2)
+    let body = try #require(transport.completionBodies.dropFirst().first)
+    let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    let userMessage = try #require(json["user_message"] as? [String: Any])
+    #expect(userMessage["content"] as? String == "plain question",
+            "a text-only regenerate stays a plain string, not an empty-blocks array")
+    #expect(json["files"] == nil, "nothing to resend, nothing on the wire")
+}
+
+/// (e) Editing the text of an image-bearing message keeps the image in *both*
+/// writes: the updateMessage POST (which overwrites the stored row) and the
+/// completion's user_message.
+@Test @MainActor func editKeepsTheImagesInTheStoredRecord() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-7-edit-images",
+        models: [ChatModel.stub("local-personal", caps: ["vision": true])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub)
+    transport.chatDetailOverride = imageMessageChatDetail(chatID: "chat-7-edit-images")
+    await conversation.load()
+
+    conversation.edit(messageID: "user-1", text: "actually: what breed is the cat")
+    try await transport.awaitCompletion()
+
+    // The updateMessage POST — this is the write that overwrote the picture.
+    let update = try #require(transport.messageUpdateBodies.first)
+    let updateJSON = try #require(JSONSerialization.jsonObject(with: update) as? [String: Any])
+    #expect(imageURLs(inContent: updateJSON["content"]) == ["data:image/png;base64,QUlE"],
+            "the updateMessage content must be multimodal or the stored row loses the image")
+    let updateBlocks = try #require(updateJSON["content"] as? [[String: Any]])
+    #expect(updateBlocks.contains { ($0["text"] as? String) == "actually: what breed is the cat" },
+            "the new text is the text block")
+    let updateFiles = try #require(updateJSON["files"] as? [[String: Any]])
+    #expect(updateFiles.first?["id"] as? String == "file-img")
+    expectStoredImage(
+        try storedUserMessage(afterUpdateBody: update, messageID: "user-1"), "edit updateMessage")
+
+    // The completion's user_message — the second overwrite vector.
+    let body = try #require(transport.completionBody)
+    let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    let userMessage = try #require(json["user_message"] as? [String: Any])
+    #expect(imageURLs(inContent: userMessage["content"]) == ["data:image/png;base64,QUlE"])
+    expectStoredImage(try storedUserMessage(afterCompletionBody: body), "edit completion")
+
+    // Locally only the text was replaced: the UI keeps showing the picture.
+    let turn = try #require(conversation.turns.first)
+    #expect(turn.text == "actually: what breed is the cat")
+    #expect(!turn.contentImageURLs.isEmpty)
+    #expect(turn.attachments.contains { $0.isImage })
+}
+
+/// (f) Failure-inertness: the updateMessage write happens first, and even when
+/// the re-run afterwards fails, what the server stored from that write is
+/// still multimodal — a failed regenerate must not be a way to lose pictures.
+@Test @MainActor func editStoresTheImagesEvenWhenTheRerunFails() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-7-edit-fail",
+        models: [ChatModel.stub("local-personal", caps: ["vision": true])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub)
+    transport.chatDetailOverride = imageMessageChatDetail(chatID: "chat-7-edit-fail")
+    await conversation.load()
+    // The exchange refuses to run without a model — the failure after the write.
+    conversation.model = ""
+
+    conversation.edit(messageID: "user-1", text: "still a cat question")
+    try await waitUntil { conversation.error != nil }
+
+    #expect(transport.completionBodies.isEmpty, "the re-run failed before posting")
+    let update = try #require(transport.messageUpdateBodies.first)
+    expectStoredImage(
+        try storedUserMessage(afterUpdateBody: update, messageID: "user-1"),
+        "edit whose re-run failed")
+}
+
+/// A chat detail whose user message carries an image file **and** a non-image
+/// file (a PDF). The overwrite semantics do not care about the file type:
+/// whatever the resend omits is what the server deletes.
+private func mixedFilesChatDetail(chatID: String) -> Data {
+    Data(
+        """
+        {"id":"\(chatID)","title":"T","updated_at":1,"created_at":1,"chat":{"models":["local-personal"],
+         "history":{"currentId":"assistant-1","messages":{
+           "user-1":{"id":"user-1","role":"user","done":true,"childrenIds":["assistant-1"],
+             "content":[{"type":"text","text":"summarize the pdf with the chart"},
+                        {"type":"image_url","image_url":{"url":"data:image/png;base64,QUlE"}}],
+             "files":[
+               {"type":"file","id":"file-shot","name":"chart.png",
+                "file":{"id":"file-shot","filename":"chart.png",
+                        "meta":{"name":"chart.png","content_type":"image/png"}}},
+               {"type":"file","id":"file-report","name":"report.pdf",
+                "file":{"id":"file-report","filename":"report.pdf",
+                        "meta":{"name":"report.pdf","content_type":"application/pdf"}}}]},
+           "assistant-1":{"id":"assistant-1","role":"assistant","done":true,"parentId":"user-1",
+                          "childrenIds":[],"content":"here you go"}}}}}
+        """.utf8)
+}
+
+/// (g) The resend is not image-only. A regenerate of a message that carries a
+/// PDF alongside a picture must put *both* file entries back, or the server's
+/// overwrite silently destroys the document.
+@Test @MainActor func regenerateResendsNonImageAttachmentsToo() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-7-regen-mixed",
+        models: [ChatModel.stub("local-personal", caps: ["vision": true])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub)
+    transport.chatDetailOverride = mixedFilesChatDetail(chatID: "chat-7-regen-mixed")
+    await conversation.load()
+    #expect(conversation.turns.count == 2)
+
+    conversation.regenerate()
+    try await transport.awaitCompletion()
+    let body = try #require(transport.completionBody)
+    let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    let files = try #require(json["files"] as? [[String: Any]],
+                            "the resend must carry every stored file, not just the images")
+    #expect(Set(files.compactMap { $0["id"] as? String }) == ["file-shot", "file-report"],
+            "the image and the PDF both survive the regenerate: \(files)")
+    // The stored record after the server's overwrite still knows about both.
+    let stored = try storedUserMessage(afterCompletionBody: body)
+    expectStoredImage(stored, "mixed-file regenerate")
+    #expect(stored.messageAttachments.contains { $0.name == "report.pdf" },
+            "the PDF must survive the overwrite, not just the image")
+}
+
+/// A chat detail whose image block references the uploaded file by id
+/// (`file_id://…`) instead of inlining the bytes — the other shape the server
+/// stores for a picture.
+private func fileIDImageChatDetail(chatID: String) -> Data {
+    Data(
+        """
+        {"id":"\(chatID)","title":"T","updated_at":1,"created_at":1,"chat":{"models":["local-personal"],
+         "history":{"currentId":"assistant-1","messages":{
+           "user-1":{"id":"user-1","role":"user","done":true,"childrenIds":["assistant-1"],
+             "content":[{"type":"text","text":"what is in this pic"},
+                        {"type":"image_url","image_url":{"url":"file_id://file-shot"}}],
+             "files":[{"type":"file","id":"file-shot","name":"shot.png",
+                       "file":{"id":"file-shot","filename":"shot.png",
+                               "meta":{"name":"shot.png","content_type":"image/png"}}}]},
+           "assistant-1":{"id":"assistant-1","role":"assistant","done":true,"parentId":"user-1",
+                          "childrenIds":[],"content":"a cat"}}}}}
+        """.utf8)
+}
+
+/// (h) The `file_id://` scheme passes through verbatim — the resend neither
+/// resolves the id nor rewrites the url — and the file entry's
+/// `meta.content_type` round-trips from the stored record instead of being
+/// guessed.
+@Test @MainActor func regenerateResendsFileIDSchemeImageVerbatim() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-7-regen-fileid",
+        models: [ChatModel.stub("local-personal", caps: ["vision": true])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub)
+    transport.chatDetailOverride = fileIDImageChatDetail(chatID: "chat-7-regen-fileid")
+    await conversation.load()
+    #expect(conversation.turns.count == 2)
+
+    conversation.regenerate()
+    try await transport.awaitCompletion()
+    let body = try #require(transport.completionBody)
+    let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    let userMessage = try #require(json["user_message"] as? [String: Any])
+    #expect(imageURLs(inContent: userMessage["content"]) == ["file_id://file-shot"],
+            "the file_id:// url must be resent byte-for-byte")
+
+    // The file entry keeps the stored mime; nothing is guessed from the name.
+    let files = try #require(json["files"] as? [[String: Any]])
+    #expect(files.count == 1)
+    let entry = try #require(files.first)
+    #expect(entry["id"] as? String == "file-shot")
+    #expect(entry["name"] as? String == "shot.png")
+    let inner = try #require(entry["file"] as? [String: Any])
+    let meta = try #require(inner["meta"] as? [String: Any])
+    #expect(meta["content_type"] as? String == "image/png",
+            "the mime round-trips from the stored meta.content_type")
+
+    let stored = try storedUserMessage(afterCompletionBody: body)
+    #expect(stored.contentImageURLs == ["file_id://file-shot"])
+    expectStoredImage(stored, "file_id:// regenerate")
 }
