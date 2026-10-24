@@ -111,18 +111,33 @@ public struct GreetingCat: View {
     /// bends as a unit.
     private func tailPath(s: CGFloat, phase: Double) -> Path {
         let root = CGPoint(x: s * 0.600, y: s * 0.865)
-        let tip = CGPoint(x: s * 0.780, y: s * 0.400)
+        let tip = CGPoint(x: s * 0.760, y: s * 0.395)
         let steps = 26
         var spine = Path()
         for i in 0...steps {
             let t = CGFloat(i) / CGFloat(steps)
+            // A gentle bow, not a lean. Two failures either side of the right
+            // answer: bulge the base out to x 0.93 and the wave can only decorate
+            // a bow that already leans one way, so the tail never crosses its own
+            // neutral line; make the base upright and the swing carries the tail
+            // behind the body, where it is the same colour as the coat and simply
+            // disappears. These numbers put the tip between 0.70 and 0.80 — across
+            // its neutral 0.76, and always clear of the body edge near 0.66.
             let p = bezier(t, root,
-                           CGPoint(x: s * 0.868, y: s * 0.815),
-                           CGPoint(x: s * 0.928, y: s * 0.560), tip)
+                           CGPoint(x: s * 0.820, y: s * 0.840),
+                           CGPoint(x: s * 0.830, y: s * 0.560), tip)
             // Amplitude grows toward the tip and the phase lags along the length,
             // so the base is still and the tip is doing the work.
-            let amp = pow(t, 1.7) * s * 0.062
-            let point = CGPoint(x: p.x + CGFloat(sin(phase - Double(t) * 2.1)) * amp, y: p.y)
+            let amp = pow(t, 1.4) * s * 0.088
+            // Two waves, travelling in opposite directions. One sine only ever
+            // bows the tail one way at a time, which is a stiff tail with a wiggle
+            // added; the counter-travelling term is what lets the tip swing
+            // against the main curve, and the mismatched frequencies mean the
+            // combination never visibly repeats. That is the snake part.
+            let main = sin(phase - Double(t) * 3.4)
+            let counter = sin(phase * 0.61 + Double(t) * 2.2)
+            let wave = main * 0.62 + counter * 0.38
+            let point = CGPoint(x: p.x + CGFloat(wave) * amp, y: p.y)
             if i == 0 { spine.move(to: point) } else { spine.addLine(to: point) }
         }
         return spine.strokedPath(StrokeStyle(lineWidth: s * 0.048,
@@ -296,14 +311,21 @@ public struct GreetingCat: View {
         // to the chin, roughly parallel-sided between the eyes and only flaring
         // where it reaches the cheeks.
         var face = Path()
-        face.move(to: CGPoint(x: s * 0.478, y: s * (0.250 + headLift)))
-        face.addLine(to: CGPoint(x: s * 0.522, y: s * (0.250 + headLift)))
+        // The top is a rounded taper, not a cut. A flat horizontal edge where the
+        // white stops reads as a sticker placed on the head; a real blaze narrows
+        // and rounds out before it runs out of forehead.
+        // Blunt, not pointed: the first rounded version tapered to a leaf tip and
+        // looked like a flame rather than a marking. Apollo's runs up as a column
+        // and stops with a soft rounded end, roughly as wide as it is tall here.
+        face.move(to: CGPoint(x: s * 0.474, y: s * (0.306 + headLift)))
+        face.addQuadCurve(to: CGPoint(x: s * 0.526, y: s * (0.306 + headLift)),
+                          control: CGPoint(x: s * 0.500, y: s * (0.252 + headLift)))
         face.addCurve(
             to: CGPoint(x: s * 0.548, y: s * (0.398 + headLift)),
-            control1: CGPoint(x: s * 0.528, y: s * (0.310 + headLift)),
+            control1: CGPoint(x: s * 0.524, y: s * (0.322 + headLift)),
             control2: CGPoint(x: s * 0.548, y: s * (0.356 + headLift)))
         face.addCurve(
-            to: CGPoint(x: s * 0.604, y: s * (0.440 + headLift)),
+            to: CGPoint(x: s * 0.592, y: s * (0.440 + headLift)),
             control1: CGPoint(x: s * 0.566, y: s * (0.408 + headLift)),
             control2: CGPoint(x: s * 0.592, y: s * (0.420 + headLift)))
         face.addCurve(
@@ -311,7 +333,7 @@ public struct GreetingCat: View {
             control1: CGPoint(x: s * 0.592, y: s * (0.470 + headLift)),
             control2: CGPoint(x: s * 0.552, y: s * (0.486 + headLift)))
         face.addCurve(
-            to: CGPoint(x: s * 0.396, y: s * (0.440 + headLift)),
+            to: CGPoint(x: s * 0.408, y: s * (0.440 + headLift)),
             control1: CGPoint(x: s * 0.448, y: s * (0.486 + headLift)),
             control2: CGPoint(x: s * 0.408, y: s * (0.470 + headLift)))
         face.addCurve(
@@ -319,9 +341,9 @@ public struct GreetingCat: View {
             control1: CGPoint(x: s * 0.408, y: s * (0.420 + headLift)),
             control2: CGPoint(x: s * 0.434, y: s * (0.408 + headLift)))
         face.addCurve(
-            to: CGPoint(x: s * 0.478, y: s * (0.250 + headLift)),
+            to: CGPoint(x: s * 0.474, y: s * (0.306 + headLift)),
             control1: CGPoint(x: s * 0.452, y: s * (0.356 + headLift)),
-            control2: CGPoint(x: s * 0.472, y: s * (0.310 + headLift)))
+            control2: CGPoint(x: s * 0.474, y: s * (0.322 + headLift)))
         face.closeSubpath()
         context.fill(face, with: .color(paper))
 
