@@ -44,19 +44,37 @@ public struct GreetingCat: View {
 
     // MARK: - Colour
 
-    /// The black coat. `Color.primary` at full strength is harsh for a decorative
-    /// mark, and a flat grey is invisible in light mode, so it is picked per
-    /// appearance.
+    /// The black coat.
+    ///
+    /// Fixed, not adaptive. The silhouette this grew out of was one colour, so
+    /// following the appearance was free; once the cat had a white half, adapting
+    /// meant dark mode drew a *white cat with black markings* — a photograph
+    /// negative rather than Apollo. A tuxedo cat is black and white whichever
+    /// appearance the app is in, so the coat is too.
     private var ink: Color {
-        scheme == .dark ? Color(white: 0.86) : Color(white: 0.22)
+        scheme == .dark ? Color(white: 0.20) : Color(white: 0.18)
     }
 
-    /// The white coat. Historically the face was cut out of the silhouette, so
-    /// this was the colour of whatever the cat sat on; now it is the bib, the
-    /// blaze and the socks, and it still tracks the appearance so it stays the
-    /// light half of a two-tone cat in either scheme.
+    /// The white coat. Fixed for the same reason.
     private var paper: Color {
-        scheme == .dark ? Color(white: 0.06) : Color(white: 0.98)
+        scheme == .dark ? Color(white: 0.93) : Color(white: 0.97)
+    }
+
+    /// A thin light edge around the silhouette, dark mode only.
+    ///
+    /// A near-black cat on a near-black background has nothing separating them.
+    /// Lifting the coat toward grey fixes the separation and turns him into a grey
+    /// cat, so instead the outline does the work: he stays black and still has an
+    /// edge. Nothing needed in light mode, where black on white already separates.
+    private var rim: Color? {
+        scheme == .dark ? Color.white.opacity(0.30) : nil
+    }
+
+    /// Whiskers stay adaptive, because they are the one thing drawn outside the
+    /// cat. Apollo's are white, which is right against his black cheeks and wrong
+    /// against a white background, so they take the background's opposite.
+    private var whisker: Color {
+        scheme == .dark ? Color(white: 0.80) : Color(white: 0.30)
     }
 
     /// Apollo's nose, and the eyes. Fixed on purpose: a muted pink and a
@@ -362,7 +380,7 @@ public struct GreetingCat: View {
             whiskers.move(to: CGPoint(x: x(0.356), y: s * (0.442 + headLift)))
             whiskers.addLine(to: CGPoint(x: x(0.192), y: s * (0.528 + headLift)))
         }
-        context.stroke(whiskers, with: .color(ink.opacity(0.7)),
+        context.stroke(whiskers, with: .color(whisker.opacity(0.8)),
                        lineWidth: max(1, s * 0.011))
 
         drawFace(&context, s: s, headLift: headLift, blink: blink)
