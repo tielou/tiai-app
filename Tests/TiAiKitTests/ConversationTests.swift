@@ -2874,14 +2874,11 @@ private func makePostFailureFixture(chatID: String?) -> (
     try await transport.awaitCompletion()
     conversation.abandon()
     #expect(conversation.phase == .ready)
-    // Let the abandoned run finish its local bookkeeping before the next one
-    // starts. (A cancelled run's exchange still unwinds and may stamp its own
-    // no-answer verdict — a pre-existing abandon-unwind race, filed as issue
-    // #11; the deterministic rework of `abandon` belongs there, so this test
-    // keeps the sleep rather than fixing the race here.) What matters here is
-    // that its cancelled POST cannot leave a failure flag behind for the next
-    // run to act on.
-    try await Task.sleep(for: .milliseconds(100))
+    // No settle sleep here any more (issue #11): `abandon` bumps the run
+    // generation, so the cancelled run's exchange unwinds generation-aware and
+    // is inert by construction — it cannot stamp its no-answer verdict on the
+    // next run, and its cancelled POST cannot leave a failure flag behind. The
+    // next send may start immediately.
 
     // An abandoned run cancels a still-open POST, and the cancellation lands as
     // a throw in its catch. If that throw records a failure, the flag poisons
@@ -2902,4 +2899,116 @@ private func makePostFailureFixture(chatID: String?) -> (
             "the abandoned first run must not leak a failure into the second: \(conversation.error ?? "nil")")
     #expect(conversation.draft.isEmpty, "the second send went out; nothing was rolled back")
     #expect(conversation.turns.last?.text == "two")
+}
+
+// MARK: - issue #11 / #5: run generation
+
+@Test @MainActor func abandonedRunUnwindDoesNotPoisonTheNextRun() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+
+    conversation.draft = "first"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let first = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: first,
+        inner: ["type": "response.output_text.delta", "delta": "one"]))
+
+    // Park run 1's unwind inside drain's "is the server still open?" fetch —
+    // the same idiom as `stopPublishesTheBufferedTextBeforeDeclaringReady`:
+    // the gate is a continuation, so cancelling the run does not wake it, and
+    // `isChatFetchGateParked` is proof of exactly where run 1 is suspended.
+    transport.gateNextChatFetch()
+    defer { transport.releaseChatFetchGate() }
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: first,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    try await waitUntil { transport.isChatFetchGateParked }
+
+    // Abandon while run 1 is provably parked mid-unwind, then start run 2.
+    conversation.abandon()
+    #expect(conversation.phase == .ready)
+    conversation.draft = "second"
+    conversation.send()
+    try await transport.awaitCompletion(2)
+    let second = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: second,
+        inner: ["type": "response.output_text.delta", "delta": "two"]))
+
+    // Let run 1's unwind run to completion. It must be inert: no phase write,
+    // no error stamp, no cancel of run 2's POST slot.
+    transport.releaseChatFetchGate()
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(conversation.phase != .ready,
+            "the abandoned run's unwind must not declare the newer run finished")
+    #expect(conversation.error == nil,
+            "the abandoned run's unwind must not stamp an error onto the newer run: \(conversation.error ?? "nil")")
+
+    // Run 2 finishes normally, untouched by run 1's exit.
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: second,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(5)) {
+        conversation.turns.last?.text == "two" && conversation.phase == .ready
+    }
+    #expect(conversation.error == nil)
+    #expect(conversation.draft.isEmpty, "the second send went out; nothing was rolled back")
+    #expect(conversation.turns.count == 4)
+}
+
+@Test @MainActor func slowStopDoesNotKillTheNewerRun() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+
+    conversation.draft = "first"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let first = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: first,
+        inner: ["type": "response.output_text.delta", "delta": "one"]))
+
+    // Hold both halves of the stop: the stop POST (so `finishLocally` lands
+    // only when the test says so) and the chat fetch the finish frame parks
+    // drain on. Both gates are continuations — `abandon` cancelling the run
+    // does not wake either.
+    transport.gateNextStop()
+    transport.gateNextChatFetch()
+    defer { transport.releaseStopGate(); transport.releaseChatFetchGate() }
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: first,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    try await waitUntil { transport.isChatFetchGateParked }
+
+    conversation.stop()
+    #expect(conversation.phase == .stopping)
+    try await waitUntil { transport.paths.contains("/api/tasks/chat/chat-1/stop") }
+
+    // Give up on the stopping run and start a newer one, then let the slow
+    // stop POST land: its `finishLocally` belongs to the abandoned run and
+    // must not touch the state the newer run now owns (issue #5).
+    conversation.abandon()
+    conversation.draft = "second"
+    conversation.send()
+    try await transport.awaitCompletion(2)
+    let second = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: second,
+        inner: ["type": "response.output_text.delta", "delta": "two"]))
+    try await waitUntil { conversation.phase == .streaming }
+
+    transport.releaseStopGate()
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(conversation.phase.isBusy,
+            "the slow stop must not finish the run that started after it")
+    #expect(conversation.error == nil,
+            "the slow stop must not stamp an error onto the newer run: \(conversation.error ?? "nil")")
+
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: second,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(5)) {
+        conversation.turns.last?.text == "two" && conversation.phase == .ready
+    }
+    #expect(conversation.error == nil)
 }

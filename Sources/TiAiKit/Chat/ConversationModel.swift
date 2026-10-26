@@ -82,6 +82,15 @@ public final class ConversationModel {
     private let hub: ChatEventHub
     private var run: Task<Void, Never>?
     private var post: Task<Void, Never>?
+    /// Which run currently owns this model's state. Bumped when a run starts
+    /// (send/edit/regenerate) or the current one is given up (abandon). A run
+    /// that captured an older generation was superseded mid-await and must not
+    /// write state it no longer owns — the next run's POST slot, phase, error
+    /// or transcript. stop() captures but never bumps: a stop belongs to the
+    /// run it stops. Invariant this relies on: phase == .ready implies post was
+    /// cancelled — every path to .ready cancels the slot first.
+    private var runGeneration = 0
+    private func isCurrent(_ gen: Int) -> Bool { gen == runGeneration }
     /// The message of a completion POST that failed while the run was still
     /// `.waiting` with not a single frame seen. Set by `recordPostError`,
     /// consumed by `exchange` after the drain to roll the phantom send back
@@ -565,6 +574,8 @@ public final class ConversationModel {
         // wait for a scheduling hop, and a caller that then awaits something
         // conditioned on the phase would otherwise race the run it just started.
         phase = .waiting
+        runGeneration += 1
+        let gen = runGeneration
         // Out-of-process progress. A long answer outlives the app switcher, and
         // coming back to a transcript that has not moved is indistinguishable
         // from a hung one; a ribbon that says "Writing · local-deep" settles it.
@@ -585,6 +596,12 @@ public final class ConversationModel {
             // Taken *after* the wait, because until the upload answers there is
             // no file id to take.
             await self.waitForUploads()
+            // A superseded run (abandoned, or replaced by a newer send while the
+            // upload wait was in flight) must not touch state it no longer owns:
+            // neither the abort branch below nor the `attachments` steal would
+            // be its to take any more. One guard covers the whole post-await
+            // region because there is no await between it and `exchange`.
+            guard gen == runGeneration else { return }
             // A failed upload is invisible in `attachments` — the chip never
             // appeared — so a send that simply carried on would ship a silently
             // reduced set. The checkpoint is compared here, after the wait, and
@@ -619,7 +636,7 @@ public final class ConversationModel {
             }
             let files = self.attachments
             self.attachments = []
-            await self.exchange(text: text, regenerating: nil, files: files)
+            await self.exchange(text: text, regenerating: nil, files: files, gen: gen)
         }
     }
 
@@ -667,6 +684,8 @@ public final class ConversationModel {
         let content = Self.resentUserContent(text: clean, imageURLs: carried.contentImageURLs)
         let resentFiles = Self.resentFilePayload(carried.attachments)
         let files = resentFiles.isEmpty ? nil : resentFiles
+        runGeneration += 1
+        let gen = runGeneration
         run = Task {
             do {
                 try await client.updateMessage(
@@ -674,7 +693,7 @@ public final class ConversationModel {
                     content: content, files: files)
             }
             catch { self.error = error.localizedDescription; return }
-            await self.exchange(text: clean, regenerating: messageID, files: [])
+            await self.exchange(text: clean, regenerating: messageID, files: [], gen: gen)
         }
     }
 
@@ -751,7 +770,9 @@ public final class ConversationModel {
         turns.removeSubrange(turns.index(after: index)..<turns.endIndex)
         leafID = last.id
         phase = .waiting
-        run = Task { await self.exchange(text: last.text, regenerating: last.id, files: []) }
+        runGeneration += 1
+        let gen = runGeneration
+        run = Task { await self.exchange(text: last.text, regenerating: last.id, files: [], gen: gen) }
     }
 
     /// Asks the server to halt the run in flight.
@@ -762,13 +783,22 @@ public final class ConversationModel {
     /// the terminal frame is what actually ends it.
     public func stop() {
         guard let chatID, phase.isBusy else { return }
+        // A stop belongs to the run it stops: capture the generation, never bump
+        // it. If a newer run starts while the stop POST is in flight, the slow
+        // stop must not come back and finish *that* run (issue #5).
+        let gen = runGeneration
         userStopped = true
         phase = .stopping
         Task {
             do {
                 try await client.stop(chatID: chatID)
             } catch {
-                self.error = error.localizedDescription
+                // Same race as finishLocally below: a stop POST that fails
+                // after a newer run started must not stamp its error onto
+                // THAT run's banner (issue #5).
+                if gen == runGeneration {
+                    self.error = error.localizedDescription
+                }
             }
             // The server has confirmed the task is stopped. Waiting for a frame
             // to prove it was the old design, and on a real stop that frame
@@ -776,12 +806,13 @@ public final class ConversationModel {
             // the button stayed red and the chat looked frozen even though
             // nothing was happening. A Stop button that stops is what was asked
             // for. Whatever arrived stays on screen.
-            finishLocally(chatID: chatID)
+            finishLocally(chatID: chatID, gen: gen)
         }
     }
 
     /// Ends the run in the app, whatever the server does next.
-    private func finishLocally(chatID: String) {
+    private func finishLocally(chatID: String, gen: Int) {
+        guard gen == runGeneration else { return }
         run?.cancel()
         post?.cancel()
         post = nil
@@ -824,11 +855,20 @@ public final class ConversationModel {
     /// Gives up on the local view of a run — used when the app goes to the
     /// background, where the socket will be cut anyway.
     public func abandon() {
+        // Give up on the current run *before* anything else: the run's own
+        // unwinding (its drain returning, its post catch firing) now sees a
+        // stale generation and stays inert instead of poisoning the next run
+        // (issue #11).
+        runGeneration += 1
         run?.cancel()
         post?.cancel()
         post = nil
         if let index = turns.lastIndex(where: \.isAssistant) { turns[index].streaming = false }
         phase = .ready
+        // The abandoned run's exchange returns at its first generation guard and
+        // never reaches its own ribbon `finish`, so close it here. `finish`
+        // no-ops on a nil activity, so this is safe even when nothing was raised.
+        Task { await GenerationActivity.shared.finish(.stopped, characters: 0) }
     }
 
     // MARK: - the exchange
@@ -959,7 +999,12 @@ public final class ConversationModel {
             .map { fileRow(id: $0.id, name: $0.name, mimeType: $0.mimeType) }
     }
 
-    private func exchange(text: String, regenerating: String?, files: [PendingAttachment]) async {
+    private func exchange(text: String, regenerating: String?, files: [PendingAttachment], gen: Int) async {
+        // G1: superseded during the caller's pre-exchange await (send's upload
+        // wait, edit's updateMessage). Nothing below is ours to write — not
+        // even the model guard's error: that banner belongs to the run that
+        // owns the model now.
+        guard isCurrent(gen) else { return }
         guard !model.isEmpty else {
             error = "No model selected."
             return
@@ -974,10 +1019,19 @@ public final class ConversationModel {
         do {
             chat = try await ensureChat(named: text)
         } catch {
+            // G2: superseded during `ensureChat`. A stale failure banner and a
+            // `.ready` that flips the *new* run back to idle are both writes we
+            // no longer own.
+            guard isCurrent(gen) else { return }
             self.error = error.localizedDescription
             phase = .ready
             return
         }
+
+        // G3: superseded during `ensureChat`'s success hop. Everything from here
+        // to the `await drain` runs without a suspension, so this one guard also
+        // covers the `postFailureMessage` clear and the `post = Task` slot write.
+        guard isCurrent(gen) else { return }
 
         let userMessageID = regenerating ?? UUID().uuidString
         let assistantID = UUID().uuidString
@@ -1107,6 +1161,12 @@ public final class ConversationModel {
         }
 
         var outcome = await drain(frames, assistantID: assistantID, index: assistantIndex)
+        // G4 — the core of issue #11. A superseded run returning from its drain
+        // must not cancel the *next* run's POST slot, roll its transcript back,
+        // or drive its phase. The early return covers the whole post-drain
+        // cluster: slot writes, `leafID`, the #9 rollback block, and the parked
+        // `.ready` branch.
+        guard isCurrent(gen) else { return }
         post?.cancel()
         post = nil
 
@@ -1207,6 +1267,8 @@ public final class ConversationModel {
                 // server closes the message, parks on a question, or the answer
                 // genuinely stops growing.
                 await reconcileUntilClosed(messageID: assistantID)
+                // G5: superseded during the reconcile fetch.
+                guard isCurrent(gen) else { return }
                 let settled = turns.first(where: { $0.id == assistantID })?.text ?? ""
                 if settled.isEmpty {
                     // "The server sent nothing" is an accusation, and it was
@@ -1237,6 +1299,8 @@ public final class ConversationModel {
             // made worse by it.
             if outcome.failure == nil && !outcome.parked {
                 await reconcileUntilClosed(messageID: assistantID)
+                // G6: superseded during the post-run reconcile fetch.
+                guard isCurrent(gen) else { return }
                 leafID = assistantID
             }
             // Once the run is genuinely over nothing is parked any more. Not
@@ -1252,6 +1316,12 @@ public final class ConversationModel {
                 await awaitGeneratedTitle(chat: adopted)
             }
         }
+        // G7: superseded during the terminal block's last await. Everything
+        // below — the error stamp, `markChatRead`, the ribbon finish, the
+        // completion notification (no banner for an abandoned run), the
+        // streaming flag and `.ready` — belongs to the run that owns the state
+        // now, not this one.
+        guard isCurrent(gen) else { return }
         // An error that arrived alongside a real answer is noise about how the
         // answer was produced, not a reason to hide it. Only surface it when
         // there is genuinely nothing to show.
@@ -1383,6 +1453,15 @@ public final class ConversationModel {
         }
         let watchdog = Task { [hub] in
             try? await Task.sleep(for: Self.silenceLimit)
+            // Cancellation must stand the watchdog down, not fire it — the
+            // same `if !Task.isCancelled` gate the grace tasks below use.
+            // Without it, `try?` swallows the cancellation this task gets at
+            // the end of every drain and `expire` runs immediately, finishing
+            // EVERY listener for the chat — including a newer run's, when an
+            // abandoned run's drain unwinds after that newer run subscribed
+            // (issue #11). The listener this run installed is cleaned up
+            // anyway when `exchange` drops the stream.
+            guard !Task.isCancelled else { return }
             hub.expire(chatID: chatID ?? "")
         }
 
@@ -1485,11 +1564,27 @@ public final class ConversationModel {
         grace?.cancel()
         flusher.cancel()
 
-        var finished = pending ?? Turn(id: assistantID, role: "assistant")
-        finished.streaming = false
-        finished.error = outcome.failure
-        flush(finished, into: index, final: true)
-        pending = nil
+        // `pending` is model-level, and a superseded run's drain can return
+        // here only after a newer run has installed its own buffer — the
+        // flusher's `publishPending` already refuses foreign buffers on this
+        // same id check. Flushing a foreign buffer into THIS run's index and
+        // then nil-ing it moved the newer run's text into the abandoned turn
+        // and left the newer turn empty (issue #11). When the buffer is not
+        // ours, take what is already on screen as the result (the abandoning
+        // path already settled its streaming flag) and leave the buffer to
+        // the run that owns it.
+        let finished: Turn
+        if pending?.id == assistantID, let buffer = pending {
+            var flushed = buffer
+            flushed.streaming = false
+            flushed.error = outcome.failure
+            flush(flushed, into: index, final: true)
+            pending = nil
+            finished = flushed
+        } else {
+            finished = turns.first(where: { $0.id == assistantID })
+                ?? Turn(id: assistantID, role: "assistant")
+        }
         // Sources are not streamed as deltas — the server attaches them when it
         // saves the message. Without this a citation only appeared after leaving
         // and re-entering the chat, which reads as the feature being broken.
@@ -1625,6 +1720,8 @@ public final class ConversationModel {
         // Subscribe before the POST: the resumed run can emit before the
         // response comes back, and the socket does not replay.
         let frames = hub.frames(for: chat)
+        // NOTE: this Task is generation-unaware (it does not capture/check a run
+        // generation) — deliberately left so pending issue #12.
         Task { [weak self] in
             guard let self else { return }
             do {
