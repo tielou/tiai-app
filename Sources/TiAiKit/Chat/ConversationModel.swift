@@ -218,19 +218,26 @@ public final class ConversationModel {
         hub.sessionID.map { "temporary:\($0)" }
     }
 
+    /// The Live Activity ribbon. Defaults to the process singleton — one
+    /// ribbon app-wide — but is injectable so tests can drive two models that
+    /// share one ribbon without racing every other test's use of `.shared`.
+    private let activity: GenerationActivity
+
     public init(
         chatID: String?,
         title: String = "New Chat",
         models: [ChatModel] = [],
         incognito: Bool = false,
         client: OWUIClient,
-        hub: ChatEventHub
+        hub: ChatEventHub,
+        activity: GenerationActivity = .shared
     ) {
         self.incognito = incognito
         self.chatID = chatID
         self.title = title
         self.client = client
         self.hub = hub
+        self.activity = activity
         self.models = models
         modelIDs = models.map(\.id)
         model = models.first?.id ?? ""
@@ -641,8 +648,8 @@ public final class ConversationModel {
         // still queued behind this task and no-ops on a nil activity —
         // leaving an orphaned "Waiting" ribbon when the start finally runs.
         let ribbon = Task { @MainActor in
-            await GenerationActivity.shared.start(chatTitle: ribbonTitle,
-                                                 model: ribbonModel, chatID: ribbonChat)
+            await activity.start(chatTitle: ribbonTitle,
+                                 model: ribbonModel, chatID: ribbonChat)
         }
         run = Task {
             // Taken *after* the wait, because until the upload answers there is
@@ -689,7 +696,7 @@ public final class ConversationModel {
                 // queue. Await it first, then close the ribbon directly —
                 // this task already runs on the main actor.
                 await ribbon.value
-                await GenerationActivity.shared.finish(.stopped, characters: 0)
+                await activity.finish(.stopped, characters: 0, chatID: chatID)
                 return
             }
             let files = self.attachments
@@ -945,7 +952,10 @@ public final class ConversationModel {
         // The abandoned run's exchange returns at its first generation guard and
         // never reaches its own ribbon `finish`, so close it here. `finish`
         // no-ops on a nil activity, so this is safe even when nothing was raised.
-        Task { await GenerationActivity.shared.finish(.stopped, characters: 0) }
+        // The owner token still gates it: an orphaned model abandoning must not
+        // end a ribbon another chat raised (issue #15).
+        let ribbonOwner = chatID
+        Task { await activity.finish(.stopped, characters: 0, chatID: ribbonOwner) }
     }
 
     // MARK: - the exchange
@@ -1316,7 +1326,7 @@ public final class ConversationModel {
             // `send` raised the Live Activity ribbon; this early return skips
             // the `finish` at the end of the exchange, so close it here —
             // again mirroring the upload-abort path.
-            await GenerationActivity.shared.finish(.stopped, characters: 0)
+            await activity.finish(.stopped, characters: 0, chatID: chatID)
             // The early return also skips the `emptyAnswerFailure` path below,
             // which would overwrite the real cause with "The server sent
             // nothing." — the misattribution this rollback exists to fix.
@@ -1409,9 +1419,10 @@ public final class ConversationModel {
         // server reads as "unread". Marking read on open is not enough for a chat
         // the app both asked and answered — nobody else needs to be told about it.
         if let chat = chatID, outcome.failure == nil { hub.markChatRead(chat) }
-        await GenerationActivity.shared.finish(
+        await activity.finish(
             outcome.failure == nil ? .finished : .stopped,
-            characters: turns.first(where: { $0.id == assistantID })?.text.count ?? 0)
+            characters: turns.first(where: { $0.id == assistantID })?.text.count ?? 0,
+            chatID: chatID)
         if outcome.failure == nil {
             // Only worth saying when nobody is watching: announcing an answer the
             // user is already reading is worse than silence, and the notifier
@@ -1550,9 +1561,10 @@ public final class ConversationModel {
             if let delta = frame.delta { pending?.text += delta }
             if let thinking = frame.reasoningDelta { pending?.reasoning += thinking }
             if let pending {
-                await GenerationActivity.shared.update(
+                await activity.update(
                     phase: pending.text.isEmpty ? .thinking : .writing,
-                    characters: pending.text.count)
+                    characters: pending.text.count,
+                    chatID: chatID)
             }
             if let usage = frame.usage { pending?.usage = usage }
             // The server's own summary for the chat, when it got one mid-run.
