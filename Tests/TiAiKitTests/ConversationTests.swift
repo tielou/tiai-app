@@ -1997,6 +1997,77 @@ enum AskUserFixture {
     }
 }
 
+// Issue #14: a pull-to-refresh mid-run rebuilds `turns` wholesale — `load()`
+// neither bumps the generation nor cancels the run, and it must not have to.
+// Every write the stream performs resolves its destination by message id at
+// write time, so a reloaded tree that inserts an older exchange and shifts
+// every captured integer cannot redirect the stream onto another row.
+@Test @MainActor func reloadMidRunCannotRedirectTheStreamToAnotherTurn() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-14-reload", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"),
+                           transport: transport),
+        hub: hub)
+
+    conversation.draft = "second question"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-14-reload", messageID: id, inner: [
+        "choices": [["index": 0, "delta": ["content": "first half, "]]],
+    ]))
+    try await waitUntil { conversation.turns.last?.text.contains("first half") == true }
+
+    // Reload mid-run. The server's tree now carries an older exchange the
+    // local array never saw — someone answered in the web UI — so the
+    // streaming assistant sits two rows deeper than any captured index
+    // remembers. The record is still open, exactly as a refresh during a
+    // live run finds it.
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-14-reload","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"\(id)","messages":{
+       "old-user":{"id":"old-user","role":"user","content":"older question","done":true,"parentId":null,"childrenIds":["old-assistant"]},
+       "old-assistant":{"id":"old-assistant","role":"assistant","content":"older answer","model":"local-personal","done":true,"parentId":"old-user","childrenIds":["user-1"]},
+       "user-1":{"id":"user-1","role":"user","content":"second question","done":true,"parentId":"old-assistant","childrenIds":["\(id)"]},
+       "\(id)":{"id":"\(id)","role":"assistant","content":"first half, ","model":"local-personal","done":false,"parentId":"user-1","childrenIds":[]}}}}}
+    """.utf8)
+    await conversation.load()
+    #expect(conversation.turns.count == 4)
+    #expect(conversation.turns.firstIndex(where: { $0.id == id }) == 3,
+            "the stream's turn moved out from under it")
+
+    // The stream keeps going after the shift and ends normally.
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-14-reload", messageID: id, inner: [
+        "choices": [["index": 0, "delta": ["content": "second half."]]],
+    ]))
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-14-reload", messageID: id,
+                              inner: ["choices": [["index": 0, "finish_reason": "stop"]]]))
+    // The server closes the record about when the stream does; leaving it
+    // open would make the post-run reconcile poll for its whole five-minute
+    // budget before the run reports ready.
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-14-reload","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"\(id)","messages":{
+       "old-user":{"id":"old-user","role":"user","content":"older question","done":true,"parentId":null,"childrenIds":["old-assistant"]},
+       "old-assistant":{"id":"old-assistant","role":"assistant","content":"older answer","model":"local-personal","done":true,"parentId":"old-user","childrenIds":["user-1"]},
+       "user-1":{"id":"user-1","role":"user","content":"second question","done":true,"parentId":"old-assistant","childrenIds":["\(id)"]},
+       "\(id)":{"id":"\(id)","role":"assistant","content":"first half, ","model":"local-personal","done":true,"parentId":"user-1","childrenIds":[]}}}}}
+    """.utf8)
+    try await waitUntil(timeout: .seconds(8)) { conversation.phase == .ready }
+
+    // The stored record above deliberately stays SHORTER than the stream: the
+    // grow-only reconcile would happily copy it up, so this assertion only
+    // passes if the live flush itself landed on this turn.
+    let mine = try #require(conversation.turns.first { $0.id == id })
+    #expect(mine.text == "first half, second half.")
+    #expect(!mine.streaming)
+    let older = try #require(conversation.turns.first { $0.id == "old-assistant" })
+    #expect(older.text == "older answer", "a shifted row must not be overwritten by the stream")
+}
+
 // A long flight of newlines in a message renders as a tall empty column, which
 // reads as the end of the chat and is the same habit the web renderer has.
 @Test func runsOfBlankLinesCollapseToOne() {

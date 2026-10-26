@@ -920,11 +920,11 @@ public final class ConversationModel {
         // And `pending` must NOT be nilled here: drain's final flush reads it
         // (`var finished = pending ?? Turn(...)`), so clearing it would flush an
         // empty Turn over the text published just above.
-        if let pending, let at = bufferIndex {
+        if let pending, bufferIndex != nil {
             // The non-final flush flips `.stopping` back to `.streaming` when
             // the buffer is non-empty (`flush`'s phase rule); unobservable —
             // `phase = .ready` follows in the same synchronous main-actor turn.
-            publishPending(keeping: pending.id, index: at)
+            publishPending(keeping: pending.id)
         }
         phase = .ready
     }
@@ -949,11 +949,6 @@ public final class ConversationModel {
     }
 
     // MARK: - the exchange
-
-    private struct Located {
-        var turn: Turn
-        var index: Int
-    }
 
     /// Whether the current model can be shown a picture at all.
     ///
@@ -1158,7 +1153,6 @@ public final class ConversationModel {
         }
         let history = wireHistory(through: userMessageID, content: content)
         turns.append(Turn(id: assistantID, role: "assistant", streaming: true))
-        let assistantIndex = turns.count - 1
 
         // A socket that died in the background, or never came up because the
         // phone was mid-handover when the chat opened, would otherwise send
@@ -1241,7 +1235,7 @@ public final class ConversationModel {
             }
         }
 
-        var outcome = await drain(frames, assistantID: assistantID, index: assistantIndex)
+        var outcome = await drain(frames, assistantID: assistantID)
         // G4 — the core of issue #11. A superseded run returning from its drain
         // must not cancel the *next* run's POST slot, roll its transcript back,
         // or drive its phase. The early return covers the whole post-drain
@@ -1505,7 +1499,6 @@ public final class ConversationModel {
     private func drain(
         _ frames: AsyncStream<ChatEventSocket.Frame>,
         assistantID: String,
-        index: Int,
         continuing: Bool = false
     ) async -> DrainOutcome {
         var outcome = DrainOutcome()
@@ -1529,7 +1522,7 @@ public final class ConversationModel {
             while !Task.isCancelled {
                 try? await Task.sleep(for: self?.flushInterval ?? Self.flushInterval)
                 guard !Task.isCancelled else { return }
-                self?.publishPending(keeping: assistantID, index: index)
+                self?.publishPending(keeping: assistantID)
             }
         }
         let watchdog = Task { [hub] in
@@ -1659,7 +1652,7 @@ public final class ConversationModel {
             var flushed = buffer
             flushed.streaming = false
             flushed.error = outcome.failure
-            flush(flushed, into: index, final: true)
+            flush(flushed, final: true)
             pending = nil
             finished = flushed
         } else {
@@ -1858,7 +1851,7 @@ public final class ConversationModel {
             // run's is exactly the buffer hijack #11 fixed for `exchange`
             // (the newer run's deltas would land in the abandoned turn).
             guard self.isCurrent(gen) else { return }
-            var outcome = await self.drain(frames, assistantID: messageID, index: index, continuing: true)
+            var outcome = await self.drain(frames, assistantID: messageID, continuing: true)
             // R4: the mirror of exchange's G4. Everything from here — the
             // parked `.ready`, the refresh, `leafID`, the calls reconcile and
             // the error stamp — belongs to the run that owns the state now.
@@ -2109,16 +2102,39 @@ public final class ConversationModel {
 
     /// Publishes whatever has arrived. Runs on the flush timer, so it must not
     /// invent a turn if the run has already been replaced (a regenerate, say).
-    private func publishPending(keeping id: String, index: Int) {
+    /// The index the callers used to pass is gone on purpose (issue #14):
+    /// `flush` resolves the destination by id at write time, so a mid-run
+    /// `load()` rebuilding `turns` cannot redirect this write to another turn.
+    private func publishPending(keeping id: String) {
         guard let pending, pending.id == id else { return }
-        flush(pending, into: index)
+        flush(pending)
     }
 
     /// Publishes buffered text. Only touches `turns` on a flush, so the view
     /// diffs at ~16 Hz instead of once per token.
-    private func flush(_ source: Turn, into index: Int, final: Bool = false) {
-        guard index < turns.count else { return }
-        var turn = turns[index]
+    ///
+    /// The destination is resolved by message id at write time, never by a
+    /// captured array index (issue #14). A pull-to-refresh mid-run calls
+    /// `load()`, which neither bumps the generation nor cancels the run, and
+    /// `apply` rebuilds `turns` wholesale — a server tree with more or fewer
+    /// turns than the local array shifts everything a captured integer pointed
+    /// at, and the next flush wrote the WRONG turn (an older answer overwritten
+    /// with this run's deltas). The id cannot shift.
+    ///
+    /// When the id is gone — a reload whose server tree does not contain this
+    /// message (yet) — the write is skipped silently, for this run and every
+    /// later flush until some reload puts the turn back. The reloaded tree is
+    /// canonical, and `apply(message, to:)`/`adoptStoredMessage` grow turns
+    /// that exist but never re-add a missing one — the streamed text is safe
+    /// on the server and the next reload shows it, but nothing in this
+    /// session re-attaches the row (filed: reconcile should insert a turn the
+    /// server has and `turns` lacks). Appending here would invent a turn the
+    /// server tree does not have mid-run, twice over if the reload lands
+    /// again. The `firstIndex` scan runs once per flush tick (~16 Hz), not per
+    /// frame; transcript arrays are tens of entries, so the scan is noise.
+    private func flush(_ source: Turn, final: Bool = false) {
+        guard let at = turns.firstIndex(where: { $0.id == source.id }) else { return }
+        var turn = turns[at]
         turn.text = source.text
         turn.reasoning = source.reasoning
         turn.usage = source.usage ?? turn.usage
@@ -2130,7 +2146,7 @@ public final class ConversationModel {
         if !source.calls.isEmpty { turn.calls = source.calls }
         if !source.sources.isEmpty { turn.sources = source.sources }
         turn.streaming = final ? false : turn.streaming
-        turns[index] = turn
+        turns[at] = turn
         if !final && (!source.text.isEmpty || !source.reasoning.isEmpty), phase.isBusy {
             phase = .streaming
         }
