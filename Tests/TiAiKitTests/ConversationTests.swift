@@ -411,6 +411,7 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     private let chatFetchGate = OneShotGate()
     private let stopGate = OneShotGate()
     private let completionGate = OneShotGate()
+    private let resolveGate = OneShotGate()
 
     /// Makes the *next* GET /chats/{id} wait until `releaseChatFetchGate()`.
     func gateNextChatFetch() { chatFetchGate.arm() }
@@ -434,6 +435,15 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     var isCompletionGateParked: Bool { completionGate.isParked }
     /// Resumes the parked completion POST (and disarms an unused gate).
     func releaseCompletion() { completionGate.release() }
+
+    /// Makes the *next* POST …/resolve wait inside the transport until
+    /// `releaseResolve()` — so a test can hold a tool-answer resume open while
+    /// it abandons the run, and only then let the resolve land (issue #12).
+    func gateNextResolve() { resolveGate.arm() }
+    /// True while a resolve POST is parked at the gate.
+    var isResolveGateParked: Bool { resolveGate.isParked }
+    /// Resumes the parked resolve POST (and disarms an unused gate).
+    func releaseResolve() { resolveGate.release() }
 
     /// A one-shot gate: `arm()` makes the next `parkIfArmed()` wait until
     /// `release()`. Cancelling the waiting task does not wake it — see the
@@ -504,6 +514,10 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
             return (Data("{}".utf8), response(for: request, 200))
         }
         if path.hasSuffix("/resolve") {
+            // Park before recording, so `resolveBodies` only grows once the
+            // test has let the request through — the same contract the other
+            // gates keep.
+            await resolveGate.parkIfArmed()
             guarded { _resolveBodies.append(request.httpBody ?? Data()) }
             return (Data(#"{"status":true}"#.utf8), response(for: request, 200))
         }
@@ -1085,6 +1099,74 @@ enum AskUserFixture {
     #expect(conversation.turns.count == 2)  // user + one assistant, not three
     #expect(conversation.turns.last?.text == "Berlin it is.")
     #expect(conversation.turns.last?.awaitingCall == nil)
+}
+
+/// Issue #12: `resolve()` spawns a bare Task that is not stored in `run`, so
+/// neither stop nor abandon can cancel it — it has to police itself by
+/// generation. Abandoning while the resolve POST is parked, then starting a
+/// fresh send, must leave the new run completely untouched once the stale
+/// resolve finally lands.
+@Test @MainActor func abandoningDuringAParkedResolveLeavesTheNextRunClean() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+
+    // Park a run on an ask_user question (same fixture as the parked tests).
+    conversation.draft = "book me a trip"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let firstID = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: firstID,
+        inner: ["done": false, "output": [AskUserFixture.outputItem]]))
+    try await waitUntil { conversation.phase == .ready }
+    let call = try #require(conversation.turns.last?.awaitingCall)
+
+    // Answer it, but hold the resolve POST inside the transport.
+    transport.gateNextResolve()
+    conversation.resolve(
+        messageID: firstID, call: call, action: .answer,
+        answers: .object(["meal": .string("pizza")]))
+    try await waitUntil { transport.isResolveGateParked }
+    #expect(conversation.phase == .streaming)
+
+    // The app goes to the background: abandon bumps the generation, and the
+    // parked resolve Task — untracked, uncancellable — is now superseded.
+    conversation.abandon()
+    #expect(conversation.phase == .ready)
+
+    // A brand-new send starts while the resolve is still parked, and must
+    // stream and finish as if the resolve had never existed.
+    conversation.draft = "second question"
+    conversation.send()
+    try await transport.awaitCompletion(2)
+    let secondID = try #require(transport.assistantMessageID)
+    #expect(secondID != firstID)
+
+    // Let the stale resolve land. It belongs to a dead generation.
+    transport.releaseResolve()
+    // Give the released Task its scheduling hops so a stale implementation
+    // has every chance to stomp before the new run's frames arrive.
+    try await Task.sleep(for: .milliseconds(150))
+
+    for frame in Frames.run(chat: "chat-1", message: secondID, answer: "No need for pizza.") {
+        hub.receive(frame)
+    }
+    try await waitUntil { conversation.phase == .ready }
+
+    // The new run streamed clean: its answer is on its own turn, nothing was
+    // stamped over it, and the abandoned turn kept its own state.
+    #expect(conversation.error == nil)
+    #expect(conversation.turns.count == 4)  // user/assistant/user/assistant
+    #expect(conversation.turns[3].text == "No need for pizza.")
+    #expect(conversation.turns[3].streaming == false)
+    #expect(conversation.turns[1].text != "No need for pizza.")
+
+    // And nothing lands late: a stale resolve writing after the fact is the
+    // bug under test, so the state has to still be clean a beat later.
+    try await Task.sleep(for: .milliseconds(250))
+    #expect(conversation.phase == .ready)
+    #expect(conversation.error == nil)
+    #expect(conversation.turns.count == 4)
+    #expect(conversation.turns[3].text == "No need for pizza.")
 }
 
 @Test func askUserPromptParsesTheRealSchema() {

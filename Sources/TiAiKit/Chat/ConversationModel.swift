@@ -1778,8 +1778,14 @@ public final class ConversationModel {
         // Subscribe before the POST: the resumed run can emit before the
         // response comes back, and the socket does not replay.
         let frames = hub.frames(for: chat)
-        // NOTE: this Task is generation-unaware (it does not capture/check a run
-        // generation) — deliberately left so pending issue #12.
+        // Issue #12: the same call-site capture discipline as #11. This Task is
+        // not stored in `run` — a resume belongs to the run that parked, so
+        // (like `stop`) it must NOT bump the generation; it carries the one it
+        // was started under and stays inert once a send/edit/regenerate or an
+        // abandon has superseded it. Without this, an abandon during a parked
+        // resolve let the resolve's post-await writes — error/phase/leafID and
+        // the `turns` mutations below — land on the *next* run's state.
+        let gen = runGeneration
         Task { [weak self] in
             guard let self else { return }
             do {
@@ -1787,6 +1793,11 @@ public final class ConversationModel {
                     chatID: chat, messageID: messageID, callID: call.callID,
                     action: action, answers: answers)
             } catch let error as APIError {
+                // R1: superseded while the resolve POST was in flight. The
+                // banner, the `.ready` and the 404 branch's refresh all
+                // describe the abandoned run, not the one that owns the state
+                // now.
+                guard self.isCurrent(gen) else { return }
                 // 404 "Tool call not found" after an answer almost never means
                 // the answer was lost — it means the server already took it and
                 // moved on, and this client was holding a stale card. The run
@@ -1798,6 +1809,10 @@ public final class ConversationModel {
                 // two lands on an id that no longer exists.
                 if case .http(404, _) = error {
                     await self.refresh(messageID: messageID)
+                    // R2: superseded during the refetch. Settling the old turn
+                    // and moving the leaf back under it is a write to a
+                    // transcript the new run owns.
+                    guard self.isCurrent(gen) else { return }
                     if let index = self.turns.firstIndex(where: { $0.id == messageID }) {
                         self.turns[index].streaming = false
                     }
@@ -1809,15 +1824,27 @@ public final class ConversationModel {
                 self.phase = .ready
                 return
             } catch {
+                guard self.isCurrent(gen) else { return }  // R1 (same as above)
                 self.error = error.localizedDescription
                 self.phase = .ready
                 return
             }
+            // R3: superseded during the POST's success hop. `drain` is not a
+            // read — it installs this run's buffer into the model-level
+            // `pending`, and a stale resume installing its buffer over a newer
+            // run's is exactly the buffer hijack #11 fixed for `exchange`
+            // (the newer run's deltas would land in the abandoned turn).
+            guard self.isCurrent(gen) else { return }
             var outcome = await self.drain(frames, assistantID: messageID, index: index, continuing: true)
+            // R4: the mirror of exchange's G4. Everything from here — the
+            // parked `.ready`, the refresh, `leafID`, the calls reconcile and
+            // the error stamp — belongs to the run that owns the state now.
+            guard self.isCurrent(gen) else { return }
             if outcome.parked {
                 // Same as the first run: keep looking until the question has
                 // actually landed, because nothing later will fix it.
                 await self.awaitQuestion(messageID: messageID)
+                guard self.isCurrent(gen) else { return }  // R5: superseded mid-refetch
                 self.phase = .ready
                 return
             }
@@ -1833,6 +1860,7 @@ public final class ConversationModel {
             // regardless of which frames we happened to understand.
             if outcome.failure == nil && !outcome.parked {
                 await self.refresh(messageID: messageID)
+                guard self.isCurrent(gen) else { return }  // R6: superseded during the refetch
                 self.leafID = messageID
             }
             if !outcome.parked, let index = self.turns.firstIndex(where: { $0.id == messageID }) {
