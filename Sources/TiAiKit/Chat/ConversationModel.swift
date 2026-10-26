@@ -489,11 +489,63 @@ public final class ConversationModel {
     /// after `waitForUploads()` inside the run, never at the button press.
     private var uploadFailuresAtLastSend = 0
 
-    private func waitForUploads() async {
-        guard !pendingUploads.isEmpty else { return }
+    /// Backstop for a transport that ignores the upload client's own 120s
+    /// URLSession timeout (`OWUIClient.uploadFile`): a hung /files POST must
+    /// not pin send in `.waiting` with the draft already consumed.
+    /// Deliberately ABOVE the transport's bound: in production the URLSession
+    /// timeout should win the race and take the ordinary failure path (a
+    /// real failure message, sticky-failure bookkeeping); this backstop only
+    /// fires for a transport that ignores its own timeout. Tests shrink it;
+    /// production keeps the default.
+    var uploadWaitLimit: Duration = .seconds(125)
+
+    /// Waits for every in-flight upload, bounded by `uploadWaitLimit`.
+    /// Returns true when the deadline fired first. One overall deadline, not
+    /// one per task: uploads run concurrently, so per-task windows would
+    /// multiply. Timed-out upload tasks are deliberately NOT cancelled: if
+    /// the socket is merely slow, a late success re-adds the chip (the user
+    /// can resend), and a late failure takes the existing sticky-failure
+    /// path — cancelling would fake a failure the next send would hold
+    /// against the user.
+    ///
+    /// Two unstructured racers on a once-latched continuation rather than a
+    /// task group: a group joins every child before returning, and a child
+    /// parked on `await task.value` of a hung `Task<Void, Never>` cannot be
+    /// cancelled free (`value` on a never-throwing task does not observe
+    /// cancellation), so the group would never return — the very hang this
+    /// bounds. Residue: the losing racer stays parked — the upload racer on
+    /// an already-hung upload (bounded by URLSession in production), the
+    /// sleeper for the rest of its sleep. Suspended tasks, no CPU; not
+    /// worth the handle-passing machinery to cancel them.
+    private func waitForUploads() async -> Bool {
+        guard !pendingUploads.isEmpty else { return false }
         let waiting = pendingUploads
         pendingUploads = []
-        for task in waiting { _ = await task.value }
+        let limit = uploadWaitLimit
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            let once = ResumeOnce()
+            Task {
+                for task in waiting { _ = await task.value }
+                if once.claim() { continuation.resume(returning: false) }
+            }
+            Task {
+                try? await Task.sleep(for: limit)
+                if once.claim() { continuation.resume(returning: true) }
+            }
+        }
+    }
+
+    /// One-shot latch: whichever racer finishes first claims it and resumes
+    /// the continuation; the other loses and does nothing.
+    private final class ResumeOnce: @unchecked Sendable {
+        private let lock = NSLock()
+        private var claimed = false
+        func claim() -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            if claimed { return false }
+            claimed = true
+            return true
+        }
     }
 
     /// A file the picker handed over and the app could not read.
@@ -595,7 +647,7 @@ public final class ConversationModel {
         run = Task {
             // Taken *after* the wait, because until the upload answers there is
             // no file id to take.
-            await self.waitForUploads()
+            let uploadsTimedOut = await self.waitForUploads()
             // A superseded run (abandoned, or replaced by a newer send while the
             // upload wait was in flight) must not touch state it no longer owns:
             // neither the abort branch below nor the `attachments` steal would
@@ -614,18 +666,24 @@ public final class ConversationModel {
             // the failed file now the user's decision, not the app's.
             let sawNewFailure = uploadFailureCount > uploadFailuresAtLastSend
             uploadFailuresAtLastSend = uploadFailureCount
-            if sawNewFailure {
+            if sawNewFailure || uploadsTimedOut {
                 phase = .ready
                 // Restore only if the draft is still empty: a message typed
                 // during a long `waitForUploads` must not be clobbered by the
                 // text of the send that just aborted.
                 if draft.isEmpty { draft = text }
-                // With no attachment on hand the "remove the failed one" fix
-                // makes no sense — the failure is stale, from before the
-                // press. Name the actual choice.
-                error = attachments.isEmpty
-                    ? "A previous upload failed — press send again to send without it, or re-attach the file."
-                    : "Upload failed — message not sent. Remove the failed attachment and send again."
+                // A timeout outranks a stale failure count: the hung upload
+                // *is* the news, whether or not an older failure is also
+                // sitting in the checkpoint. With no attachment on hand the
+                // "remove the failed one" fix makes no sense — the failure
+                // is stale, from before the press. Name the actual choice.
+                if uploadsTimedOut {
+                    error = "Upload is taking too long — message not sent. Try again in a moment; the file may still arrive."
+                } else {
+                    error = attachments.isEmpty
+                        ? "A previous upload failed — press send again to send without it, or re-attach the file."
+                        : "Upload failed — message not sent. Remove the failed attachment and send again."
+                }
                 // The sticky-failure path never suspends in `waitForUploads`,
                 // so the ribbon raise may still be sitting in the main-actor
                 // queue. Await it first, then close the ribbon directly —

@@ -27,7 +27,10 @@ private func testServer() -> Server {
 /// A transport whose uploads never answer — the window in which a photo is
 /// picked, visible in the composer, and *not yet in* `attachments` because the
 /// file id does not exist until the server replies.
-private final class HangingTransport: APITransport, @unchecked Sendable {
+///
+/// Internal rather than file-private: `ConversationTests` shares this target
+/// and needs the same hung-upload fixture for the bounded-wait test.
+final class HangingTransport: APITransport, @unchecked Sendable {
     private let lock = NSLock()
     private var _completionBodies: [Data] = []
     private let hangUploads: Bool

@@ -866,6 +866,61 @@ extension ChatModel {
     #expect(message.contains("Remove the failed attachment"), "\(message)")
 }
 
+// A /files POST that never answers — a transport ignoring the upload client's
+// own 120s URLSession timeout — must not pin the send in `.waiting` with the
+// draft already consumed. The wait is bounded; on timeout the send aborts in
+// the same shape as the #6 upload-failure abort: draft back, error out loud,
+// nothing posted.
+@Test @MainActor func aHungUploadTimesOutAndRestoresTheSend() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let transport = HangingTransport(hangUploads: true)
+    let conversation = ConversationModel(
+        chatID: nil,
+        models: [ChatModel.stub("local-personal", caps: ["vision": true])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: ChatEventHub(server: server))
+    // Production waits 120s (the URLSession backstop); the test shrinks the
+    // knob rather than sitting out two minutes.
+    conversation.uploadWaitLimit = .milliseconds(150)
+
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "shot.jpg", mimeType: "image/jpeg")
+    // The upload never answers: still "uploading", no chip landed.
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(conversation.uploading)
+    #expect(conversation.attachments.isEmpty)
+
+    conversation.draft = "hello"
+    conversation.send()
+    // The bounded wait fires in ~150ms. Without the bound this never arrives
+    // and waitUntil throws — that is the regression this pins.
+    try await waitUntil(timeout: .seconds(2)) { conversation.phase == .ready }
+
+    #expect(conversation.draft == "hello", "the draft comes back, not into the void")
+    let message = try #require(conversation.error)
+    #expect(message.contains("too long"), "\(message)")
+    #expect(conversation.turns.isEmpty, "no phantom user turn for a send that never posted")
+    #expect(transport.completionBodies.isEmpty, "a timed-out send must not post")
+    // The hung upload is deliberately NOT cancelled — the spinner stays on
+    // and a late success would re-add the chip for a resend. This pins that
+    // decision so a future "cleanup" cannot silently flip it.
+    #expect(conversation.uploading, "the timed-out upload is left running, not faked as failed")
+
+    // Second send with the same hung transport: the timed-out upload was
+    // deliberately NOT cancelled and is no longer in `pendingUploads`, so
+    // the second send does not wait for it — it proceeds with the text
+    // alone (observed: it posts immediately; a late upload success would
+    // re-add the chip for a third press). The requirement is that the chat
+    // is not wedged, and it isn't.
+    conversation.send()
+    try await waitUntil(timeout: .seconds(2)) { !transport.completionBodies.isEmpty }
+    #expect(conversation.phase.isBusy, "the second send is a live run, not a stuck one")
+    // "Proceeds text-only" made concrete: the second completion carries no
+    // file payload and no image block — the hung upload is not half-sent.
+    let body = String(decoding: try #require(transport.completionBodies.last), as: UTF8.self)
+    #expect(!body.contains("shot.jpg"), "no file entry for the hung upload: \(body)")
+    #expect(!body.contains("image_url"), "no image block for bytes that never uploaded: \(body)")
+}
+
 // A camera or fileImporter callback can land while a run is in flight; the
 // pick must not be swept into whatever message sends next.
 @Test @MainActor func attachIsRefusedWhileARunIsInFlight() async throws {
