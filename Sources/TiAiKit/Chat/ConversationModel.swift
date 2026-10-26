@@ -35,6 +35,12 @@ public final class ConversationModel {
     public private(set) var turns: [Turn] = []
     public private(set) var phase: Phase = .ready
     public private(set) var error: String?
+    /// Takes the error banner away. Errors used to clear themselves on the next
+    /// send or on the next successful run, which is fine for a failure that
+    /// fixes itself but not for one the user has already read — a banner that
+    /// outlives its meaning is noise, and the dismiss affordance has to be
+    /// honest about what it dismisses (issue #9).
+    public func dismissError() { error = nil }
     public private(set) var title: String
     /// Nil until the chat exists. It is set by `createChat`, not by the caller —
     /// a new conversation learns its own id mid-send.
@@ -76,6 +82,12 @@ public final class ConversationModel {
     private let hub: ChatEventHub
     private var run: Task<Void, Never>?
     private var post: Task<Void, Never>?
+    /// The message of a completion POST that failed while the run was still
+    /// `.waiting` with not a single frame seen. Set by `recordPostError`,
+    /// consumed by `exchange` after the drain to roll the phantom send back
+    /// (issue #9), and cleared before every new POST so a stale failure can
+    /// never poison the next run.
+    private var postFailureMessage: String?
     /// The message the next reply will be filed under. Tracked explicitly rather
     /// than derived from `turns`, because "the last thing in the tree" is exactly
     /// the thing regenerate and edit change.
@@ -953,6 +965,11 @@ public final class ConversationModel {
             return
         }
         phase = .waiting
+        // A rollback (issue #9) puts a brand-new chat back exactly where the
+        // send found it, and `ensureChat` is the thing that renames a new chat
+        // after the first message — so the pre-send name is captured here.
+        let titleBeforeSend = title
+        let placeholderBeforeSend = titleIsPlaceholder
         let chat: String
         do {
             chat = try await ensureChat(named: text)
@@ -1072,9 +1089,21 @@ public final class ConversationModel {
         // Blocks for the whole generation and yields no body; what is left for it
         // to do is fail loudly (401, 429) and to close. The task inherits this
         // actor's isolation, so reporting from it needs no hop.
+        // A failure recorded by an earlier run must never be mistaken for
+        // this one's (issue #9).
+        postFailureMessage = nil
         post = Task {
             do { try await self.client.stream(request).drain() }
-            catch { self.recordPostError(error) }
+            catch {
+                // The normal end of a run cancels this task while the POST is
+                // still open — the completion stays in flight until the server
+                // closes it — and the cancellation surfaces as a throw here.
+                // Recording it stamped a spurious error onto a run that had
+                // just finished, and (issue #9) could set the rollback flag of
+                // the *next* run through the shared `phase.isBusy` guard.
+                if Task.isCancelled { return }
+                self.recordPostError(error)
+            }
         }
 
         var outcome = await drain(frames, assistantID: assistantID, index: assistantIndex)
@@ -1092,6 +1121,70 @@ public final class ConversationModel {
             // unreadable has nothing that will ever fix it.
             await awaitQuestion(messageID: assistantID)
             phase = .ready
+            return
+        }
+        // Issue #9: the POST itself failed — dead server, refused request,
+        // signed out — before the run produced a single frame. The exchange
+        // never reached the server, so the local user turn and the empty
+        // assistant placeholder are a fiction: the transcript showed a
+        // question with a dead bubble under a banner that cleared itself.
+        // Roll the send back — drop both turns, put the message and its
+        // attachments back in the composer, and leave a persistent,
+        // dismissible error saying what actually happened.
+        //
+        // The gates are the whole point:
+        // - `postFailureMessage != nil` — only a POST that failed while
+        //   `.waiting` with no frames sets it (see `recordPostError`);
+        // - `regenerating == nil` — a regenerate/edit failure must not eat the
+        //   pre-existing user turn it was re-running;
+        // - `phase == .waiting` — a stop (`.stopping`) and a mid-stream drop
+        //   (`.streaming`) are different stories with their own handling;
+        // - `!outcome.sawAnyFrame` — once any frame for this message arrived
+        //   the server knows about the exchange, and rolling back would lie
+        //   about what was sent.
+        if let message = postFailureMessage, regenerating == nil,
+           phase == .waiting, !outcome.sawAnyFrame {
+            postFailureMessage = nil
+            // By id, not index: nothing else should have moved the array, but
+            // id-matching cannot eat the wrong turn if something did.
+            turns.removeAll { $0.id == userMessageID || $0.id == assistantID }
+            // Same rule as the upload-abort path in `send` (the established
+            // precedent for putting a send back): a message typed while the
+            // POST was in flight must not be clobbered by the rollback.
+            // The draft and the attachments are tracked separately, because
+            // the draft is editable mid-run: a user who re-typed while the
+            // POST was in flight has their new text left untouched (correct —
+            // the same no-clobber rule as above) and the failed text is
+            // silently dropped. Claiming "It's back in the composer" then
+            // would be a lie the rollback has no way to make true.
+            var restoredDraft = false
+            var restoredAttachments = false
+            if draft.isEmpty { draft = text; restoredDraft = true }
+            // `!files.isEmpty`: a text-only send has nothing to put back —
+            // claiming "Attachments are back" for an empty list would be the
+            // same lie the separate flags exist to prevent.
+            if attachments.isEmpty, !files.isEmpty { attachments = files; restoredAttachments = true }
+            // "Could not send — Signed out." reads wrong; the 401 already
+            // has its own plain sentence, so it stands alone.
+            var banner = message == "Signed out." ? message : "Could not send — \(message)."
+            if restoredDraft { banner += " It's back in the composer." }
+            else if restoredAttachments { banner += " Attachments are back; re-type and send again." }
+            error = banner
+            if chatID == nil {
+                // A new chat that never learned an id never existed; put the
+                // name back the way it was before the send named it after the
+                // failed message.
+                title = titleBeforeSend
+                titleIsPlaceholder = placeholderBeforeSend
+            }
+            phase = .ready
+            // `send` raised the Live Activity ribbon; this early return skips
+            // the `finish` at the end of the exchange, so close it here —
+            // again mirroring the upload-abort path.
+            await GenerationActivity.shared.finish(.stopped, characters: 0)
+            // The early return also skips the `emptyAnswerFailure` path below,
+            // which would overwrite the real cause with "The server sent
+            // nothing." — the misattribution this rollback exists to fix.
             return
         }
         if outcome.sawTerminal {
@@ -1244,6 +1337,11 @@ public final class ConversationModel {
         /// because nothing more will arrive until they do.
         var parked = false
         var failure: String?
+        /// True once any frame belonging to *this* assistant message has been
+        /// handled — even one with no text (an `ask_user` call, a bare title
+        /// event) counts: it is proof the server knows about the exchange,
+        /// which is the question a rollback asks (issue #9).
+        var sawAnyFrame = false
     }
 
     /// Drains frames for one assistant message until the run ends, is stopped,
@@ -1293,6 +1391,9 @@ public final class ConversationModel {
         var grace: Task<Void, Never>?
         for await frame in frames {
             if let messageID = frame.messageID, messageID != assistantID { continue }
+            // Only frames for this message count — the filter above is what
+            // makes that true, so the flag goes directly under it (issue #9).
+            outcome.sawAnyFrame = true
             if let delta = frame.delta { pending?.text += delta }
             if let thinking = frame.reasoningDelta { pending?.reasoning += thinking }
             if let pending {
@@ -1771,8 +1872,30 @@ public final class ConversationModel {
     /// that a failure would be a lie the user cannot act on.
     private func recordPostError(_ error: Error) {
         guard phase.isBusy else { return }
-        if let api = error as? APIError, api.isUnauthorized { self.error = "Signed out." }
-        else { self.error = error.localizedDescription }
+        let message: String
+        if let api = error as? APIError, api.isUnauthorized { message = "Signed out." }
+        else { message = error.localizedDescription }
+        self.error = message
+        // Issue #9: a POST that dies before the first frame means the exchange
+        // never reached the server, and `exchange` needs to know that — by
+        // message, because the banner above will be overwritten by the drain's
+        // own guess — so it can roll the send back.
+        if phase == .waiting {
+            postFailureMessage = message
+            // Unblock the drain: nothing will ever arrive on this run's
+            // listener now. An existing chat's listener is keyed by id, and
+            // `expire(chatID:)` reaches it. A new chat's `framesAwaitingChatID`
+            // listener has chatID nil, which `expire(chatID: "")` never
+            // matches, so it needs `expireWaitingListeners` — without it that
+            // drain sat out the 60 s silence watchdog and then reported
+            // "The server sent nothing." But the sweep is global and the hub
+            // is shared per server (`SessionStore`): firing it on an existing
+            // chat's failure would expire OTHER conversations' pending
+            // new-chat listeners, so it runs only in the one case that needs
+            // it — the nil-chatID listener of a brand-new chat.
+            hub.expire(chatID: chatID ?? "")
+            if chatID == nil { hub.expireWaitingListeners() }
+        }
     }
 
     /// Text accumulated from the socket but not yet published.

@@ -184,11 +184,27 @@ public struct ConversationView: View {
                     // question is known, and re-running it is the same operation
                     // the toolbar's regenerate already does. Not offered while
                     // busy, because a second run would collide with the first.
+                    // And not while the draft holds text: after a failed-send
+                    // rollback (issue #9) the composer carries the message that
+                    // never got out, and regenerating would re-run the PREVIOUS
+                    // message as a fork — the wrong action entirely. The right
+                    // action there is pressing send again.
                     if !conversation.phase.isBusy,
+                        conversation.draft.isEmpty,
                         conversation.turns.contains(where: \.isUser) {
                         Button("Retry") { conversation.regenerate() }
                             .font(.footnote)
                     }
+                    // A banner the user has read has served its purpose; one
+                    // that only goes away on the next send is a permanent
+                    // smear of red (issue #9).
+                    Button {
+                        conversation.dismissError()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityLabel("Dismiss error")
                 }
                 .padding(.horizontal)
                 .padding(.vertical, 6)

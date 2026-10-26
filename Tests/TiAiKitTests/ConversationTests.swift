@@ -359,6 +359,15 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     private var _chatDetailOverride: Data?
     private var _chatDetailQueue: [Data] = []
     private var _failUploads = false
+    private var _completionFailure: Error?
+
+    /// When set, the completion POST throws this instead of returning the
+    /// never-ending stream — the failed-POST path of issue #9. Settable so a
+    /// test can arm the failure at a chosen moment (mid-stream, parked, stop).
+    var completionFailure: Error? {
+        get { guarded { _completionFailure } }
+        set { guarded { _completionFailure = newValue } }
+    }
 
     /// When set, POST /files throws — the failed-upload path. Settable so a
     /// test can let the first upload land and fail the second.
@@ -401,6 +410,7 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     // expose would be papered over.
     private let chatFetchGate = OneShotGate()
     private let stopGate = OneShotGate()
+    private let completionGate = OneShotGate()
 
     /// Makes the *next* GET /chats/{id} wait until `releaseChatFetchGate()`.
     func gateNextChatFetch() { chatFetchGate.arm() }
@@ -414,6 +424,16 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     func gateNextStop() { stopGate.arm() }
     /// Resumes the parked stop request (and disarms an unused gate).
     func releaseStopGate() { stopGate.release() }
+
+    /// Makes the *next* completion POST wait inside the transport until
+    /// `releaseCompletion()` — so a test can hold the POST open while it puts
+    /// the run into a chosen state (streaming, parked, stopping) and only then
+    /// let the POST fail there.
+    func gateNextCompletion() { completionGate.arm() }
+    /// True while a completion POST is parked at the gate.
+    var isCompletionGateParked: Bool { completionGate.isParked }
+    /// Resumes the parked completion POST (and disarms an unused gate).
+    func releaseCompletion() { completionGate.release() }
 
     /// A one-shot gate: `arm()` makes the next `parkIfArmed()` wait until
     /// `release()`. Cancelling the waiting task does not wake it — see the
@@ -506,6 +526,10 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
             _paths.append(path)
             _completionBodies.append(request.httpBody ?? Data())
         }
+        // Park first (issue #9 tests: the failure must land at a chosen point
+        // of the run, not the instant the POST goes out), then fail if armed.
+        await completionGate.parkIfArmed()
+        if let failure = guarded { _completionFailure } { throw failure }
         // The real one stays open for the whole generation and yields nothing;
         // an empty stream that ends at once would let a bug that ignores the
         // socket look correct, so it stays open until cancelled.
@@ -2546,4 +2570,336 @@ private func fileIDImageChatDetail(chatID: String) -> Data {
     let stored = try storedUserMessage(afterCompletionBody: body)
     #expect(stored.contentImageURLs == ["file_id://file-shot"])
     expectStoredImage(stored, "file_id:// regenerate")
+}
+
+// MARK: - issue #9: a POST that fails before the first frame rolls the send back
+//
+// The completion POST stays open for the whole generation, so "the POST threw"
+// means different things at different moments. Before any frame it means the
+// exchange never reached the server — the local user turn and the empty
+// assistant placeholder are a fiction, and leaving them behind showed the user
+// a question with a dead bubble under a self-clearing banner. The rollback:
+// drop both turns, put the message and its attachments back in the composer,
+// and leave a persistent, dismissible error. It must NOT fire on a stop, a
+// mid-stream drop, or a parked run — each of those has its own story.
+
+/// The shared setup: a conversation on a scripted transport whose completion
+/// POST can be made to fail at a chosen moment.
+@MainActor
+private func makePostFailureFixture(chatID: String?) -> (
+    ConversationModel, ScriptedTransport, ChatEventHub
+) {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: chatID,
+        models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub)
+    return (conversation, transport, hub)
+}
+
+@Test @MainActor func rollbackFiresOnNewChatPostFailure() async throws {
+    let (conversation, transport, _) = makePostFailureFixture(chatID: nil)
+    transport.completionFailure = APIError.unreachable("connection reset")
+
+    conversation.draft = "hi"
+    conversation.attach(
+        data: Data([0xFF, 0xD8, 0xFF]), name: "shot.jpg", mimeType: "image/jpeg")
+    try await waitUntil { conversation.attachments.count == 1 }
+
+    conversation.send()
+    // This wait IS the regression. A new chat's `framesAwaitingChatID`
+    // listener has chatID nil; the 60 s silence watchdog expires "" and never
+    // matches it. Without `expireWaitingListeners` in `recordPostError` this
+    // times out — the run hangs forever on a POST that already failed.
+    try await waitUntil { conversation.phase == .ready }
+
+    #expect(conversation.turns.isEmpty,
+            "a POST that never reached the server must not leave phantom turns behind")
+    #expect(conversation.draft == "hi", "the failed message goes back in the composer")
+    #expect(conversation.attachments.count == 1, "and so do its attachments")
+    #expect(conversation.title == "New Chat",
+            "a chat that was never created gets its pre-send name back")
+
+    let error = try #require(conversation.error)
+    #expect(error.contains("Could not send"), "\(error)")
+    #expect(error.contains("connection reset"), "\(error)")
+    #expect(error.contains("back in the composer"), "\(error)")
+    // The drain's empty-answer guess ("The server sent nothing.") must not
+    // overwrite the real cause after the fact either — the rollback returns
+    // before that path runs.
+    try await Task.sleep(for: .milliseconds(150))
+    #expect(conversation.error == error)
+}
+
+@Test @MainActor func rollbackFiresOnExistingChatPostFailure() async throws {
+    let (conversation, transport, _) = makePostFailureFixture(chatID: "chat-1")
+    transport.completionFailure = APIError.http(status: 503, message: "server is restarting")
+
+    conversation.draft = "hi"
+    conversation.send()
+    // The existing-chat regression: without the expire in `recordPostError`
+    // the drain sits out the 60 s watchdog, then `emptyAnswerFailure` stamps
+    // "The server sent nothing." over the true cause.
+    try await waitUntil { conversation.phase == .ready }
+
+    #expect(conversation.turns.isEmpty)
+    #expect(conversation.draft == "hi")
+    let error = try #require(conversation.error)
+    #expect(error.contains("Could not send"), "\(error)")
+    #expect(error.contains("503"), "\(error)")
+    try await Task.sleep(for: .milliseconds(150))
+    #expect(conversation.error == error)
+    #expect(conversation.error?.contains("The server sent nothing") == false)
+}
+
+@Test @MainActor func textOnlyRollbackAfterMidRunRetypeDoesNotClaimTheComposer() async throws {
+    // The draft is editable mid-run. If the user typed while the POST was
+    // in flight, the failed text is dropped (no-clobber wins) and a
+    // text-only send has no attachments to put back — so the banner must
+    // not claim anything came back.
+    let (conversation, transport, _) = makePostFailureFixture(chatID: "chat-1")
+    transport.gateNextCompletion()
+    defer { transport.releaseCompletion() }
+
+    conversation.draft = "the original message"
+    conversation.send()
+    try await transport.awaitCompletion()
+
+    conversation.draft = "something typed while waiting"
+    transport.completionFailure = APIError.http(status: 503, message: "server is restarting")
+    transport.releaseCompletion()
+    try await waitUntil { conversation.phase == .ready }
+
+    #expect(conversation.turns.isEmpty, "the phantom turns are still rolled back")
+    #expect(conversation.draft == "something typed while waiting",
+            "the re-typed text is never clobbered by the failed message")
+    let error = try #require(conversation.error)
+    #expect(error.contains("Could not send"), "\(error)")
+    #expect(error.contains("back in the composer") == false,
+            "nothing was actually restored — the banner must not claim it: \(error)")
+    #expect(error.contains("Attachments are back") == false, "\(error)")
+}
+
+@Test @MainActor func stopDoesNotRollback() async throws {
+    let (conversation, transport, _) = makePostFailureFixture(chatID: "chat-1")
+    transport.gateNextCompletion()
+    defer { transport.releaseCompletion() }
+
+    conversation.draft = "go"
+    conversation.send()
+    try await transport.awaitCompletion()
+
+    conversation.stop()
+    #expect(conversation.phase == .stopping)
+    // The POST dies *after* the stop — with a failure armed, so a rollback
+    // that keyed only on "the POST failed" would fire here. It must not: a
+    // stop is the user ending a real run, not a send that never happened.
+    transport.completionFailure = APIError.unreachable("connection reset")
+    transport.releaseCompletion()
+    try await waitUntil { conversation.phase == .ready }
+
+    #expect(conversation.turns.count == 2, "the user turn and its answer survive a stop")
+    #expect(conversation.draft.isEmpty, "nothing is put back in the composer")
+}
+
+@Test @MainActor func midStreamDropDoesNotRollback() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+    transport.gateNextCompletion()
+    defer { transport.releaseCompletion() }
+
+    conversation.draft = "go"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let assistantID = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: assistantID,
+        inner: ["type": "response.output_text.delta", "delta": "partial answer"]))
+    try await waitUntil { conversation.phase == .streaming }
+
+    transport.completionFailure = APIError.unreachable("connection reset")
+    transport.releaseCompletion()
+    // The drop that takes the POST down also takes the socket with it — in the
+    // test the hub is the socket, so ending the listener is what simulates it.
+    hub.expire(chatID: "chat-1")
+    try await waitUntil { conversation.phase == .ready }
+
+    #expect(conversation.turns.count == 2, "a partial answer is the answer the user got")
+    #expect(conversation.turns.last?.text == "partial answer")
+    #expect(conversation.draft.isEmpty, "a mid-stream drop is not a send that never happened")
+}
+
+@Test @MainActor func parkedRunDoesNotRollback() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+    transport.gateNextCompletion()
+    defer { transport.releaseCompletion() }
+
+    conversation.draft = "book me a trip"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let assistantID = try #require(transport.assistantMessageID)
+    // A delta-less `ask_user` frame parks the run: `phase` goes to `.ready`,
+    // so `recordPostError`'s `isBusy` guard drops the late POST failure long
+    // before the rollback gate is consulted. This test pins the parked-run
+    // guard chain, NOT `sawAnyFrame` — the frame here would satisfy that
+    // flag, but the flag is never reached. The gate itself is pinned by
+    // `seenFrameBeforePostFailureDoesNotRollback`.
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: assistantID,
+        inner: ["done": false, "output": [AskUserFixture.outputItem]]))
+    try await waitUntil { conversation.phase == .ready }
+    #expect(conversation.turns.last?.awaitingCall?.name == "ask_user")
+
+    transport.completionFailure = APIError.unreachable("connection reset")
+    transport.releaseCompletion()
+    // Give the POST's catch a chance to misfire into the rollback.
+    try await Task.sleep(for: .milliseconds(150))
+
+    #expect(conversation.turns.count == 2, "the parked question must survive")
+    #expect(conversation.turns.last?.awaitingCall?.name == "ask_user")
+    #expect(conversation.draft.isEmpty, "nothing is put back in the composer")
+}
+
+@Test @MainActor func seenFrameBeforePostFailureDoesNotRollback() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+    transport.gateNextCompletion()
+    defer { transport.releaseCompletion() }
+
+    conversation.draft = "go"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let assistantID = try #require(transport.assistantMessageID)
+    // A bare ack-style opener: it carries *this* message's id — proof the
+    // server heard the exchange — but it deltas no text and parks no call,
+    // so the phase stays `.waiting`. This is the only state that reaches the
+    // rollback gate with `sawAnyFrame` set: stop, mid-stream and parked are
+    // each blocked by earlier guards. Delete `!outcome.sawAnyFrame` from the
+    // gate and this is the test that goes red.
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: assistantID,
+        inner: ["id": "chatcmpl-1", "object": "chat.completion.chunk",
+                "model": "local-personal",
+                "choices": [["index": 0, "delta": ["content": "", "role": "assistant"]]]]))
+    // Wait for the drain to have *consumed* the frame — proof it was seen,
+    // not a sleep. The frame's model reaches the turn only through the
+    // pending buffer the frame loop filled.
+    try await waitUntil { conversation.turns.last?.model == "local-personal" }
+    #expect(conversation.phase == .waiting,
+            "an empty-content frame must not flip the run to .streaming — that is what makes this the sawAnyFrame test, not another mid-stream one")
+
+    transport.completionFailure = APIError.unreachable("connection reset")
+    transport.releaseCompletion()
+    try await waitUntil { conversation.phase == .ready }
+
+    // No rollback: a frame was seen, so the exchange reached the server and
+    // the transcript is the truth. The drain's own no-answer verdict is fine
+    // here; the rollback's "Could not send" framing would be a lie.
+    #expect(conversation.turns.count == 2, "a seen frame means the server heard the send")
+    #expect(conversation.turns.first?.text == "go")
+    #expect(conversation.draft.isEmpty, "nothing is put back in the composer")
+    #expect(conversation.error?.contains("Could not send") == false,
+            "\(conversation.error ?? "nil")")
+}
+
+@Test @MainActor func unauthorizedPostFailureRollsBackWithSignedOut() async throws {
+    let (conversation, transport, _) = makePostFailureFixture(chatID: "chat-1")
+    transport.completionFailure = APIError.unauthorized
+
+    conversation.draft = "hi"
+    conversation.send()
+    try await waitUntil { conversation.phase == .ready }
+
+    #expect(conversation.turns.isEmpty, "a 401 before any frame is still a send that never happened")
+    #expect(conversation.draft == "hi")
+    let error = try #require(conversation.error)
+    #expect(error.contains("Signed out."), "\(error)")
+    // "Could not send — Signed out." read wrong; the 401 stands alone,
+    // unwrapped, with only the composer note appended.
+    #expect(error.hasPrefix("Signed out."), "\(error)")
+    #expect(!error.contains("Could not send"), "\(error)")
+}
+
+@Test @MainActor func regeneratePostFailureKeepsTurns() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+
+    conversation.draft = "first"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let firstAssistant = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: firstAssistant,
+        inner: ["type": "response.output_text.delta", "delta": "one"]))
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: firstAssistant,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    try await waitUntil { conversation.phase == .ready }
+    #expect(conversation.turns.count == 2)
+
+    // Now the regenerate's POST fails before any frame. The user turn it is
+    // re-running is pre-existing transcript, not a phantom — the rollback must
+    // keep its hands off it.
+    transport.completionFailure = APIError.unreachable("connection reset")
+    conversation.regenerate()
+    try await waitUntil { conversation.phase == .ready }
+
+    #expect(conversation.turns.count == 2, "the regenerate failure must not eat the user's message")
+    #expect(conversation.turns.first?.isUser == true)
+    #expect(conversation.turns.first?.text == "first")
+    #expect(conversation.draft.isEmpty)
+}
+
+@Test @MainActor func dismissErrorClearsBanner() async throws {
+    let (conversation, transport, _) = makePostFailureFixture(chatID: "chat-1")
+    transport.completionFailure = APIError.unreachable("connection reset")
+
+    conversation.draft = "hi"
+    conversation.send()
+    try await waitUntil { conversation.phase == .ready }
+    #expect(conversation.error != nil)
+
+    conversation.dismissError()
+    #expect(conversation.error == nil)
+    // And it stays gone — nothing about the rollback re-raises it.
+    try await Task.sleep(for: .milliseconds(150))
+    #expect(conversation.error == nil)
+}
+
+@Test @MainActor func abandonThenSendNotPoisoned() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+
+    conversation.draft = "first"
+    conversation.send()
+    try await transport.awaitCompletion()
+    conversation.abandon()
+    #expect(conversation.phase == .ready)
+    // Let the abandoned run finish its local bookkeeping before the next one
+    // starts. (A cancelled run's exchange still unwinds and may stamp its own
+    // no-answer verdict — a pre-existing abandon-unwind race, filed as issue
+    // #11; the deterministic rework of `abandon` belongs there, so this test
+    // keeps the sleep rather than fixing the race here.) What matters here is
+    // that its cancelled POST cannot leave a failure flag behind for the next
+    // run to act on.
+    try await Task.sleep(for: .milliseconds(100))
+
+    // An abandoned run cancels a still-open POST, and the cancellation lands as
+    // a throw in its catch. If that throw records a failure, the flag poisons
+    // the next run — which must roll back only a POST that really failed.
+    conversation.draft = "second"
+    conversation.send()
+    try await transport.awaitCompletion(2)
+    let second = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: second,
+        inner: ["type": "response.output_text.delta", "delta": "two"]))
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: second,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    try await waitUntil { conversation.turns.last?.text == "two" && conversation.phase == .ready }
+
+    #expect(conversation.error == nil,
+            "the abandoned first run must not leak a failure into the second: \(conversation.error ?? "nil")")
+    #expect(conversation.draft.isEmpty, "the second send went out; nothing was rolled back")
+    #expect(conversation.turns.last?.text == "two")
 }
