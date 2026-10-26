@@ -412,6 +412,7 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     private let stopGate = OneShotGate()
     private let completionGate = OneShotGate()
     private let resolveGate = OneShotGate()
+    private let messageUpdateGate = OneShotGate()
 
     /// Makes the *next* GET /chats/{id} wait until `releaseChatFetchGate()`.
     func gateNextChatFetch() { chatFetchGate.arm() }
@@ -444,6 +445,16 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     var isResolveGateParked: Bool { resolveGate.isParked }
     /// Resumes the parked resolve POST (and disarms an unused gate).
     func releaseResolve() { resolveGate.release() }
+
+    /// Makes the *next* POST /chats/{id}/messages/{id} — the edit's
+    /// `updateMessage` — wait inside the transport until
+    /// `releaseMessageUpdateGate()`, so a test can hold the edit open across
+    /// the window the model must stay busy in (issue #13).
+    func gateNextMessageUpdate() { messageUpdateGate.arm() }
+    /// True while a message-update POST is parked at the gate.
+    var isMessageUpdateGateParked: Bool { messageUpdateGate.isParked }
+    /// Resumes the parked message-update POST (and disarms an unused gate).
+    func releaseMessageUpdateGate() { messageUpdateGate.release() }
 
     /// A one-shot gate: `arm()` makes the next `parkIfArmed()` wait until
     /// `release()`. Cancelling the waiting task does not wake it — see the
@@ -522,6 +533,10 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
             return (Data(#"{"status":true}"#.utf8), response(for: request, 200))
         }
         if request.httpMethod == "POST", path.contains("/messages/") {
+            // Park before recording, so `messageUpdateBodies` only grows once
+            // the test has let the request through — the same contract the
+            // other gates keep.
+            await messageUpdateGate.parkIfArmed()
             guarded { _messageUpdateBodies.append(request.httpBody ?? Data()) }
             return (Data("{}".utf8), response(for: request, 200))
         }
@@ -1438,6 +1453,69 @@ enum AskUserFixture {
     #expect((json["id"] as? String) != "assistant-2")
     #expect(json["parent_id"] as? String == "user-1")
     #expect(conversation.turns.first?.text == "Actually: Berlin, but colder")
+}
+
+/// Regression for issue #13: `edit()` must hold the model busy for the whole
+/// `updateMessage` window. If it stays `.ready`, a send pressed while the
+/// server rewrite is in flight is not refused: it bumps the generation, the
+/// edit's exchange then arrives generation-stale and silently no-ops — the
+/// branch already truncated locally, the message already rewritten server-side,
+/// and no answer ever generated for either run.
+@Test @MainActor func sendDuringAnInFlightEditIsRefused() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub)
+    // Same fixture as `editingAMessageStoresItAndReRunsFromIt`: the edited
+    // message has to exist, so the conversation is loaded from a fixture.
+    transport.chatDetailOverride = Data(
+        """
+        {"id":"chat-1","title":"T","updated_at":1,"created_at":1,"chat":{"models":["local-personal"],
+         "history":{"currentId":"assistant-2","messages":{
+           "user-1":{"id":"user-1","role":"user","content":"hi","childrenIds":["assistant-1","assistant-2"]},
+           "assistant-2":{"id":"assistant-2","role":"assistant","content":"second","parentId":"user-1"}}}}}
+        """.utf8)
+    await conversation.load()
+
+    transport.gateNextMessageUpdate()
+    conversation.edit(messageID: "user-1", text: "edited question")
+    try await waitUntil { transport.isMessageUpdateGateParked }
+    #expect(conversation.phase == .waiting,
+            "the model must be busy while updateMessage is in flight")
+
+    // A send pressed in that window must be refused — and refused the way
+    // send() refuses everything else: before anything is touched.
+    conversation.draft = "interloper"
+    conversation.send()
+    #expect(conversation.draft == "interloper", "a refused send must not consume the draft")
+    #expect(conversation.error == nil, "refused before anything is touched — no banner either")
+    #expect(transport.completionBodies.isEmpty, "the refused send must not start a completion")
+    #expect(conversation.phase == .waiting, "the edit's run still owns the phase")
+
+    // Let the edit's write land: its run must proceed, not silently drop.
+    transport.releaseMessageUpdateGate()
+    try await transport.awaitCompletion()
+    #expect(transport.messageUpdateBodies.count == 1)
+    let body = try #require(transport.completionBody)
+    let json = try #require(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+    #expect(json["parent_id"] as? String == "user-1", "the completion is the edit's re-run")
+    let userMessage = try #require(json["user_message"] as? [String: Any])
+    #expect(userMessage["content"] as? String == "edited question")
+
+    // And the run completes: the answer arrives, the phase returns to ready.
+    let assistant = try #require(transport.assistantMessageID)
+    for frame in Frames.run(chat: "chat-1", message: assistant, answer: "an answer") {
+        hub.receive(frame)
+    }
+    try await waitUntil { conversation.phase == .ready }
+    #expect(conversation.turns.first?.text == "edited question")
+    #expect(conversation.turns.last?.text == "an answer")
+    #expect(!conversation.turns.contains { $0.text == "interloper" },
+            "the refused send left no trace in the transcript")
 }
 
 @Test @MainActor func aThumbUpGoesToFeedback() async throws {
@@ -2589,6 +2667,7 @@ private func expectStoredImage(_ message: ChatMessage, _ source: String) {
     try await waitUntil { conversation.error != nil }
 
     #expect(transport.completionBodies.isEmpty, "the re-run failed before posting")
+    #expect(conversation.phase == .ready, "a failed re-run must not wedge the composer busy")
     let update = try #require(transport.messageUpdateBodies.first)
     expectStoredImage(
         try storedUserMessage(afterUpdateBody: update, messageID: "user-1"),

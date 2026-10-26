@@ -742,6 +742,14 @@ public final class ConversationModel {
         let content = Self.resentUserContent(text: clean, imageURLs: carried.contentImageURLs)
         let resentFiles = Self.resentFilePayload(carried.attachments)
         let files = resentFiles.isEmpty ? nil : resentFiles
+        // Mark busy *before* the run starts, next to the generation bump — the
+        // same shape as send's prologue. Without it the model stays `.ready`
+        // through the `updateMessage` await, so a send pressed in that window
+        // is not refused: it bumps the generation, this edit's exchange then
+        // arrives generation-stale and silently no-ops — branch already
+        // truncated locally, message already rewritten server-side, and no
+        // answer ever generated for either (issue #13).
+        phase = .waiting
         runGeneration += 1
         let gen = runGeneration
         run = Task {
@@ -750,7 +758,18 @@ public final class ConversationModel {
                     chatID: chatID ?? "", messageID: messageID,
                     content: content, files: files)
             }
-            catch { self.error = error.localizedDescription; return }
+            catch {
+                // The run owns the phase now, so a failure has to hand it
+                // back — but only if the run is still current: an abandon
+                // during the POST already reset the phase itself, and a newer
+                // run's `.waiting` is not this stale failure's to stamp over
+                // (the same generation guard issue #5 established for stop).
+                if gen == runGeneration {
+                    self.error = error.localizedDescription
+                    phase = .ready
+                }
+                return
+            }
             await self.exchange(text: clean, regenerating: messageID, files: [], gen: gen)
         }
     }
@@ -1065,6 +1084,10 @@ public final class ConversationModel {
         guard isCurrent(gen) else { return }
         guard !model.isEmpty else {
             error = "No model selected."
+            // G1 above proved this run still owns the model, so the phase
+            // stamp is ours to make — without it, a caller that entered
+            // busy (send, edit) wedges in .waiting forever.
+            phase = .ready
             return
         }
         phase = .waiting
