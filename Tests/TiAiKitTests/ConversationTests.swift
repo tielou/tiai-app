@@ -413,6 +413,7 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     private let completionGate = OneShotGate()
     private let resolveGate = OneShotGate()
     private let messageUpdateGate = OneShotGate()
+    private let cooperativeMessageUpdateGate = CooperativeOneShotGate()
 
     /// Makes the *next* GET /chats/{id} wait until `releaseChatFetchGate()`.
     func gateNextChatFetch() { chatFetchGate.arm() }
@@ -456,6 +457,20 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     /// Resumes the parked message-update POST (and disarms an unused gate).
     func releaseMessageUpdateGate() { messageUpdateGate.release() }
 
+    /// Makes the *next* POST /chats/{id}/messages/{id} wait inside the
+    /// transport on a gate that is *cancellation-cooperative*: cancelling the
+    /// waiting Task throws `CancellationError` out of the parked request,
+    /// which is what a real URLSession-backed transport does. The plain
+    /// `gateNextMessageUpdate()` deliberately never wakes on cancel, so the
+    /// catch path of `edit()` — the issue #18 banner suppression — is only
+    /// reachable through this variant.
+    func gateNextMessageUpdateCancelThrows() { cooperativeMessageUpdateGate.arm() }
+    /// True while a message-update POST is parked at the cooperative gate.
+    var isCooperativeMessageUpdateGateParked: Bool { cooperativeMessageUpdateGate.isParked }
+    /// Resumes the parked cooperative message-update POST (and disarms an
+    /// unused gate). Only reachable on the path where nothing cancelled.
+    func releaseCooperativeMessageUpdateGate() { cooperativeMessageUpdateGate.release() }
+
     /// A one-shot gate: `arm()` makes the next `parkIfArmed()` wait until
     /// `release()`. Cancelling the waiting task does not wake it — see the
     /// comment on the gates above for why that is the whole point.
@@ -482,6 +497,88 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
                     lock.unlock()
                     resume.resume()
                 }
+            }
+        }
+
+        var isParked: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return !waiters.isEmpty
+        }
+
+        func release() {
+            lock.lock()
+            armed = false
+            let parked = waiters
+            waiters = []
+            lock.unlock()
+            for waiter in parked { waiter.resume() }
+        }
+    }
+
+    /// A one-shot gate that *is* cancellation-cooperative: cancelling the
+    /// waiting Task resumes the parked waiter by throwing `CancellationError`,
+    /// the way a real transport aborts an in-flight request when the run's
+    /// Task is cancelled. `OneShotGate` above deliberately cannot do this (the
+    /// race it exposes needs a sleep that does not wake); this variant exists
+    /// so the *other* half of the same race — the catch path in `edit()` — can
+    /// be reached at all. An unarmed gate is a no-op, even for an already
+    /// cancelled Task: the throw is reserved for a request this gate held.
+    fileprivate final class CooperativeOneShotGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var armed = false
+        /// Set by the cancellation handler so a cancel that lands *before* the
+        /// continuation is registered still resolves the wait, by throwing.
+        private var cancelRequested = false
+        private var waiters: [CheckedContinuation<Void, any Error>] = []
+
+        func arm() {
+            lock.lock()
+            armed = true
+            cancelRequested = false
+            lock.unlock()
+        }
+
+        /// Consume the arm in a synchronous helper: `NSLock.lock()` is
+        /// `noasync`, so the async body cannot take the lock itself.
+        private func takeArm() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard armed else { return false }
+            armed = false
+            cancelRequested = false
+            return true
+        }
+
+        func parkIfArmed() async throws {
+            // Consume the arm *before* any cancellation machinery is installed:
+            // an unarmed gate must be a no-op even for a Task that is already
+            // cancelled, or every cancelled run would trip this gate on
+            // requests no test ever gated.
+            guard takeArm() else { return }
+
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation {
+                    (resume: CheckedContinuation<Void, any Error>) in
+                    lock.lock()
+                    // `Task.isCancelled` as well as `cancelRequested`: covers a
+                    // cancel that landed in the window above, before the
+                    // handler was installed, whatever the handler's ordering
+                    // semantics are.
+                    if cancelRequested || Task.isCancelled {
+                        lock.unlock()
+                        resume.resume(throwing: CancellationError())
+                        return
+                    }
+                    waiters.append(resume)
+                    lock.unlock()
+                }
+            } onCancel: {
+                lock.lock()
+                cancelRequested = true
+                let parked = waiters
+                waiters = []
+                lock.unlock()
+                for waiter in parked { waiter.resume(throwing: CancellationError()) }
             }
         }
 
@@ -537,6 +634,11 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
             // the test has let the request through — the same contract the
             // other gates keep.
             await messageUpdateGate.parkIfArmed()
+            // Two gates on one route: the cooperative one is a no-op unless
+            // armed, so the issue #13/#18 tests that use the plain gate are
+            // untouched, and a Task that is merely already cancelled is not
+            // thrown at by a gate that never held its request.
+            try await cooperativeMessageUpdateGate.parkIfArmed()
             guarded { _messageUpdateBodies.append(request.httpBody ?? Data()) }
             return (Data("{}".utf8), response(for: request, 200))
         }
@@ -1590,6 +1692,125 @@ enum AskUserFixture {
     #expect(conversation.turns.last?.text == "an answer")
     #expect(!conversation.turns.contains { $0.text == "interloper" },
             "the refused send left no trace in the transcript")
+}
+
+/// Regression for issue #18: a stop pressed during `edit()`'s `updateMessage`
+/// window is acknowledged (`.stopping` → `.ready` via `finishLocally`) but must
+/// not go on to start the re-run. `stop` cancels the run Task without bumping
+/// the generation, so `exchange`'s generation guard cannot catch this — the
+/// run Task itself has to refuse to continue once cancelled. The edit's save
+/// surviving its own stop is the documented choice; the re-run is what the
+/// user stopped.
+@Test @MainActor func stopDuringAnInFlightEditSkipsTheReRun() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub)
+    // Same fixture as the issue #13 test: the edited message has to exist.
+    transport.chatDetailOverride = Data(
+        """
+        {"id":"chat-1","title":"T","updated_at":1,"created_at":1,"chat":{"models":["local-personal"],
+         "history":{"currentId":"assistant-2","messages":{
+           "user-1":{"id":"user-1","role":"user","content":"hi","childrenIds":["assistant-1","assistant-2"]},
+           "assistant-2":{"id":"assistant-2","role":"assistant","content":"second","parentId":"user-1"}}}}}
+        """.utf8)
+    await conversation.load()
+
+    transport.gateNextMessageUpdate()
+    // A parked gate must never outlive the test, whatever the assertions do.
+    defer { transport.releaseMessageUpdateGate() }
+    conversation.edit(messageID: "user-1", text: "edited question")
+    try await waitUntil { transport.isMessageUpdateGateParked }
+    #expect(conversation.phase == .waiting)
+
+    // Stop lands inside the update window: acknowledged up front as
+    // `.stopping`, then `finishLocally` settles it once the stop POST returns.
+    conversation.stop()
+    #expect(conversation.phase == .stopping)
+    try await waitUntil { conversation.phase == .ready }
+
+    // Let the parked update land. The save itself survives the stop (it
+    // already happened server-side); the re-run must not start.
+    transport.releaseMessageUpdateGate()
+    try await waitUntil { transport.messageUpdateBodies.count == 1 }
+    // Settle window: without the cancellation guard the run Task enters
+    // `exchange` here and the completion POST is recorded near-instantly, so
+    // this sleep is what the mutation trips on.
+    try await Task.sleep(for: .milliseconds(150))
+
+    #expect(transport.completionBodies.isEmpty,
+            "the stopped edit must not POST a completion after stop was acknowledged")
+    #expect(conversation.error == nil,
+            "a stop the user asked for is not an error — no banner")
+    #expect(conversation.phase == .ready,
+            "the settled phase must stay settled")
+    // The edit's save itself did land — the documented choice.
+    #expect(transport.messageUpdateBodies.count == 1)
+    #expect(conversation.turns.first?.text == "edited question")
+}
+
+/// The other half of issue #18, pinned by no amount of `OneShotGate` testing:
+/// with a transport that *does* wake on cancellation — which is what a real
+/// URLSession-backed transport is — the halted `updateMessage` surfaces in
+/// `edit()`'s `catch` as a thrown `CancellationError`. A stop the user pressed
+/// is not a failure, so that throw must not stamp an error banner; only the
+/// `Task.isCancelled` branch of the catch stands between the user and a
+/// "cancelled" banner flashing over a stop that had already been acknowledged.
+@Test @MainActor func stopDuringEditWithCooperativeTransportShowsNoBanner() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub)
+    // Same fixture as `stopDuringAnInFlightEditSkipsTheReRun`: the edited
+    // message has to exist.
+    transport.chatDetailOverride = Data(
+        """
+        {"id":"chat-1","title":"T","updated_at":1,"created_at":1,"chat":{"models":["local-personal"],
+         "history":{"currentId":"assistant-2","messages":{
+           "user-1":{"id":"user-1","role":"user","content":"hi","childrenIds":["assistant-1","assistant-2"]},
+           "assistant-2":{"id":"assistant-2","role":"assistant","content":"second","parentId":"user-1"}}}}}
+        """.utf8)
+    await conversation.load()
+
+    transport.gateNextMessageUpdateCancelThrows()
+    // Release covers the path where nothing cancelled (or a mutation removed
+    // the guard and the run lived on); on the cancelled path the gate has
+    // already been woken by the throw, and release is then a no-op.
+    defer { transport.releaseCooperativeMessageUpdateGate() }
+    conversation.edit(messageID: "user-1", text: "edited question")
+    try await waitUntil { transport.isCooperativeMessageUpdateGateParked }
+    #expect(conversation.phase == .waiting)
+
+    // Stop lands inside the update window: `.stopping`, then `finishLocally`
+    // cancels the run Task — which is what throws at the parked update.
+    conversation.stop()
+    #expect(conversation.phase == .stopping)
+    try await waitUntil { conversation.phase == .ready }
+
+    // Settle window: without the catch-path guard the cancelled throw falls
+    // through to the banner below, near-instantly.
+    try await Task.sleep(for: .milliseconds(150))
+
+    // Symptom 2 of issue #18: the cancel throw must not be reported as an
+    // error. This is the assertion the whole test exists for.
+    #expect(conversation.error == nil,
+            "a stop the user asked for is not an error — no cancelled banner")
+    #expect(conversation.phase == .ready,
+            "the settled phase must stay settled (no restore wedge, no re-run)")
+    #expect(transport.completionBodies.isEmpty,
+            "the stopped edit must not POST a completion after stop was acknowledged")
+    // The update never completed — it was thrown out of mid-flight, so nothing
+    // was recorded as saved (unlike the non-cooperative gate above, where the
+    // parked request is let through and the save does land).
+    #expect(transport.messageUpdateBodies.isEmpty)
 }
 
 @Test @MainActor func aThumbUpGoesToFeedback() async throws {

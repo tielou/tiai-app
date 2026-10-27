@@ -766,6 +766,24 @@ public final class ConversationModel {
                     content: content, files: files)
             }
             catch {
+                // Issue #18: a stop pressed during this update's window
+                // cancels this Task (stop's `finishLocally` owns the
+                // cancellation), and with a cancellation-cooperative
+                // transport the halted update surfaces as *this* throw. The
+                // stop is the user's intent, not a failure — stamping the
+                // cancel error here flashed a cancelled-error banner over a
+                // stop that had already been acknowledged. `finishLocally`
+                // settled the phase in the same main-actor turn it cancelled
+                // this Task, so there is normally nothing left to do; the
+                // belt-and-braces restore only fires if the phase is somehow
+                // still ours and still busy, so a cancelled run can never
+                // wedge it. A genuine failure that races the stop is swallowed
+                // here too — `Task.isCancelled` takes precedence, because the
+                // stop is the newer intent.
+                if Task.isCancelled {
+                    if gen == runGeneration, phase.isBusy { phase = .ready }
+                    return
+                }
                 // The run owns the phase now, so a failure has to hand it
                 // back — but only if the run is still current: an abandon
                 // during the POST already reset the phase itself, and a newer
@@ -777,6 +795,16 @@ public final class ConversationModel {
                 }
                 return
             }
+            // Issue #18: a stop pressed during the update window cancelled
+            // this Task. The edit itself is saved — the update landed
+            // server-side before the stop was acknowledged, and that save
+            // surviving its own stop is the documented choice — but the
+            // re-run is what the user stopped. `exchange`'s generation guard
+            // cannot catch this: stop never bumps the generation, so the
+            // completion would POST and stream after the UI had already gone
+            // `.stopping` → `.ready`. Cancellation *is* the marker; the phase
+            // and UI were settled by `finishLocally`.
+            if Task.isCancelled { return }
             await self.exchange(text: clean, regenerating: messageID, files: [], gen: gen)
         }
     }
