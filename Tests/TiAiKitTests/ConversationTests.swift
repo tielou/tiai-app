@@ -3696,7 +3696,12 @@ private func makePostFailureFixture(chatID: String?) -> (
 /// never made, and `hub.expire(chatID:)` the newer run's listener. The fix
 /// is the gen guard first in `recordPostError` (plus the slot-write cancel).
 @Test @MainActor func supersededPostFailureDoesNotKillTheNewerRun() async throws {
-    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+    // A `temporary:` chat — the shape an incognito conversation keeps after
+    // deriving its id. It is the remaining mid-run phase un-gate in `load()`:
+    // the prefix early-return writes `.ready` before issue #19's
+    // `runInFlight` guard (filed as a follow-up), which is what lets a send
+    // supersede a live run and orphan its POST into the new slot.
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "temporary:sid-1")
     transport.gateNextCompletion()
 
     conversation.draft = "first"
@@ -3707,11 +3712,11 @@ private func makePostFailureFixture(chatID: String?) -> (
     // Run 1's assistant id, read from the recorded POST body.
     let firstID = try #require(transport.assistantMessageID)
 
-    // The supersede path. The fixture's chat-1 detail is EMPTY (the scripted
-    // tree has no messages), so the heal path in `load()` cannot fire and the
-    // load settles deterministically to `.ready` while run 1's POST is still
-    // parked — no chatDetailOverride needed.
+    // The supersede: re-entering the chat mid-run. The prefix branch returns
+    // `.ready` unconditionally, composer included, while run 1's POST is
+    // still parked inside the transport.
     await conversation.load()
+    #expect(conversation.phase == .ready)
 
     conversation.draft = "second"
     conversation.send()
@@ -3719,6 +3724,7 @@ private func makePostFailureFixture(chatID: String?) -> (
     let secondID = try #require(transport.assistantMessageID)
 
     // The stale POST dies — keyed to run 1's message id so only that request
+    // can consume it (the global flag would race run 2's continuation hop).
     // can consume it (the global flag would race run 2's continuation hop).
     transport.failCompletion(messageID: firstID)
     transport.releaseCompletion()
@@ -3737,10 +3743,10 @@ private func makePostFailureFixture(chatID: String?) -> (
 
     // And run 2 must still be able to finish: its listener survived.
     hub.receive(Frame.fixture(
-        kind: "response:completion", chatID: "chat-1", messageID: secondID,
+        kind: "response:completion", chatID: "temporary:sid-1", messageID: secondID,
         inner: ["type": "response.output_text.delta", "delta": "two"]))
     hub.receive(Frame.fixture(
-        kind: "chat:completion", chatID: "chat-1", messageID: secondID,
+        kind: "chat:completion", chatID: "temporary:sid-1", messageID: secondID,
         inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
     try await waitUntil(timeout: .seconds(5)) {
         conversation.phase == .ready && conversation.turns.last?.text == "two"
@@ -3753,7 +3759,7 @@ private func makePostFailureFixture(chatID: String?) -> (
 /// there too, and the banner lands even though no rollback fires (the
 /// rollback gate wants `.waiting`).
 @Test @MainActor func supersededPostFailureDoesNotStampAStreamingRun() async throws {
-    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "temporary:sid-1")
     transport.gateNextCompletion()
 
     conversation.draft = "first"
@@ -3762,8 +3768,9 @@ private func makePostFailureFixture(chatID: String?) -> (
     #expect(transport.isCompletionGateParked)
     let firstID = try #require(transport.assistantMessageID)
 
-    // Empty fixture detail → deterministic `.ready`; see the waiting test.
+    // Supersede via the temporary-prefix early-return in load(); see the waiting test.
     await conversation.load()
+    #expect(conversation.phase == .ready)
 
     conversation.draft = "second"
     conversation.send()
@@ -3772,7 +3779,7 @@ private func makePostFailureFixture(chatID: String?) -> (
 
     // Put run 2 into `.streaming` before the stale POST dies.
     hub.receive(Frame.fixture(
-        kind: "response:completion", chatID: "chat-1", messageID: secondID,
+        kind: "response:completion", chatID: "temporary:sid-1", messageID: secondID,
         inner: ["type": "response.output_text.delta", "delta": "two"]))
     try await waitUntil { conversation.phase == .streaming }
 
@@ -3784,7 +3791,7 @@ private func makePostFailureFixture(chatID: String?) -> (
 
     // Run 2 finishes untouched — its listener was not expired either.
     hub.receive(Frame.fixture(
-        kind: "chat:completion", chatID: "chat-1", messageID: secondID,
+        kind: "chat:completion", chatID: "temporary:sid-1", messageID: secondID,
         inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
     try await waitUntil(timeout: .seconds(5)) {
         conversation.phase == .ready && conversation.turns.last?.text == "two"
