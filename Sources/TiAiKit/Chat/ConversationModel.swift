@@ -1265,6 +1265,13 @@ public final class ConversationModel {
             // stopped until the user answers, so a question that came through
             // unreadable has nothing that will ever fix it.
             await awaitQuestion(messageID: assistantID)
+            // G5 (#17) — the mirror of resolve's R5. The refetch loop is a
+            // long await: abandoning the parked run bumps the generation, but
+            // this task keeps waiting (the refetch is uncancellable in
+            // practice), and when it finally returns the run it belongs to is
+            // dead. Stamping `.ready` here would end the *next* run's phase
+            // while it is still waiting or streaming.
+            guard isCurrent(gen) else { return }
             phase = .ready
             return
         }

@@ -1184,6 +1184,80 @@ enum AskUserFixture {
     #expect(conversation.turns[3].text == "No need for pizza.")
 }
 
+/// Issue #17: exchange's parked branch awaited `awaitQuestion` and then wrote
+/// `phase = .ready` with no generation guard — the mirror of the resolve-side
+/// R5 from #12. Abandoning a run that is parked *inside* the refetch loop, then
+/// starting a fresh send, must leave the new run's phase untouched when the
+/// stale refetch finally returns.
+@Test @MainActor func abandoningDuringAParkedAwaitQuestionLeavesTheNextRunClean() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+
+    // Arm the chat-fetch gate BEFORE the parking frame: `awaitQuestion`'s
+    // first refetch is a GET /chats/{id}, and holding it open is what keeps
+    // the parked branch inside its await long enough to be abandoned.
+    transport.gateNextChatFetch()
+    // Release on the way out no matter how the test ends: a failed #expect
+    // must not leave a parked request (and its continuation) hanging the
+    // suite.
+    defer { transport.releaseChatFetchGate() }
+    conversation.draft = "book me a trip"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let firstID = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: firstID,
+        inner: ["done": false, "output": [AskUserFixture.outputItem]]))
+
+    // The run has parked and `awaitQuestion` is now parked at the gate — so
+    // the `.ready` stamp at the end of the parked branch has not happened.
+    try await waitUntil { transport.isChatFetchGateParked }
+    #expect(conversation.phase != .ready)
+    #expect(conversation.turns.last?.questionIncoming == true)
+
+    // Abandon: the generation bumps; the parked exchange task stays parked
+    // (the transport gate ignores cancellation, by design).
+    conversation.abandon()
+    #expect(conversation.phase == .ready)
+
+    // A brand-new send starts while the stale refetch is still in flight.
+    conversation.draft = "second question"
+    conversation.send()
+    try await transport.awaitCompletion(2)
+    let secondID = try #require(transport.assistantMessageID)
+    #expect(secondID != firstID)
+    #expect(conversation.phase == .waiting)
+
+    // Let the stale refetch land. The ask_user call on the abandoned turn has
+    // structured arguments, so `awaitQuestion` returns after this refetch —
+    // and its `defer` clearing `questionIncoming` is the deterministic signal
+    // that the parked branch has resumed on a dead generation.
+    transport.releaseChatFetchGate()
+    try await waitUntil { conversation.turns[1].questionIncoming == false }
+    // Every scheduling hop for the stale branch to stomp if it is going to.
+    try await Task.sleep(for: .milliseconds(150))
+
+    // The stale `.ready` must not have touched the new run: it is still
+    // waiting for its first frame, not "finished".
+    #expect(conversation.phase == .waiting)
+
+    // The new run then streams and ends clean, as if the park never existed.
+    for frame in Frames.run(chat: "chat-1", message: secondID, answer: "No need for pizza.") {
+        hub.receive(frame)
+    }
+    try await waitUntil { conversation.phase == .ready }
+    #expect(conversation.error == nil)
+    #expect(conversation.turns.count == 4)  // user/assistant/user/assistant
+    #expect(conversation.turns[3].text == "No need for pizza.")
+    #expect(conversation.turns[3].streaming == false)
+    #expect(conversation.turns[1].text != "No need for pizza.")
+
+    // Nothing lands late either.
+    try await Task.sleep(for: .milliseconds(250))
+    #expect(conversation.phase == .ready)
+    #expect(conversation.error == nil)
+    #expect(conversation.turns.count == 4)
+}
+
 @Test func askUserPromptParsesTheRealSchema() {
     let data = Data(AskUserFixture.arguments.utf8)
     let arguments = try! JSONDecoder().decode(JSONValue.self, from: data)
