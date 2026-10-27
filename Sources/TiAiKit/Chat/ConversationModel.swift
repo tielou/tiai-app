@@ -1273,7 +1273,7 @@ public final class ConversationModel {
             }
         }
 
-        var outcome = await drain(frames, assistantID: assistantID)
+        var outcome = await drain(frames, assistantID: assistantID, gen: gen)
         // G4 — the core of issue #11. A superseded run returning from its drain
         // must not cancel the *next* run's POST slot, roll its transcript back,
         // or drive its phase. The early return covers the whole post-drain
@@ -1535,6 +1535,38 @@ public final class ConversationModel {
         var sawAnyFrame = false
     }
 
+    /// A one-shot `hub.expire(chatID:)` on a budget — the silence watchdog and
+    /// its handoff/error-recovery grace timers all install one.
+    ///
+    /// Cancellation must stand the timer down, not fire it — the `!Task.isCancelled`
+    /// gate the #11 fix introduced: `try?` swallows the cancellation every
+    /// drain gets on its way out, and without the gate `expire` would run
+    /// immediately at the end of EVERY drain, finishing every listener for the
+    /// chat — including a newer run's, when an abandoned run's drain unwinds
+    /// after that newer run subscribed (issue #11). The listener this run
+    /// installed is cleaned up anyway when the caller drops the stream.
+    ///
+    /// The two fire-time gates each close a window where firing is wrong:
+    ///
+    /// * `isCurrent(gen)` — a newer run may have installed its hub listener
+    ///   but not yet its `pending`: a resolve subscribes, then awaits its POST
+    ///   (a full network round trip) before its drain installs the buffer,
+    ///   and `abandon` does not clear `pending`, so the id check alone still
+    ///   passes there. Without the generation gate a superseded drain's timer
+    ///   fires `hub.expire(chatID:)` on the shared chatID and kills the
+    ///   NEWER run's listener (issue #21).
+    /// * `pending?.id == assistantID` — a resolve reuses the parked message
+    ///   id, so ids can collide across runs; this check is what encodes
+    ///   "the watchdog only fires while this run still owns `pending`".
+    private func hubExpireTimer(after limit: Duration, gen: Int, assistantID: String) -> Task<Void, Never> {
+        Task { [hub] in
+            try? await Task.sleep(for: limit)
+            guard !Task.isCancelled else { return }
+            guard isCurrent(gen), pending?.id == assistantID else { return }
+            hub.expire(chatID: chatID ?? "")
+        }
+    }
+
     /// Drains frames for one assistant message until the run ends, is stopped,
     /// or parks on a tool call.
     ///
@@ -1542,9 +1574,13 @@ public final class ConversationModel {
     /// *new* completion on the server whose tokens arrive under the same
     /// assistant message id — the client has to listen again exactly as it did
     /// the first time, and a second copy of this loop is how the two would drift.
+    ///
+    /// `gen` is the generation the caller was started under; the watchdog and
+    /// grace timers installed here fire only while it is still current (#21).
     private func drain(
         _ frames: AsyncStream<ChatEventSocket.Frame>,
         assistantID: String,
+        gen: Int,
         continuing: Bool = false
     ) async -> DrainOutcome {
         var outcome = DrainOutcome()
@@ -1571,19 +1607,7 @@ public final class ConversationModel {
                 self?.publishPending(keeping: assistantID)
             }
         }
-        let watchdog = Task { [hub] in
-            try? await Task.sleep(for: Self.silenceLimit)
-            // Cancellation must stand the watchdog down, not fire it — the
-            // same `if !Task.isCancelled` gate the grace tasks below use.
-            // Without it, `try?` swallows the cancellation this task gets at
-            // the end of every drain and `expire` runs immediately, finishing
-            // EVERY listener for the chat — including a newer run's, when an
-            // abandoned run's drain unwinds after that newer run subscribed
-            // (issue #11). The listener this run installed is cleaned up
-            // anyway when `exchange` drops the stream.
-            guard !Task.isCancelled else { return }
-            hub.expire(chatID: chatID ?? "")
-        }
+        let watchdog = hubExpireTimer(after: silenceLimit, gen: gen, assistantID: assistantID)
 
         var sawToolArguments = false
         var erroredOnce = false
@@ -1595,14 +1619,14 @@ public final class ConversationModel {
             // loop keeps delivering frames to a run that no longer owns
             // anything — and `pending` is the model-level buffer, so its
             // deltas would append into the NEW run's buffer (issue #16).
-            // `break`, not `continue`, because a half-dead drain's 60 s
-            // silence watchdog is not generation-gated: left iterating it
-            // would later fire `hub.expire(chatID:)` on the shared chatID and
-            // kill the NEWER run's listener. Breaking also reaches the
-            // watchdog/grace/flusher cancels below the loop and unregisters
-            // the hub subscriber via the stream's `onTermination`; the final
-            // flush is already id-gated, so nothing stale flushes here (the
-            // #11 fix).
+            // `break`, not `continue`, because a half-dead drain must stop
+            // writing and must reach the watchdog/grace/flusher cancels below
+            // the loop — which also unregisters the hub subscriber via the
+            // stream's `onTermination`. (The silence watchdog is
+            // generation-gated now — #21 — so a half-dead drain left iterating
+            // can no longer expire the shared chatID out from under the newer
+            // run; breaking is still the right exit.) The final flush is
+            // already id-gated, so nothing stale flushes here (the #11 fix).
             // Why this guard can never false-fire mid-run: `pending` is
             // assigned only at this drain's install (just above, synchronously
             // after the caller's generation guard) and at the final flush
@@ -1655,10 +1679,7 @@ public final class ConversationModel {
                 if pending?.awaitsTool == true
                     || (sawToolArguments && pending?.calls.isEmpty != false) {
                     sawToolArguments = false
-                    grace = Task { [hub] in
-                        try? await Task.sleep(for: Self.handoffLimit)
-                        if !Task.isCancelled { hub.expire(chatID: chatID ?? "") }
-                    }
+                    grace = hubExpireTimer(after: Self.handoffLimit, gen: gen, assistantID: assistantID)
                     continue
                 }
                 // A run that reported an error and then "finished" is the one
@@ -1670,10 +1691,7 @@ public final class ConversationModel {
                 // on the same budget as a tool handoff, and see if it resumes.
                 if outcome.reportedError != nil && !erroredOnce {
                     erroredOnce = true
-                    grace = Task { [hub] in
-                        try? await Task.sleep(for: Self.errorRecoveryLimit)
-                        if !Task.isCancelled { hub.expire(chatID: chatID ?? "") }
-                    }
+                    grace = hubExpireTimer(after: Self.errorRecoveryLimit, gen: gen, assistantID: assistantID)
                     continue
                 }
                 // The stream says it is over. Ask the server anyway.
@@ -1686,11 +1704,12 @@ public final class ConversationModel {
                 // finished prompt over half an answer, and leaving and re-entering
                 // the chat, which refetches, showed the real one. That asymmetry
                 // is the whole bug: the truth was always in the stored message.
+                // `chat` is `chatID` captured just before the fetch; a chat id
+                // that is already set never changes, so the helper's
+                // `chatID ?? ""` expires the same chat as the old inline
+                // `hub.expire(chatID: chat)` did.
                 if let chat = chatID, await serverStillOpen(chatID: chat, messageID: assistantID) {
-                    grace = Task { [hub] in
-                        try? await Task.sleep(for: Self.handoffLimit)
-                        if !Task.isCancelled { hub.expire(chatID: chat) }
-                    }
+                    grace = hubExpireTimer(after: Self.handoffLimit, gen: gen, assistantID: assistantID)
                     continue
                 }
                 outcome.sawTerminal = true
@@ -1921,7 +1940,7 @@ public final class ConversationModel {
             // run's is exactly the buffer hijack #11 fixed for `exchange`
             // (the newer run's deltas would land in the abandoned turn).
             guard self.isCurrent(gen) else { return }
-            var outcome = await self.drain(frames, assistantID: messageID, continuing: true)
+            var outcome = await self.drain(frames, assistantID: messageID, gen: gen, continuing: true)
             // R4: the mirror of exchange's G4. Everything from here — the
             // parked `.ready`, the refresh, `leafID`, the calls reconcile and
             // the error stamp — belongs to the run that owns the state now.
@@ -2135,6 +2154,14 @@ public final class ConversationModel {
     /// 60 ms timer, so the interval is an instance knob. The static stays the
     /// production default.
     var flushInterval: Duration = ConversationModel.flushInterval
+
+    /// Tuning for the drain's silence watchdog, same reasoning as
+    /// `flushInterval`: a test that has to prove a stale watchdog did *not*
+    /// fire cannot sit out a 60 s timer, so the limit is an instance knob.
+    /// The static stays the production default. Note the budget is read when
+    /// the drain INSTALLS its timer, so a test that wants a short watchdog
+    /// must set this before the run starts, not after.
+    var silenceLimit: Duration = ConversationModel.silenceLimit
 
     /// A failed POST is reported only if the run has not already ended on its own
     /// terms — a stream closed by `stop()` errors on the way out, and calling

@@ -3677,6 +3677,166 @@ private func makePostFailureFixture(chatID: String?) -> (
     #expect(conversation.phase == .ready)
 }
 
+/// Issue #21: a resolve's drain runs in a bare Task that `abandon` cannot
+/// cancel, and a superseded drain that receives no further frames never
+/// reaches the #16 loop-top guard — the only thing left in it is the
+/// silence watchdog. Before the fix that watchdog was ungated: when its
+/// budget ran out it fired `hub.expire(chatID:)` on the shared chat and
+/// killed the NEWER run's listener, so the next answer never arrived. The
+/// watchdog is now gated on the generation and on still owning `pending`,
+/// and the budget is an instance knob so a test can actually wait it out.
+@Test @MainActor func supersededResolveWatchdogDoesNotExpireTheNewerRun() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+
+    // Park a run on an ask_user question (same fixture as #16's test).
+    conversation.draft = "book me a trip"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let firstID = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: firstID,
+        inner: ["done": false, "output": [AskUserFixture.outputItem]]))
+    try await waitUntil { conversation.phase == .ready }
+    let call = try #require(conversation.turns.last?.awaitingCall)
+
+    // The stale watchdog's whole budget. It is read when the resolve's drain
+    // installs the timer, so it must be set before the resolve starts.
+    conversation.silenceLimit = .milliseconds(300)
+
+    conversation.resolve(
+        messageID: firstID, call: call, action: .answer,
+        answers: .object(["meal": .string("pizza")]))
+    try await waitUntil { !transport.resolveBodies.isEmpty }
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: firstID,
+        inner: ["type": "response.output_text.delta", "delta": "one"]))
+    // Proof the resolve's drain is alive in the frame loop.
+    try await waitUntil { conversation.turns.last?.text == "one" }
+
+    // Supersede the resolve. Its drain keeps waiting for frames that never
+    // come — no frame means no loop-top guard, so the watchdog is the only
+    // thing in it that can still act.
+    conversation.abandon()
+
+    // Restore the production budget BEFORE run 2 starts: whatever fires
+    // during this test can then only ever be the stale resolve's timer.
+    conversation.silenceLimit = ConversationModel.silenceLimit
+
+    conversation.draft = "second"
+    conversation.send()
+    try await transport.awaitCompletion(2)
+    let secondID = try #require(transport.assistantMessageID)
+    // Run 2's listener and buffer are installed; now sit well past the stale
+    // watchdog's budget. Pre-fix this is where `hub.expire(chatID:)` killed
+    // run 2's listener and its answer never arrived.
+    try await Task.sleep(for: .milliseconds(500))
+
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: secondID,
+        inner: ["type": "response.output_text.delta", "delta": "two"]))
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: secondID,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+
+    #expect(conversation.turns.last?.text == "two",
+            "a stale resolve watchdog must not expire the newer run's listener: got \"\(conversation.turns.last?.text ?? "nil")\"")
+    #expect(conversation.error == nil)
+    #expect(conversation.phase == .ready)
+}
+
+/// The other side of #21's gates: they must not turn the silence watchdog
+/// into a no-op. A CURRENT run that goes silent must still be expired —
+/// same expectations as `aSilentStreamIsEndedRatherThanWaitingForever`,
+/// which simulates the firing with a manual `hub.expire`; this one lets
+/// the real watchdog do it on a short budget.
+@Test @MainActor func silenceWatchdogStillExpiresTheRunItOwns() async throws {
+    let (conversation, transport, _) = makePostFailureFixture(chatID: "chat-1")
+    conversation.silenceLimit = .milliseconds(150)
+
+    conversation.draft = "go"
+    conversation.send()
+    try await transport.awaitCompletion()
+    // No frames ever. The watchdog belongs to this run — generation current,
+    // buffer owned — so it must still fire and settle the run with an error.
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+    #expect(conversation.error != nil,
+            "the watchdog of the run that owns the chat must still expire it")
+    #expect(conversation.turns.last?.streaming == false)
+}
+
+/// #21's discriminating case: why `isCurrent(gen)` is needed ON TOP OF the
+/// pending-id check. A stale resolve drain is superseded by a NEW resolve
+/// on the SAME parked message id whose POST is still in flight (parked at
+/// the transport's resolve gate). In that window the new resolve has its
+/// hub listener installed but its drain has not installed a buffer yet,
+/// and `abandon` does not clear `pending` — so a pending-id-only gate
+/// walks straight into it: the stale watchdog's id check matches, the
+/// shared chat expires, and the new resolve's listener dies before its
+/// first frame. Only the generation gate closes this window.
+@Test @MainActor func staleResolveWatchdogDoesNotExpireASlowNewResolve() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+
+    conversation.draft = "book me a trip"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let firstID = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: firstID,
+        inner: ["done": false, "output": [AskUserFixture.outputItem]]))
+    try await waitUntil { conversation.phase == .ready }
+    let call = try #require(conversation.turns.last?.awaitingCall)
+
+    conversation.silenceLimit = .milliseconds(250)
+    conversation.resolve(
+        messageID: firstID, call: call, action: .answer,
+        answers: .object(["meal": .string("pizza")]))
+    try await waitUntil { !transport.resolveBodies.isEmpty }
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: firstID,
+        inner: ["type": "response.output_text.delta", "delta": "one"]))
+    try await waitUntil { conversation.turns.last?.text == "one" }
+
+    // Supersede the first resolve. `abandon` bumps the generation but
+    // leaves `pending` holding the first resolve's buffer for `firstID`.
+    conversation.abandon()
+
+    // Start a second resolve on the SAME message and park its POST inside
+    // the transport: `resolve()` subscribes before the POST, so its
+    // listener is live while `pending?.id` is still `firstID` — the exact
+    // window the generation gate exists for.
+    transport.gateNextResolve()
+    conversation.resolve(
+        messageID: firstID, call: call, action: .answer,
+        answers: .object(["meal": .string("pasta")]))
+    try await waitUntil { transport.isResolveGateParked }
+
+    // Sit past the stale watchdog's budget with the new resolve's listener
+    // alive and the id check matching.
+    try await Task.sleep(for: .milliseconds(500))
+
+    // Restore the production budget so the SECOND resolve's own watchdog
+    // cannot fire while its frames are still on their way.
+    conversation.silenceLimit = ConversationModel.silenceLimit
+    transport.releaseResolve()
+    try await waitUntil { transport.resolveBodies.count == 2 }
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: firstID,
+        inner: ["type": "response.output_text.delta", "delta": "two"]))
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: firstID,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+
+    // With the generation gate the second resolve's listener survived and
+    // its own delta arrived. With only the pending-id gate the stale
+    // watchdog expired the chat during the window and the second resolve's
+    // stream closed before its first frame: the text would stay "one".
+    #expect(conversation.turns.last?.text.contains("two") == true,
+            "the new resolve's listener must survive a stale resolve's watchdog: got \"\(conversation.turns.last?.text ?? "nil")\"")
+    #expect(conversation.error == nil)
+}
+
 @Test @MainActor func slowStopDoesNotKillTheNewerRun() async throws {
     let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
 
