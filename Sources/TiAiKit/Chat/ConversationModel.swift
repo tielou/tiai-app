@@ -1283,6 +1283,16 @@ public final class ConversationModel {
         // A failure recorded by an earlier run must never be mistaken for
         // this one's (issue #9).
         postFailureMessage = nil
+        // #25: reclaim a POST still held by a superseded run. The occupant at
+        // this point is provably nil or a strictly older run's task: the G3
+        // guard above and this write are one main-actor synchronous region,
+        // and there is one `post = Task` write per exchange and one exchange
+        // per generation — so anything in the slot now belongs to an older run
+        // (`load()` mid-run neither bumps the generation nor cancels the POST,
+        // and the next send reaches here with the old task still alive).
+        // Cancelling it reclaims the orphaned POST, and that task's catch
+        // self-silences via `Task.isCancelled`.
+        post?.cancel()
         post = Task {
             do { try await self.client.stream(request).drain() }
             catch {
@@ -1292,8 +1302,16 @@ public final class ConversationModel {
                 // Recording it stamped a spurious error onto a run that had
                 // just finished, and (issue #9) could set the rollback flag of
                 // the *next* run through the shared `phase.isBusy` guard.
+                //
+                // #25: `isCancelled` only covers a same-gen retirement. A run
+                // superseded via `load()` + a new send is not cancelled at
+                // supersede time — and if its POST dies on its own before the
+                // next send's slot write (where it would then be cancelled),
+                // it is never cancelled at all — so its late failure still
+                // lands here; the gen guard inside `recordPostError` is what
+                // silences that case.
                 if Task.isCancelled { return }
-                self.recordPostError(error)
+                self.recordPostError(error, gen: gen)
             }
         }
 
@@ -2252,7 +2270,22 @@ public final class ConversationModel {
     /// A failed POST is reported only if the run has not already ended on its own
     /// terms — a stream closed by `stop()` errors on the way out, and calling
     /// that a failure would be a lie the user cannot act on.
-    private func recordPostError(_ error: Error) {
+    ///
+    /// `gen` is the generation the caller's exchange was started under, and the
+    /// first gate is ownership (#25). This is the event-driven path the #21
+    /// timer gates cannot cover: the POST's catch fires whenever the POST dies,
+    /// and a superseded run's late failure would pass `phase.isBusy` on the
+    /// NEWER run's busy phase — stamping its banner, arming the #9 rollback for
+    /// a send the newer run never made, and expiring the newer run's hub
+    /// listener. `Task.isCancelled` at the call site covers a same-gen
+    /// retirement (the slot owner cancelled the task); this covers cross-gen
+    /// supersession, where the supersede path — `load()` has no busy gate and
+    /// neither bumps the generation nor cancels the POST, and the next send
+    /// overwrites the `post` slot with the old task alive — leaves the old POST
+    /// uncancelled. `runGeneration` is monotonic, so the equality check is the
+    /// whole ownership test; no second gate is needed.
+    private func recordPostError(_ error: Error, gen: Int) {
+        guard isCurrent(gen) else { return }
         guard phase.isBusy else { return }
         let message: String
         if let api = error as? APIError, api.isUnauthorized { message = "Signed out." }

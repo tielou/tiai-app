@@ -370,6 +370,7 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     private var _chatDetailQueue: [Data] = []
     private var _failUploads = false
     private var _completionFailure: Error?
+    private var _completionFailuresByID: [String: Error] = [:]
 
     /// When set, the completion POST throws this instead of returning the
     /// never-ending stream — the failed-POST path of issue #9. Settable so a
@@ -377,6 +378,19 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     var completionFailure: Error? {
         get { guarded { _completionFailure } }
         set { guarded { _completionFailure = newValue } }
+    }
+
+    /// Arms a one-shot failure for the completion POST whose body carries
+    /// this assistant message id (#25). Keyed rather than global: the global
+    /// `completionFailure` is transport-global, so arming it after
+    /// `awaitCompletion(2)` races the new POST's continuation hop — the stale
+    /// POST may not have reached the failure check yet, or the new one may
+    /// have. Keying to the stale run's assistant id is deterministic: only
+    /// that run's POST can carry that id. Consumed at the same point the
+    /// global flag is checked (after the completion gate's park), and
+    /// consumed-once like the gates.
+    func failCompletion(messageID: String, _ error: Error = APIError.unreachable("connection reset")) {
+        guarded { _completionFailuresByID[messageID] = error }
     }
 
     /// When set, POST /files throws — the failed-upload path. Settable so a
@@ -671,6 +685,16 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
         // of the run, not the instant the POST goes out), then fail if armed.
         await completionGate.parkIfArmed()
         if let failure = guarded { _completionFailure } { throw failure }
+        // Per-message failure (#25), consumed at the same point as the global
+        // flag — after the gate's park, so a test can arm it while the POST is
+        // provably held. The id is parsed from this call's own body outside
+        // the lock (the request is call-local; NSLock is not recursive), then
+        // the lookup/removal is one guarded step.
+        if let json = try? JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any],
+           let messageID = json["id"] as? String,
+           let failure = guarded({ _completionFailuresByID.removeValue(forKey: messageID) }) {
+            throw failure
+        }
         // The real one stays open for the whole generation and yields nothing;
         // an empty stream that ends at once would let a bug that ignores the
         // socket look correct, so it stays open until cancelled.
@@ -3661,6 +3685,111 @@ private func makePostFailureFixture(chatID: String?) -> (
 
     #expect(conversation.turns.count == 2, "the user turn and its answer survive a stop")
     #expect(conversation.draft.isEmpty, "nothing is put back in the composer")
+}
+
+/// Issue #25, the waiting case. `load()` has no busy gate: it writes `.ready`
+/// mid-run without bumping the generation or cancelling the POST, and the
+/// next send overwrites the `post` slot with the old POST task still alive.
+/// When that orphaned POST later dies with a real failure, its catch runs on
+/// the NEWER run's busy phase: the old `phase.isBusy` guard alone let it
+/// stamp its error banner, arm the #9 rollback for a send the newer run
+/// never made, and `hub.expire(chatID:)` the newer run's listener. The fix
+/// is the gen guard first in `recordPostError` (plus the slot-write cancel).
+@Test @MainActor func supersededPostFailureDoesNotKillTheNewerRun() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+    transport.gateNextCompletion()
+
+    conversation.draft = "first"
+    conversation.send()
+    try await transport.awaitCompletion(1)
+    // Proof run 1's POST is the one held open inside the transport.
+    #expect(transport.isCompletionGateParked)
+    // Run 1's assistant id, read from the recorded POST body.
+    let firstID = try #require(transport.assistantMessageID)
+
+    // The supersede path. The fixture's chat-1 detail is EMPTY (the scripted
+    // tree has no messages), so the heal path in `load()` cannot fire and the
+    // load settles deterministically to `.ready` while run 1's POST is still
+    // parked — no chatDetailOverride needed.
+    await conversation.load()
+
+    conversation.draft = "second"
+    conversation.send()
+    try await transport.awaitCompletion(2)
+    let secondID = try #require(transport.assistantMessageID)
+
+    // The stale POST dies — keyed to run 1's message id so only that request
+    // can consume it (the global flag would race run 2's continuation hop).
+    transport.failCompletion(messageID: firstID)
+    transport.releaseCompletion()
+    // Give the superseded POST's catch a chance to misfire into the newer
+    // run (same catch-window idiom as `parkedRunDoesNotRollback`).
+    try await Task.sleep(for: .milliseconds(150))
+
+    // Asserted BEFORE any frames are injected for run 2: pre-fix the late
+    // failure stamped its banner on run 2's `.waiting` phase, expired run 2's
+    // listener, and the rollback gate then fired — red in both orderings.
+    #expect(conversation.error == nil,
+            "a superseded run's POST failure must not stamp the newer run: \(conversation.error ?? "nil")")
+    #expect(conversation.turns.contains { $0.isUser && $0.text == "second" },
+            "the newer run's user turn must not be rolled back")
+    #expect(conversation.draft.isEmpty, "nothing is put back in the composer")
+
+    // And run 2 must still be able to finish: its listener survived.
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: secondID,
+        inner: ["type": "response.output_text.delta", "delta": "two"]))
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: secondID,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(5)) {
+        conversation.phase == .ready && conversation.turns.last?.text == "two"
+    }
+    #expect(conversation.error == nil)
+}
+
+/// Issue #25, the streaming case. Same supersede, but the newer run is
+/// already `.streaming` when the orphaned POST dies — `phase.isBusy` passes
+/// there too, and the banner lands even though no rollback fires (the
+/// rollback gate wants `.waiting`).
+@Test @MainActor func supersededPostFailureDoesNotStampAStreamingRun() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+    transport.gateNextCompletion()
+
+    conversation.draft = "first"
+    conversation.send()
+    try await transport.awaitCompletion(1)
+    #expect(transport.isCompletionGateParked)
+    let firstID = try #require(transport.assistantMessageID)
+
+    // Empty fixture detail → deterministic `.ready`; see the waiting test.
+    await conversation.load()
+
+    conversation.draft = "second"
+    conversation.send()
+    try await transport.awaitCompletion(2)
+    let secondID = try #require(transport.assistantMessageID)
+
+    // Put run 2 into `.streaming` before the stale POST dies.
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: secondID,
+        inner: ["type": "response.output_text.delta", "delta": "two"]))
+    try await waitUntil { conversation.phase == .streaming }
+
+    transport.failCompletion(messageID: firstID)
+    transport.releaseCompletion()
+    try await Task.sleep(for: .milliseconds(150))
+    #expect(conversation.error == nil,
+            "a superseded run's POST failure must not stamp the streaming run: \(conversation.error ?? "nil")")
+
+    // Run 2 finishes untouched — its listener was not expired either.
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: secondID,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(5)) {
+        conversation.phase == .ready && conversation.turns.last?.text == "two"
+    }
+    #expect(conversation.error == nil)
 }
 
 @Test @MainActor func midStreamDropDoesNotRollback() async throws {
