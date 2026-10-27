@@ -3244,6 +3244,144 @@ private func makePostFailureFixture(chatID: String?) -> (
     #expect(conversation.turns.count == 4)
 }
 
+@Test @MainActor func abandonMidStreamDoesNotPoisonTheNextRunsBuffer() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+
+    conversation.draft = "first"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let firstID = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: firstID,
+        inner: ["type": "response.output_text.delta", "delta": "one"]))
+    // Proof run 1's drain is alive inside the frame loop: the delta reached
+    // the buffer and the flusher published it.
+    try await waitUntil { conversation.turns.last?.text == "one" }
+
+    // The bug: `abandon` bumps the generation, but neither expires the hub
+    // nor cancels frame iteration — run 1's drain KEEPS iterating, and its
+    // writes target the model-level `pending`, which is about to belong to
+    // run 2 (issue #16).
+    conversation.abandon()
+
+    conversation.draft = "second"
+    conversation.send()
+    try await transport.awaitCompletion(2)
+    let secondID = try #require(transport.assistantMessageID)
+    #expect(secondID != firstID)
+    // Run 2's drain has installed its own `pending` by now.
+    try await Task.sleep(for: .milliseconds(100))
+
+    // A stale delta for run 1's message, arriving after run 2 installed its
+    // buffer. Run 2's drain filters it out by message id; run 1's drain is
+    // the one that reads it — and must not write it anywhere.
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: firstID,
+        inner: ["type": "response.output_text.delta", "delta": "STALE-"]))
+
+    // Run 2's own delta and terminal frame.
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: secondID,
+        inner: ["type": "response.output_text.delta", "delta": "two"]))
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: secondID,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+
+    #expect(conversation.turns.count == 4)
+    // Without the guard: "STALE-two" — run 1's drain appended the stale
+    // delta into run 2's buffer.
+    #expect(conversation.turns[3].text == "two",
+            "a superseded drain must not write into the newer run's buffer: \(conversation.turns[3].text)")
+    #expect(conversation.turns[1].text == "one")
+    #expect(conversation.error == nil)
+    // Nothing lands late via the abandoned run's flusher or watchdog either.
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(conversation.turns[3].text == "two")
+    #expect(conversation.phase == .ready)
+}
+
+/// Issue #16, the reachable path. An exchange's drain lives inside `run`,
+/// which `abandon` cancels — and cancelling the iterating task ends the
+/// `AsyncStream` loop, so the exchange path unwinds by itself. The RESOLVE's
+/// drain is the exposed one: `resolve()` runs it in a bare Task that is not
+/// stored in `run` (issue #12), so abandon cannot cancel it, and abandon
+/// neither expires the hub nor ends the frame iteration. The stale resolve
+/// keeps looping, and its writes target the model-level `pending` — which
+/// the next run has just installed. Without drain's id guard a stale delta
+/// for the parked message lands inside the NEW run's answer.
+@Test @MainActor func abandonMidResolveStreamDoesNotPoisonTheNextRunsBuffer() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+
+    // Park a run on an ask_user question (same fixture as the parked tests).
+    conversation.draft = "book me a trip"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let firstID = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: firstID,
+        inner: ["done": false, "output": [AskUserFixture.outputItem]]))
+    try await waitUntil { conversation.phase == .ready }
+    let call = try #require(conversation.turns.last?.awaitingCall)
+
+    // Answer it. The resolve's hub subscriber is installed synchronously
+    // inside `resolve()` (before the POST), so the delta below is buffered and
+    // the resumed drain — running under the SAME assistant message id —
+    // cannot miss it.
+    conversation.resolve(
+        messageID: firstID, call: call, action: .answer,
+        answers: .object(["meal": .string("pizza")]))
+    try await waitUntil { !transport.resolveBodies.isEmpty }
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: firstID,
+        inner: ["type": "response.output_text.delta", "delta": "one"]))
+    // Proof the resolve's drain is alive in the frame loop: the delta reached
+    // the buffer and the flusher published it.
+    try await waitUntil { conversation.turns.last?.text == "one" }
+
+    // The bug: abandon bumps the generation, but the resolve Task is
+    // untracked and uncancellable and the hub is not expired — the drain
+    // KEEPS iterating, and `pending` is about to belong to run 2.
+    conversation.abandon()
+    #expect(conversation.phase == .ready)
+
+    conversation.draft = "second"
+    conversation.send()
+    try await transport.awaitCompletion(2)
+    let secondID = try #require(transport.assistantMessageID)
+    #expect(secondID != firstID)
+    // Run 2's drain has installed its own `pending` by now.
+    try await Task.sleep(for: .milliseconds(100))
+
+    // A stale delta for the parked message, arriving after run 2 installed
+    // its buffer. Run 2's drain filters it out by message id; the resolve's
+    // drain is the one that reads it — and must not write it anywhere.
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: firstID,
+        inner: ["type": "response.output_text.delta", "delta": "STALE-"]))
+
+    // Run 2's own delta and terminal frame.
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: secondID,
+        inner: ["type": "response.output_text.delta", "delta": "two"]))
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: secondID,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+
+    #expect(conversation.turns.count == 4)
+    // Without the guard: "STALE-two" — the stale resolve's drain appended
+    // the stale delta into run 2's buffer.
+    #expect(conversation.turns[3].text == "two",
+            "a superseded resolve drain must not write into the newer run's buffer: \(conversation.turns[3].text)")
+    #expect(conversation.turns[1].text == "one")
+    #expect(conversation.error == nil)
+    // Nothing lands late via the stale resolve's flusher or watchdog either.
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(conversation.turns[3].text == "two")
+    #expect(conversation.phase == .ready)
+}
+
 @Test @MainActor func slowStopDoesNotKillTheNewerRun() async throws {
     let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
 

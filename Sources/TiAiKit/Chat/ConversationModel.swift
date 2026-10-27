@@ -1554,6 +1554,26 @@ public final class ConversationModel {
         var erroredOnce = false
         var grace: Task<Void, Never>?
         for await frame in frames {
+            // A drain superseded after its caller's guard (exchange's G3, the
+            // resume's R3) must stop writing: `abandon` bumps the generation
+            // but neither expires the hub nor cancels frame iteration, so this
+            // loop keeps delivering frames to a run that no longer owns
+            // anything — and `pending` is the model-level buffer, so its
+            // deltas would append into the NEW run's buffer (issue #16).
+            // `break`, not `continue`, because a half-dead drain's 60 s
+            // silence watchdog is not generation-gated: left iterating it
+            // would later fire `hub.expire(chatID:)` on the shared chatID and
+            // kill the NEWER run's listener. Breaking also reaches the
+            // watchdog/grace/flusher cancels below the loop and unregisters
+            // the hub subscriber via the stream's `onTermination`; the final
+            // flush is already id-gated, so nothing stale flushes here (the
+            // #11 fix).
+            // Why this guard can never false-fire mid-run: `pending` is
+            // assigned only at this drain's install (just above, synchronously
+            // after the caller's generation guard) and at the final flush
+            // (after the loop), so mid-loop `pending?.id != assistantID` can
+            // only mean superseded.
+            guard pending?.id == assistantID else { break }
             if let messageID = frame.messageID, messageID != assistantID { continue }
             // Only frames for this message count — the filter above is what
             // makes that true, so the flag goes directly under it (issue #9).
@@ -1566,6 +1586,9 @@ public final class ConversationModel {
                     characters: pending.text.count,
                     chatID: chatID)
             }
+            // Abandon plus a newer send can interleave at `activity.update`'s
+            // await: everything below belongs to whoever owns `pending` now.
+            guard pending?.id == assistantID else { break }
             if let usage = frame.usage { pending?.usage = usage }
             // The server's own summary for the chat, when it got one mid-run.
             if let generated = frame.title {
