@@ -169,3 +169,121 @@ struct TwoModelsOneRibbon {
         #expect(ribbon.activeChatID == nil)
     }
 }
+
+/// Issue #20: a brand-new chat raises its ribbon before the server has named
+/// the chat, so the owner token starts nil — and nil matches *anything*.
+/// Nothing used to upgrade the token when the run adopted its id, so the
+/// ribbon stayed unclaimed for its whole run and any other chat's `finish`
+/// could close it. `claim` closes that window at adoption.
+@Suite(.serialized)
+struct RibbonClaim {
+    /// The acceptance scenario, stub-level: raise unclaimed, adopt (claim),
+    /// a foreign finish no-ops, the adopting run still closes its own.
+    @Test @MainActor func adoptedIdClaimsTheRibbonAndForeignFinishesCannotCloseIt() async {
+        let ribbon = GenerationActivity()
+        // A brand-new chat raises the ribbon: live, but unclaimed.
+        await ribbon.start(chatTitle: "New chat", model: "m", chatID: nil)
+        #expect(ribbon.isRibbonActive)
+        #expect(ribbon.activeChatID == nil)
+
+        // The run adopts the id the server chose: the token upgrades.
+        ribbon.claim(chatID: "chat-adopted")
+        #expect(ribbon.activeChatID == "chat-adopted")
+
+        // Pre-#20 the ribbon was still nil-owned here — nil matches anything —
+        // and this closed it. Now the ribbon has a real owner and a mismatch
+        // makes the finish a no-op.
+        await ribbon.finish(.finished, characters: 5, chatID: "chat-other")
+        #expect(ribbon.isRibbonActive, "an adopted-id ribbon is owned; another chat's finish must no-op")
+        #expect(ribbon.activeChatID == "chat-adopted")
+        // Updates from the wrong chat are gated the same way.
+        await ribbon.update(phase: .writing, characters: 40, chatID: "chat-other")
+        #expect(ribbon.acceptedUpdates == 0)
+
+        // The adopting run still closes its own ribbon at its end.
+        await ribbon.finish(.finished, characters: 9, chatID: "chat-adopted")
+        #expect(!ribbon.isRibbonActive)
+        #expect(ribbon.activeChatID == nil)
+    }
+
+    /// Pins the *only-while-nil* rule: a claim upgrades an unclaimed ribbon
+    /// and nothing else. Without this pin, an unconditional overwrite would
+    /// let a second chat's claim steal a live ribbon — the same class of bug
+    /// #15 was.
+    @Test @MainActor func claimUpgradesOnlyAnUnclaimedRibbon() async {
+        let ribbon = GenerationActivity()
+        // No ribbon live: there is nothing to upgrade, and no owner may be
+        // invented out of thin air.
+        ribbon.claim(chatID: "chat-z")
+        #expect(ribbon.activeChatID == nil)
+        #expect(!ribbon.isRibbonActive)
+
+        await ribbon.start(chatTitle: "Chat A", model: "m", chatID: "chat-a")
+        // A live ribbon with a real owner must survive a stranger's claim.
+        ribbon.claim(chatID: "chat-b")
+        #expect(ribbon.activeChatID == "chat-a", "a claim must never overwrite a real owner")
+        // The owner claiming its own id is a no-op (idempotent).
+        ribbon.claim(chatID: "chat-a")
+        #expect(ribbon.activeChatID == "chat-a")
+
+        // Only the nil-but-live (brand-new chat) state is claimable.
+        await ribbon.finish(.finished, characters: 1, chatID: "chat-a")
+        await ribbon.start(chatTitle: "New", model: "m", chatID: nil)
+        ribbon.claim(chatID: "chat-new")
+        #expect(ribbon.activeChatID == "chat-new")
+    }
+
+    /// The wiring: the model's adoption point (`adopt(chatID:)`) is what
+    /// claims the ribbon. A brand-new chat sends, raises the ribbon
+    /// unclaimed, adopts its id from the first frame — and from that moment
+    /// another chat's finish cannot close it. The adopting run then closes
+    /// its own ribbon as usual.
+    @Test @MainActor func aNewChatClaimsItsRibbonWhenTheStreamNamesItsId() async throws {
+        let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+        let hub = ChatEventHub(server: server)
+        let ribbon = GenerationActivity()
+        let transport = ScriptedTransport()
+        // A generated title lands on the first refetch, so the run's terminal
+        // block does not sit in `awaitGeneratedTitle`'s backoff (the default
+        // stub detail says "New Chat", which that loop deliberately ignores).
+        transport.chatDetailOverride = Data(
+            """
+            {"id":"chat-adopted","title":"Salzburg trains","updated_at":1,"created_at":1,
+             "chat":{"models":["local-personal"],"history":{"currentId":null,"messages":{}}}}
+            """.utf8)
+        let fresh = ConversationModel(
+            chatID: nil,
+            models: [ChatModel.stub("local-personal")],
+            client: OWUIClient(server: server, transport: transport),
+            hub: hub, activity: ribbon)
+
+        fresh.draft = "which train goes to Salzburg"
+        fresh.send()
+        try await transport.awaitCompletion()
+        let answerID = try #require(transport.assistantMessageID)
+        // The ribbon is up but unclaimed: a new chat has no id to raise it with.
+        try await waitUntil { ribbon.isRibbonActive }
+        #expect(ribbon.activeChatID == nil)
+
+        // The first frames for a real chat id are the adoption point: the
+        // model takes the id and claims the ribbon with it.
+        let frames = Frames.run(chat: "chat-adopted", message: answerID, answer: "the 08:15")
+        hub.receive(frames[0])
+        hub.receive(frames[1])
+        try await waitUntil { ribbon.activeChatID == "chat-adopted" }
+
+        // Another chat's finish — the exact #15 shape, now against a ribbon
+        // whose real owner was adopted mid-run. Pre-#20 the token was still
+        // nil here and this closed the ribbon.
+        await ribbon.finish(.finished, characters: 5, chatID: "chat-other")
+        #expect(ribbon.isRibbonActive, "the adopted id owns the ribbon; a foreign finish must no-op")
+        #expect(ribbon.activeChatID == "chat-adopted")
+
+        // The run ends: its own finish carries the adopted id and closes it.
+        hub.receive(frames[2])
+        try await waitUntil(timeout: .seconds(5)) { fresh.phase == .ready }
+        #expect(fresh.turns.last?.text == "the 08:15")
+        #expect(!ribbon.isRibbonActive, "the adopting run must still close its own ribbon")
+        #expect(ribbon.activeChatID == nil)
+    }
+}

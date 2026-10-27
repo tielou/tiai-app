@@ -222,6 +222,9 @@ public final class ConversationModel {
     /// ribbon app-wide — but is injectable so tests can drive two models that
     /// share one ribbon without racing every other test's use of `.shared`.
     private let activity: GenerationActivity
+    /// The in-flight (or finished) ribbon raise of the current run, so a
+    /// mid-run `claim` can order itself after `start` (issue #20).
+    private var ribbonRaise: Task<Void, Never>?
 
     public init(
         chatID: String?,
@@ -668,6 +671,10 @@ public final class ConversationModel {
             await activity.start(chatTitle: ribbonTitle,
                                  model: ribbonModel, chatID: ribbonChat)
         }
+        // Kept for the adoption point (issue #20): a new chat's `claim` has to
+        // land *after* this raise, because `start` suspends inside
+        // ActivityKit and the first frame can beat it back.
+        ribbonRaise = ribbon
         run = Task {
             // Taken *after* the wait, because until the upload answers there is
             // no file id to take.
@@ -1475,6 +1482,14 @@ public final class ConversationModel {
             outcome.failure == nil ? .finished : .stopped,
             characters: turns.first(where: { $0.id == assistantID })?.text.count ?? 0,
             chatID: chatID)
+        // Same family as #17: `activity.finish` is a real suspension on iOS
+        // (ActivityKit's `end`), so an abandon can interleave exactly here.
+        // The notification below, the streaming stamp and `.ready` belong to
+        // the run that owns the state now — a just-abandoned run must not
+        // announce an answer the user walked away from. (`abandon` has
+        // already cleared the streaming flag and stamped `.ready` itself,
+        // so returning here leaves nothing dangling.)
+        guard isCurrent(gen) else { return }
         if outcome.failure == nil {
             // Only worth saying when nobody is watching: announcing an answer the
             // user is already reading is worse than silence, and the notifier
@@ -2355,6 +2370,35 @@ public final class ConversationModel {
     private func adopt(chatID: String) {
         guard self.chatID == nil else { return }
         self.chatID = chatID
+        // Issue #20: a brand-new chat raised its ribbon with no owner (there
+        // was no id yet), and an unclaimed ribbon matches *any* finish — any
+        // other chat's run ending could close it. The moment this chat has a
+        // real id, upgrade the token so only this run can close its ribbon.
+        // `claim` is only-while-nil, so if another chat's ribbon is live
+        // (this chat's `start` no-oped) the claim cannot steal it.
+        //
+        // Chained onto the raise, not fired on the spot: on iOS `start`
+        // suspends inside `Activity.request`, and the frame that carries the
+        // adopted id can arrive first — claiming before the raise lands would
+        // no-op (no ribbon yet) and then be written over by the raise's own
+        // (nil) token. Awaiting the raise makes the order deterministic.
+        //
+        // The claim is staleness-gated (issue #20 review): a slow
+        // `Activity.request` can land after this run already finished (fast
+        // offline failure: finish no-ops on the nil activity, then the raise
+        // finally strands a ribbon). Claiming that orphan would make it
+        // owned-by-a-dead-run — worse than nil-owned, which any later finish
+        // could clear. If this run no longer owns the model (generation
+        // bumped) or is no longer busy, the ribbon it left behind is not
+        // worth protecting. The gate also stops a late claim from this chat
+        // stamping a *different* chat's freshly raised, still-unclaimed ribbon.
+        let gen = runGeneration
+        let raise = ribbonRaise
+        Task { @MainActor [weak self] in
+            await raise?.value
+            guard let self, self.runGeneration == gen, self.phase.isBusy else { return }
+            self.activity.claim(chatID: chatID)
+        }
         // Deliberately no title write here. The server is generating a summary for
         // this chat right now; naming it from the client at this moment is a race
         // the client loses, and losing means a good title gets replaced by the

@@ -62,14 +62,17 @@ public struct GenerationActivityAttributes: Codable, Hashable {
 ///
 /// A match is: either side nil, or the two ids equal. nil means *unclaimed*:
 /// a brand-new chat raises its ribbon before the server has answered with an
-/// id, and nothing ever upgrades the token when the run adopts the id later —
-/// a new chat's ribbon stays nil-owned for its whole run. The identity
-/// `start` had was nil, and `finish` passes the *current* (adopted) id, so a
-/// nil owner must match anything or the adopting run could never close its
-/// own ribbon. The accepted trade: while a nil-owner ribbon is live, any
-/// finish may close it — strictly better than stranding the new chat's
-/// ribbon forever, and identical to the pre-fix behavior. Closing the window
-/// for real means claiming the token at adoption (filed as a follow-up).
+/// id. The identity `start` had was nil, and `finish` passes the *current*
+/// (adopted) id, so a nil owner must match anything or the adopting run
+/// could never close its own ribbon. The accepted trade: while a nil-owner
+/// ribbon is live, any finish may close it — strictly better than stranding
+/// the new chat's ribbon forever.
+///
+/// Issue #20 closed the window that trade left open: the nil-owner state now
+/// lasts only from `start` until the run adopts the id the server chose,
+/// because the model's adoption point calls `claim`, which upgrades the
+/// token nil → real id. From that moment on the ribbon is owned and only
+/// the adopting run's calls match it.
 private func ribbonMatches(owner activeChatID: String?, caller chatID: String?) -> Bool {
     activeChatID == nil || chatID == nil || activeChatID == chatID
 }
@@ -124,6 +127,23 @@ public final class GenerationActivity {
         // The owner token is recorded only for a ribbon that actually exists —
         // a refused request leaves nothing to guard.
         activeChatID = activity == nil ? nil : chatID
+    }
+
+    /// Upgrades a live, unclaimed ribbon's owner token to a real chat id
+    /// (issue #20).
+    ///
+    /// A brand-new chat raises its ribbon with `chatID: nil` — the server has
+    /// not named the chat yet — and while the token is nil `ribbonMatches`
+    /// lets *any* finish close the ribbon. When the run adopts the id the
+    /// stream carried, this is what makes the ribbon owned. Only ever
+    /// nil → id: a ribbon that already has a real owner is never re-assigned.
+    /// (A late claim could still upgrade a *different* chat's live-but-
+    /// unclaimed ribbon — the caller gates claims on run ownership so a
+    /// stale run never gets here; see ConversationModel.adopt.) No-ops when
+    /// no ribbon is live — there is nothing to upgrade.
+    public func claim(chatID: String) {
+        guard activity != nil, activeChatID == nil else { return }
+        activeChatID = chatID
     }
 
     public func update(phase: GenerationActivityAttributes.ContentState.Phase,
@@ -204,6 +224,14 @@ public final class GenerationActivity {
         // a second chat's start no-ops and the owner stays whoever raised it.
         guard !isRibbonActive else { return }
         isRibbonActive = true
+        activeChatID = chatID
+    }
+
+    /// Same semantics as the iOS variant's `claim`: upgrades a live,
+    /// unclaimed ribbon's owner to a real chat id, never overwrites a real
+    /// owner, and no-ops when no ribbon is live.
+    public func claim(chatID: String) {
+        guard isRibbonActive, activeChatID == nil else { return }
         activeChatID = chatID
     }
 
