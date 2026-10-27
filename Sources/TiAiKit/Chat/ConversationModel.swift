@@ -349,6 +349,16 @@ public final class ConversationModel {
         }
         let cacheKey = DiskCache.key("chat-\(chatID)",
                                      host: client.server.baseURL.host ?? "local")
+        // A run in flight owns the phase (issue #19). A pull-to-refresh during
+        // a live run used to drop the phase to .loading/.ready whatever the run
+        // was doing: the composer unlocked mid-answer, and — because
+        // `reconcileUntilClosed` refuses to watch a run nobody considers live —
+        // the reload also disarmed the very loop that is supposed to converge
+        // the transcript on the server. The run settles the phase when it ends;
+        // a refresh is not an end. Ownership covers the heal below too: the
+        // live run is already watching its own message, so a mid-run load must
+        // neither restamp the phase nor start a second watcher on it.
+        let runInFlight = phase.isBusy
         // Cached first. Opening a chat used to be a blank screen for the length
         // of a round trip, which is the single thing that most makes the app feel
         // slow — the transcript is already on the phone from the last time you
@@ -356,8 +366,8 @@ public final class ConversationModel {
         // transcript on screen instead of trading it for an error banner.
         if let cached = DiskCache.load(ChatDetail.self, key: cacheKey) {
             apply(cached)
-            phase = .ready
-        } else {
+            if !runInFlight { phase = .ready }
+        } else if !runInFlight {
             phase = .loading
         }
         do {
@@ -377,7 +387,14 @@ public final class ConversationModel {
             // This is the part that makes the fix durable: however a run got
             // mis-ended — dead socket, misread frame, app killed mid-answer —
             // re-entering the chat now converges on what the server has.
-            if let last = turns.last, !last.isUser,
+            //
+            // Only when no run is live (issue #19 review): a mid-run load whose
+            // reloaded tree happens to end on the run's own open assistant
+            // used to stamp `.streaming` over `.waiting`/`.stopping` and spawn
+            // a SECOND `reconcileUntilClosed` on the message the live run is
+            // already watching — two loops, double GETs, one record. The live
+            // run is watching that message; there is nothing to heal.
+            if !runInFlight, let last = turns.last, !last.isUser,
                let stored = detail.messages[last.id], stored.done != true {
                 phase = .streaming
                 Task {
@@ -386,7 +403,7 @@ public final class ConversationModel {
                     // we were watching — a send started mid-heal owns the phase.
                     if case .streaming = phase, post == nil { phase = .ready }
                 }
-            } else {
+            } else if !runInFlight {
                 phase = .ready
             }
         } catch {
@@ -394,7 +411,7 @@ public final class ConversationModel {
             // cached transcript on screen, a dead network should keep the screen
             // as it is, not replace readable messages with a red banner.
             if detail == nil { self.error = error.localizedDescription }
-            phase = .ready
+            if !runInFlight { phase = .ready }
         }
     }
 
@@ -1766,12 +1783,18 @@ public final class ConversationModel {
             // there is no file on the first miss.
             let owesFile = finished.calls.contains { $0.name == "display_file" }
             let api = client
+            // Which run this adopt belongs to. The retry loop below can outlive
+            // the run — and the rebuild in `adoptStoredMessage` is a wholesale
+            // `turns` replacement, so it must refuse to run once a newer run
+            // has started: that run's placeholder rows exist only locally and
+            // a rebuild would delete them (issue #19).
+            let gen = runGeneration
             Task { @MainActor [weak self] in
                 for attempt in 0..<(owesFile ? 5 : 1) {
                     if attempt > 0 { try? await Task.sleep(for: .seconds(1)) }
                     guard let model = self else { return }
                     if await ConversationModel.adoptStoredMessage(
-                        model, client: api, chat: chat, id: id, streamed: streamed)
+                        model, client: api, chat: chat, id: id, streamed: streamed, gen: gen)
                     { break }
                 }
             }
@@ -1787,13 +1810,36 @@ public final class ConversationModel {
     /// can be missing both. Leaving and re-entering the chat refetched and they
     /// appeared — which is the asymmetry that makes a feature look broken rather
     /// than late.
+    ///
+    /// This is also the post-run read that closes issue #19 on the clean-terminal
+    /// path: `reconcileUntilClosed` is only reached by runs that ended without a
+    /// terminal frame (and by the heal-on-open), so after a normal finish this
+    /// fetch is the only thing that looks at the record — and when a mid-run
+    /// reload dropped the streaming row, it is the only thing that can put it
+    /// back.
     private static func adoptStoredMessage(
         _ model: ConversationModel, client: OWUIClient, chat: String,
-        id: String, streamed: String
+        id: String, streamed: String, gen: Int
     ) async -> Bool {
         guard let detail = try? await client.chat(id: chat),
-            let stored = detail.messages[id],
-            let at = model.turns.firstIndex(where: { $0.id == id })
+            let stored = detail.messages[id]
+        else { return false }
+        // Issue #19: the row may be gone. A mid-run reload whose server tree
+        // did not yet contain this message dropped it, and flush skips every
+        // write for an absent id (#14, correct), so growing the row here was
+        // never an option — nothing re-added it and a visibly-live run showed
+        // nothing until you left the chat and came back. The stored message
+        // is here, so rebuild from the fresh detail: the same wholesale apply
+        // load() does, safe since #14 because every stream write resolves by
+        // id at write time, and it places the row at the tree-correct
+        // position for free. Only while this run is still current — a newer
+        // run's local placeholder rows are in no server tree, and rebuilding
+        // over them would delete them.
+        if model.turns.firstIndex(where: { $0.id == id }) == nil,
+           model.runGeneration == gen {
+            model.apply(detail)
+        }
+        guard let at = model.turns.firstIndex(where: { $0.id == id })
         else { return false }
         if stored.citedSources.isEmpty == false {
             model.turns[at].sources = stored.citedSources
@@ -2088,6 +2134,13 @@ public final class ConversationModel {
         // spinner on a dead chat, which is its own bug. So growth is the signal:
         // if neither the answer nor the reasoning has moved in half a minute,
         // nothing is coming.
+        // Which run this reconcile is watching for. The rebuild below is the
+        // one write in this loop that replaces `turns` wholesale, so it has to
+        // refuse to run once this watch has been superseded (a stop, a new run)
+        // — that newer run's local placeholder rows are not in any server tree
+        // yet, and rebuilding would delete them. The per-message `apply` is
+        // id-keyed and grow-only, so it never needed this.
+        let gen = runGeneration
         var watch = RunWatch(stallLimit: reconcileStallLimit)
         // How many ticks an open tool call has been allowed to buy. Without a
         // cap a call that never settles in the record — the server moved on, the
@@ -2106,7 +2159,25 @@ public final class ConversationModel {
             guard phase == .streaming || phase == .stopping else { return }
             self.detail = detail
             guard let message = detail.messages[messageID] else { return }
-            apply(message, to: messageID)
+            if turns.firstIndex(where: { $0.id == messageID }) != nil {
+                apply(message, to: messageID)
+            } else if isCurrent(gen) {
+                // Issue #19: the server has the message but the local array
+                // lost the row — the classic shape is a mid-run reload whose
+                // tree did not contain the streaming assistant yet (the
+                // server writes the message as the run goes). flush skips
+                // every write for an absent id (#14, correct), and
+                // `apply(message, to:)` only grows rows that exist, so
+                // without this nothing in the session re-attached the row and
+                // a visibly-live run showed nothing until you left the chat
+                // and came back. Rebuilding from the detail is the same
+                // wholesale `apply` load() already does — safe mid-run since
+                // #14 because every stream write resolves its destination by
+                // id at write time — and it places the row at the
+                // tree-correct position for free, converging the whole
+                // transcript rather than just the one row.
+                apply(detail)
+            }
             if message.done { return }
             if Turn(message).calls.contains(where: \.isAwaitingUser) {
                 // The run is waiting on a tap, not on the server. Show the
@@ -2220,15 +2291,14 @@ public final class ConversationModel {
     ///
     /// When the id is gone — a reload whose server tree does not contain this
     /// message (yet) — the write is skipped silently, for this run and every
-    /// later flush until some reload puts the turn back. The reloaded tree is
-    /// canonical, and `apply(message, to:)`/`adoptStoredMessage` grow turns
-    /// that exist but never re-add a missing one — the streamed text is safe
-    /// on the server and the next reload shows it, but nothing in this
-    /// session re-attaches the row (filed: reconcile should insert a turn the
-    /// server has and `turns` lacks). Appending here would invent a turn the
-    /// server tree does not have mid-run, twice over if the reload lands
-    /// again. The `firstIndex` scan runs once per flush tick (~16 Hz), not per
-    /// frame; transcript arrays are tens of entries, so the scan is noise.
+    /// later flush until something puts the turn back. The reloaded tree is
+    /// canonical, and appending here would invent a turn the server tree does
+    /// not have mid-run, twice over if the reload lands again. What puts the
+    /// row back is `reconcileUntilClosed`: when its detail has the message but
+    /// `turns` lacks the row, it rebuilds from the detail (issue #19), so a
+    /// dropped row converges without leaving the chat. The `firstIndex` scan
+    /// runs once per flush tick (~16 Hz), not per frame; transcript arrays are
+    /// tens of entries, so the scan is noise.
     private func flush(_ source: Turn, final: Bool = false) {
         guard let at = turns.firstIndex(where: { $0.id == source.id }) else { return }
         var turn = turns[at]

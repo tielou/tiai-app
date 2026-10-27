@@ -315,6 +315,16 @@ private typealias Frame = ChatEventSocket.Frame
     #expect(Markdown.blocks("") == [])
 }
 
+/// A chat detail whose tree carries only the user turn — the streaming
+/// assistant is not written yet, the way the server has it mid-run.
+private func chatDetailWithoutAssistant(_ chatID: String) -> Data {
+    Data("""
+    {"id":"\(chatID)","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"user-1","messages":{
+       "user-1":{"id":"user-1","role":"user","content":"first","done":true,"parentId":null,"childrenIds":[]}}}}}
+    """.utf8)
+}
+
 @MainActor
 private func waitUntil(timeout: Duration = .seconds(2), _ condition: () -> Bool) async throws {
     let deadline = ContinuousClock.now + timeout
@@ -2361,6 +2371,372 @@ enum AskUserFixture {
     #expect(!mine.streaming)
     let older = try #require(conversation.turns.first { $0.id == "old-assistant" })
     #expect(older.text == "older answer", "a shifted row must not be overwritten by the stream")
+}
+
+// Issue #19: a mid-run reload whose server tree does not (yet) contain the
+// streaming assistant drops the row from `turns`, and nothing re-added it.
+// flush skips writes for absent ids (#14, correct), and `apply(message,to:)`
+// / `adoptStoredMessage` grow turns that exist but never insert a missing
+// one — so the live transcript showed nothing for a run that visibly
+// happened, until leaving the chat and coming back.
+//
+// The fix is in the two places that re-read the record after a run: the
+// post-terminal-frame adopt (`adoptStoredMessage`) and `reconcileUntilClosed`
+// (runs that ended without a terminal frame, and the heal-on-open). When the
+// fetched detail HAS the message but `turns` lacks the row, they rebuild via
+// `apply(detail)` — the same wholesale rebuild load() already does, safe now
+// because every stream write resolves by id at write time. It also puts the
+// row at the tree-correct position for free.
+@Test @MainActor func reloadDroppingTheStreamingRowIsReAddedByReconcile() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-19-reload", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"),
+                           transport: transport),
+        hub: hub)
+    conversation.reconcileInterval = .milliseconds(1)
+
+    conversation.draft = "the question"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-19-reload", messageID: id, inner: [
+        "choices": [["index": 0, "delta": ["content": "partial "]]],
+    ]))
+    try await waitUntil { conversation.turns.last?.text.contains("partial") == true }
+
+    // Reload mid-run. The server has not written the assistant's message yet,
+    // so its tree carries only the user turn — the streaming row leaves the
+    // local array, and every later flush for this run is skipped (#14).
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-19-reload","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"user-1","messages":{
+       "user-1":{"id":"user-1","role":"user","content":"the question","done":true,"parentId":null,"childrenIds":[]}}}}}
+    """.utf8)
+    await conversation.load()
+    #expect(conversation.turns.firstIndex(where: { $0.id == id }) == nil,
+            "the reload must actually have dropped the streaming row")
+    // A refresh during a live run must not unlock the composer: the run owns
+    // the phase until it ends, whatever the reloaded tree looks like.
+    #expect(conversation.phase.isBusy,
+            "a mid-run reload must not hand the composer back while the run is live")
+
+    // The stream keeps going; its writes are dropped (the row is gone), but
+    // the server is accumulating the full answer.
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-19-reload", messageID: id, inner: [
+        "choices": [["index": 0, "delta": ["content": "answer."]]],
+    ]))
+    // The server closes the record about when the stream does — and the
+    // closed record now contains the assistant.
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-19-reload","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"\(id)","messages":{
+       "user-1":{"id":"user-1","role":"user","content":"the question","done":true,"parentId":null,"childrenIds":["\(id)"]},
+       "\(id)":{"id":"\(id)","role":"assistant","content":"partial answer.","model":"local-personal","done":true,"parentId":"user-1","childrenIds":[]}}}}}
+    """.utf8)
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-19-reload", messageID: id,
+                              inner: ["choices": [["index": 0, "finish_reason": "stop"]]]))
+
+    try await waitUntil(timeout: .seconds(8)) { conversation.phase == .ready }
+    // The post-run read of the record lands asynchronously (the adopt Task
+    // spawned when the run finished; `reconcileUntilClosed` plays the same
+    // role for runs that ended without a terminal frame).
+    try await waitUntil(timeout: .seconds(4)) {
+        conversation.turns.contains { $0.id == id }
+    }
+    let row = try #require(
+        conversation.turns.first { $0.id == id },
+        "the post-run read of the record must re-add the row the reload dropped")
+    #expect(row.text == "partial answer.",
+            "and land it with the stored text, without leaving the chat")
+    #expect(!row.streaming)
+    #expect(conversation.error == nil)
+}
+
+/// The same dropped row, on the other post-run read: a run that ends without
+/// a terminal frame (iOS kills the socket on a background sojourn) falls
+/// through to `reconcileUntilClosed`, which must re-add the row the same way.
+@Test @MainActor func droppedSocketAfterReloadStillLandsTheAnswer() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-19-drop", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"),
+                           transport: transport),
+        hub: hub)
+    conversation.reconcileInterval = .milliseconds(1)
+
+    conversation.draft = "the question"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-19-drop", messageID: id, inner: [
+        "choices": [["index": 0, "delta": ["content": "partial "]]],
+    ]))
+    try await waitUntil { conversation.turns.last?.text.contains("partial") == true }
+
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-19-drop","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"user-1","messages":{
+       "user-1":{"id":"user-1","role":"user","content":"the question","done":true,"parentId":null,"childrenIds":[]}}}}}
+    """.utf8)
+    await conversation.load()
+    #expect(conversation.turns.firstIndex(where: { $0.id == id }) == nil)
+
+    // The server finishes writing the answer, then the socket dies — no
+    // terminal frame ever arrives. The run falls through to the reconcile loop.
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-19-drop","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"\(id)","messages":{
+       "user-1":{"id":"user-1","role":"user","content":"the question","done":true,"parentId":null,"childrenIds":["\(id)"]},
+       "\(id)":{"id":"\(id)","role":"assistant","content":"partial answer.","model":"local-personal","done":true,"parentId":"user-1","childrenIds":[]}}}}}
+    """.utf8)
+    hub.expire(chatID: "chat-19-drop")
+
+    try await waitUntil(timeout: .seconds(8)) { conversation.phase == .ready }
+    let row = try #require(
+        conversation.turns.first { $0.id == id },
+        "the reconcile after a socket drop must re-add the dropped row too")
+    #expect(row.text == "partial answer.")
+    #expect(conversation.error == nil,
+            "an answer that landed off the record is not an empty answer")
+}
+
+// Issue #19 review, warning 1: the heal-on-open must only fire when no run is
+// live. A mid-run `load()` whose reloaded tree happens to end on the run's own
+// open assistant used to stamp `.streaming` over the run's phase (`waiting`
+// here, but `stopping` was worse) and spawn a SECOND `reconcileUntilClosed`
+// on a message the live run is already watching — two loops, double GETs, one
+// record. The live run owns its message; a refresh has nothing to heal.
+@Test @MainActor func midRunLoadDoesNotHealTheLiveRunsOwnMessage() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-19-healrace", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+
+    conversation.draft = "the question"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    // The record already carries both messages and still has the assistant
+    // open — exactly the shape the heal-on-open looks for. But this app did
+    // not mis-end that run: the run is live on the socket this very second.
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-19-healrace","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"\(id)","messages":{
+       "user-1":{"id":"user-1","role":"user","content":"the question","done":true,"parentId":null,"childrenIds":["\(id)"]},
+       "\(id)":{"id":"\(id)","role":"assistant","content":"partial","model":"local-personal","done":false,"parentId":"user-1","childrenIds":[]}}}}}
+    """.utf8)
+    // No frame has flushed yet, so the run sits at `.waiting` — the phase the
+    // old heal clobbered on its way to `.streaming`.
+    #expect(conversation.phase == .waiting)
+    let chatFetches: () -> Int = {
+        transport.paths.filter { $0 == "/api/v1/chats/chat-19-healrace" }.count
+    }
+    let before = chatFetches()
+    await conversation.load()
+    #expect(conversation.phase == .waiting,
+            "a mid-run load must not restamp the live run's phase — the run owns it")
+    // The heal is a spawned `reconcileUntilClosed`, and its first act is a
+    // GET. The load's own fetch is the only one allowed to happen; a second
+    // watcher on this message would have fetched again within the settle.
+    try await Task.sleep(for: .milliseconds(250))
+    #expect(chatFetches() == before + 1,
+            "the heal must not spawn a second reconcile watching the live run's message")
+    // And the live run is unharmed: its stream still drives the transcript.
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-19-healrace", messageID: id, inner: [
+        "choices": [["index": 0, "delta": ["content": "answer."]]],
+    ]))
+    try await waitUntil { conversation.turns.last?.text.contains("answer.") == true }
+}
+
+// Issue #19 review, warning 2: the wholesale `apply(detail)` rebuild in
+// `adoptStoredMessage` is gated on the run generation precisely because it
+// replaces `turns` with the fetched tree — which deletes every row that tree
+// does not contain yet, including a NEWER run's local-only placeholders. This
+// test makes the rebuild lose that race on purpose: the adopt's GET is parked
+// in the transport, a new run starts (bumping the generation and appending
+// placeholder rows no server tree has), and only then does the stale fetch
+// land. Remove the `runGeneration == gen` gate and the new run's rows are
+// clobbered out from under it.
+@Test @MainActor func staleAdoptRebuildDoesNotClobberTheNewerRun() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-19-adoptclob", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.reconcileInterval = .milliseconds(1)
+
+    // Run 1 ends the #19 way — a mid-run reload drops the streaming row, so
+    // the post-run adopt takes its rebuild branch (row absent locally,
+    // present in the record).
+    conversation.draft = "first"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let firstID = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-19-adoptclob", messageID: firstID, inner: [
+        "choices": [["index": 0, "delta": ["content": "partial "]]],
+    ]))
+    try await waitUntil { conversation.turns.last?.text.contains("partial") == true }
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-19-adoptclob","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"user-1","messages":{
+       "user-1":{"id":"user-1","role":"user","content":"first","done":true,"parentId":null,"childrenIds":[]}}}}}
+    """.utf8)
+    await conversation.load()
+    #expect(conversation.turns.firstIndex(where: { $0.id == firstID }) == nil,
+            "the reload must have dropped the streaming row (the rebuild branch precondition)")
+
+    // The record now HAS the finished answer — the adopt fetch will want to
+    // rebuild from it. Park that fetch inside the transport so the rebuild is
+    // provably in flight at the moment the new run starts.
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-19-adoptclob","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"\(firstID)","messages":{
+       "user-1":{"id":"user-1","role":"user","content":"first","done":true,"parentId":null,"childrenIds":["\(firstID)"]},
+       "\(firstID)":{"id":"\(firstID)","role":"assistant","content":"partial answer.","model":"local-personal","done":true,"parentId":"user-1","childrenIds":[]}}}}}
+    """.utf8)
+    // Two GETs want to land on the terminal frame: drain's `serverStillOpen`
+    // probe (which holds the run at `.streaming` until it answers) and, once
+    // the run ends, the adopt's own fetch. Park the probe first, then re-arm
+    // in the same main-actor turn — nothing else can slip a GET between them —
+    // so the fetch that ends up parked, and loses the race, is the adopt's.
+    transport.gateNextChatFetch()
+    defer { transport.releaseChatFetchGate() }
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-19-adoptclob", messageID: firstID,
+                              inner: ["choices": [["index": 0, "finish_reason": "stop"]]]))
+    try await waitUntil { transport.isChatFetchGateParked }
+    transport.releaseChatFetchGate()
+    transport.gateNextChatFetch()
+    // The record says `done`, so the probe answers "not still open", the run
+    // ends, and the adopt Task's GET is the next one through the door.
+    try await waitUntil { transport.isChatFetchGateParked }
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+
+    // A NEW run starts while the rebuild is parked mid-round-trip. Its user
+    // and assistant rows are local-only — no server tree contains them yet.
+    conversation.draft = "second"
+    conversation.send()
+    try await transport.awaitCompletion(2)
+    let secondID = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-19-adoptclob", messageID: secondID, inner: [
+        "choices": [["index": 0, "delta": ["content": "two"]]],
+    ]))
+    try await waitUntil { conversation.turns.last?.text == "two" }
+
+    // Let the stale fetch land. Its tree ends at run 1's answer and contains
+    // neither of run 2's rows; the generation gate must make it refuse.
+    transport.releaseChatFetchGate()
+    // Proof the fetch actually landed and raced: the mid-run load's GET, the
+    // `serverStillOpen` probe, and the adopt's GET.
+    try await waitUntil(timeout: .seconds(5)) {
+        transport.paths.filter { $0 == "/api/v1/chats/chat-19-adoptclob" }.count >= 3
+    }
+    try await Task.sleep(for: .milliseconds(150))
+
+    let survivor = try #require(
+        conversation.turns.first { $0.id == secondID },
+        "the superseded adopt must not rebuild away the newer run's placeholder")
+    #expect(survivor.text == "two",
+            "the newer run's streamed text must survive the stale rebuild")
+    #expect(conversation.phase.isBusy, "the newer run is still live")
+    // The rebuild was refused outright, not applied-then-patched: run 1's row
+    // stays where the reload left it (absent) until the next real load.
+    #expect(conversation.turns.firstIndex(where: { $0.id == firstID }) == nil)
+}
+
+// The same race against the OTHER wholesale rebuild: `reconcileUntilClosed`.
+// The discriminating detail is the loop's own phase guard — it passes on
+// `phase == .streaming`, and after an `abandon` + new send the NEW run is
+// streaming, so the guard waves the stale loop through. `isCurrent(gen)` is
+// the only thing left standing between the fetched tree and the newer run's
+// rows. Remove it and the rebuild deletes them.
+@Test @MainActor func staleReconcileRebuildDoesNotClobberTheNewerRun() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-19-recclob", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.reconcileInterval = .milliseconds(1)
+
+    // Run 1: dropped row again, but it ends by the socket dying — no terminal
+    // frame — so `reconcileUntilClosed` is the one holding the fetch.
+    conversation.draft = "first"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let firstID = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-19-recclob", messageID: firstID, inner: [
+        "choices": [["index": 0, "delta": ["content": "partial "]]],
+    ]))
+    try await waitUntil { conversation.turns.last?.text.contains("partial") == true }
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-19-recclob","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"user-1","messages":{
+       "user-1":{"id":"user-1","role":"user","content":"first","done":true,"parentId":null,"childrenIds":[]}}}}}
+    """.utf8)
+    await conversation.load()
+    #expect(conversation.turns.firstIndex(where: { $0.id == firstID }) == nil)
+
+    let fullTree = Data("""
+    {"id":"chat-19-recclob","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"\(firstID)","messages":{
+       "user-1":{"id":"user-1","role":"user","content":"first","done":true,"parentId":null,"childrenIds":["\(firstID)"]},
+       "\(firstID)":{"id":"\(firstID)","role":"assistant","content":"partial answer.","model":"local-personal","done":true,"parentId":"user-1","childrenIds":[]}}}}}
+    """.utf8)
+    // Two watchers read the record when the socket dies: the adopt Task and
+    // the reconcile loop. The one-shot gate parks whichever GET arrives
+    // first; the other must NOT rebuild while its generation is still
+    // current (that would put the row back and take the grow-only branch
+    // later, never the rebuild). So the first answer out of the queue is a
+    // detail without the assistant — the early watcher exits finding
+    // nothing — and the parked one gets the full tree once run 2 is live.
+    transport.chatDetailQueue = [chatDetailWithoutAssistant(firstID), fullTree]
+    transport.chatDetailOverride = fullTree
+    transport.gateNextChatFetch()
+    defer { transport.releaseChatFetchGate() }
+    hub.expire(chatID: "chat-19-recclob")
+    // A GET is parked. (The gate's continuation is deliberately not
+    // cancellation-cooperative, so the abandon below cannot wake it early —
+    // the race stays where the test put it.)
+    try await waitUntil { transport.isChatFetchGateParked }
+
+    // Supersede run 1 while its reconcile fetch is parked, then start run 2.
+    conversation.abandon()
+    conversation.draft = "second"
+    conversation.send()
+    try await transport.awaitCompletion(2)
+    let secondID = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-19-recclob", messageID: secondID, inner: [
+        "choices": [["index": 0, "delta": ["content": "two"]]],
+    ]))
+    try await waitUntil { conversation.turns.last?.text == "two" }
+    // The stale loop's `phase == .streaming` guard will pass — this is run 2's
+    // streaming, not the run the loop belongs to. That is exactly why the
+    // generation gate exists.
+    #expect(conversation.phase == .streaming)
+
+    transport.releaseChatFetchGate()
+    // load + the two post-run watchers, all answered.
+    try await waitUntil(timeout: .seconds(5)) {
+        transport.paths.filter { $0 == "/api/v1/chats/chat-19-recclob" }.count >= 3
+    }
+    try await Task.sleep(for: .milliseconds(150))
+
+    let survivor = try #require(
+        conversation.turns.first { $0.id == secondID },
+        "the superseded reconcile must not rebuild away the newer run's rows")
+    #expect(survivor.text == "two",
+            "the newer run's streamed text must survive the stale rebuild")
+    #expect(conversation.turns.firstIndex(where: { $0.id == firstID }) == nil,
+            "the rebuild was refused outright, not applied and re-patched")
 }
 
 // A long flight of newlines in a message renders as a tall empty column, which
