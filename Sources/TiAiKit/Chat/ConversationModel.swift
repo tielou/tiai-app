@@ -697,6 +697,41 @@ public final class ConversationModel {
             // the failed file now the user's decision, not the app's.
             let sawNewFailure = uploadFailureCount > uploadFailuresAtLastSend
             uploadFailuresAtLastSend = uploadFailureCount
+            // Issue #22: a stop pressed while this run was parked in
+            // `waitForUploads`. The wait is not cancellation-cooperative and
+            // `stop` never bumps the generation, so the gen guard above
+            // cannot see the stop — this is the first point after the wake
+            // where it is visible: `finishLocally` cancelled this Task in the
+            // same main-actor turn it settled the phase to `.ready`.
+            // Cancellation *is* the marker (the contract #18 set for edit's
+            // updateMessage window); without this guard the run would enter
+            // `exchange`, flip the UI back to `.waiting`, POST and stream a
+            // message the user already stopped. The failure checkpoint above
+            // was already re-synced, so one old upload failure cannot wedge
+            // later sends. Draft: mirror #8's abort — the message was never
+            // posted, so the text goes back to the composer, but only if the
+            // user has not typed in the meantime.
+            //
+            // This check runs BEFORE the #6/#8 abort branch on purpose: when
+            // a stop and an upload failure/timeout race, the stop wins and
+            // stays banner-free — `Task.isCancelled` takes precedence,
+            // because the stop is the newer intent (the same priority #18
+            // decided for edit's catch).
+            if Task.isCancelled {
+                if draft.isEmpty { draft = text }
+                // Same shape as the abort branch: await the raise first, or
+                // the finish no-ops on a nil activity and the raise finally
+                // lands as an orphaned ribbon. The generation re-check after
+                // that await: `ribbon.value` is a real suspension, and a new
+                // send (the phase has been `.ready` since the stop) could
+                // have raised this chat's next ribbon — a stopped run must
+                // not close the ribbon its successor raised (#5's lesson).
+                await ribbon.value
+                if gen == runGeneration {
+                    await activity.finish(.stopped, characters: 0, chatID: chatID)
+                }
+                return
+            }
             if sawNewFailure || uploadsTimedOut {
                 phase = .ready
                 // Restore only if the draft is still empty: a message typed

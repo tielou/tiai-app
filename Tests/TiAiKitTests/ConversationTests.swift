@@ -438,6 +438,7 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     private let resolveGate = OneShotGate()
     private let messageUpdateGate = OneShotGate()
     private let cooperativeMessageUpdateGate = CooperativeOneShotGate()
+    private let uploadGate = OneShotGate()
 
     /// Makes the *next* GET /chats/{id} wait until `releaseChatFetchGate()`.
     func gateNextChatFetch() { chatFetchGate.arm() }
@@ -494,6 +495,18 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     /// Resumes the parked cooperative message-update POST (and disarms an
     /// unused gate). Only reachable on the path where nothing cancelled.
     func releaseCooperativeMessageUpdateGate() { cooperativeMessageUpdateGate.release() }
+
+    /// Makes the *next* POST /files wait inside the transport until
+    /// `releaseUpload()` — so a test can hold an upload on the wire while a
+    /// send parks in `waitForUploads()` (issue #22). The parked request
+    /// lives in the upload's own Task, not the run's, and this gate
+    /// deliberately does not wake on cancellation: the upload outliving its
+    /// run's stop is the non-cooperative shape #22 is about.
+    func gateNextUpload() { uploadGate.arm() }
+    /// True while an upload is parked at the gate.
+    var isUploadGateParked: Bool { uploadGate.isParked }
+    /// Resumes the parked upload (and disarms an unused gate).
+    func releaseUpload() { uploadGate.release() }
 
     /// A one-shot gate: `arm()` makes the next `parkIfArmed()` wait until
     /// `release()`. Cancelling the waiting task does not wake it — see the
@@ -667,6 +680,9 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
             return (Data("{}".utf8), response(for: request, 200))
         }
         if path.hasSuffix("/files") || path.hasSuffix("/files/") {
+            // Park before recording, so `uploads` only grows once the test has
+            // let the request through — the same contract the other gates keep.
+            await uploadGate.parkIfArmed()
             if failUploads { throw UploadFailure() }
             guarded { _uploads.append(request.httpBody ?? Data()) }
             return (Data(#"{"id":"file-1","filename":"notes.txt","type":"text/plain","updated_at":1}"#.utf8),
@@ -1845,6 +1861,123 @@ enum AskUserFixture {
     // was recorded as saved (unlike the non-cooperative gate above, where the
     // parked request is let through and the save does land).
     #expect(transport.messageUpdateBodies.isEmpty)
+}
+
+/// Regression for issue #22: a stop pressed while `send()` is parked in
+/// `waitForUploads()` is acknowledged (`.stopping` → `.ready` via
+/// `finishLocally`) but must not go on to post. The wait is not
+/// cancellation-cooperative and `stop` never bumps the generation, so —
+/// exactly like #18 for edit — the run Task itself has to refuse to continue
+/// once the upload finally lands: cancellation *is* the marker. The ribbon
+/// `send()` raised must be closed by the cancelled run (exchange's exits
+/// never run), and no error banner may appear.
+@Test @MainActor func stopDuringTheUploadWaitCancelsTheSend() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    // Injected seam (#15): the cancelled run has to close the ribbon it raised.
+    let ribbon = GenerationActivity()
+    let conversation = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-personal", caps: ["vision": true])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub, activity: ribbon)
+
+    transport.gateNextUpload()
+    // The upload must land after the stop whatever the assertions do — a
+    // parked gate outliving the test would hang the transport for nobody.
+    defer { transport.releaseUpload() }
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "shot.jpg", mimeType: "image/jpeg")
+    try await waitUntil { transport.isUploadGateParked }
+
+    conversation.draft = "hello"
+    conversation.send()
+    // The run is parked in `waitForUploads`: phase `.waiting`, upload still
+    // on the wire, and the ribbon has gone up owned by this chat.
+    #expect(conversation.phase == .waiting)
+    try await waitUntil { ribbon.activeChatID == "chat-1" }
+
+    // Stop lands inside the upload-wait window: acknowledged as `.stopping`,
+    // then `finishLocally` settles to `.ready` once the stop POST returns —
+    // cancelling the run Task on the way.
+    conversation.stop()
+    #expect(conversation.phase == .stopping)
+    try await waitUntil { conversation.phase == .ready }
+
+    // The upload lands — successfully, so no failure-abort branch fires.
+    transport.releaseUpload()
+    try await waitUntil { transport.uploads.count == 1 }
+    // Settle window: without the cancellation guard the run Task enters
+    // `exchange` here and the completion POST is recorded near-instantly,
+    // so this sleep is what the mutation trips on.
+    try await Task.sleep(for: .milliseconds(150))
+
+    #expect(transport.completionBodies.isEmpty,
+            "the stopped send must not POST a completion after stop was acknowledged")
+    #expect(conversation.error == nil,
+            "a stop the user asked for is not an error — no banner")
+    #expect(conversation.phase == .ready,
+            "the settled phase must stay settled — no flip back to .waiting")
+    #expect(conversation.turns.isEmpty,
+            "no phantom turns for a send that never posted")
+    // The ribbon: closed by the cancelled run, token cleared.
+    #expect(!ribbon.isRibbonActive, "the cancelled run must close the ribbon it raised")
+    #expect(ribbon.activeChatID == nil)
+    // Draft semantics, mirroring #8's abort: the message was never posted, so
+    // the text goes back to the composer rather than into the void.
+    #expect(conversation.draft == "hello")
+    // Re-assert after the settle: nothing late re-posts, re-errors or re-raises.
+    try await Task.sleep(for: .milliseconds(150))
+    #expect(transport.completionBodies.isEmpty)
+    #expect(conversation.error == nil)
+    #expect(conversation.phase == .ready)
+    #expect(!ribbon.isRibbonActive)
+}
+
+// The priority decision of #22, pinned: when a stop and an upload failure
+// race, the stop wins and stays banner-free — `Task.isCancelled` takes
+// precedence because the stop is the newer intent (the same priority #18
+// decided for edit's catch). Without the ordering, the failure-abort branch
+// would run first and stamp "A previous upload failed…" after the user's
+// stop was already acknowledged.
+@Test @MainActor func stopOutranksARacingUploadFailure() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let ribbon = GenerationActivity()
+    let conversation = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-personal", caps: ["vision": true])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub, activity: ribbon)
+
+    transport.gateNextUpload()
+    defer { transport.releaseUpload() }
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "shot.jpg", mimeType: "image/jpeg")
+    try await waitUntil { transport.isUploadGateParked }
+
+    conversation.draft = "hello"
+    conversation.send()
+    #expect(conversation.phase == .waiting)
+
+    conversation.stop()
+    try await waitUntil { conversation.phase == .ready }
+
+    // The upload now lands FAILING: both conditions are true at the wake —
+    // cancelled and a new upload failure.
+    transport.failUploads = true
+    transport.releaseUpload()
+    // Settle: the failed upload wakes `waitForUploads` and the run Task
+    // resumes near-instantly; with the abort branch ahead of the cancel
+    // guard, the failure banner lands in this window.
+    try await Task.sleep(for: .milliseconds(250))
+
+    #expect(conversation.error == nil || conversation.error!.hasPrefix("Could not attach"),
+            "the send-abort banner must not appear after a stop; the attach path's own \"Could not attach\" note is the upload subsystem reporting a real failure, independent of the stopped send")
+    #expect(transport.completionBodies.isEmpty)
+    #expect(conversation.phase == .ready)
+    #expect(!ribbon.isRibbonActive, "the cancelled run still closes the ribbon it raised")
+    #expect(conversation.draft == "hello", "the stopped text returns to the composer either way")
 }
 
 @Test @MainActor func aThumbUpGoesToFeedback() async throws {
