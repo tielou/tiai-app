@@ -4242,9 +4242,11 @@ private func makePostFailureFixture(chatID: String?) -> (
 }
 
 /// Issue #16, the reachable path. An exchange's drain lives inside `run`,
-/// which `abandon` cancels — and cancelling the iterating task ends the
-/// `AsyncStream` loop, so the exchange path unwinds by itself. The RESOLVE's
-/// drain is the exposed one: `resolve()` runs it in a bare Task that is not
+/// which `abandon` cancels — but cancelling the iterating task does NOT
+/// end the `AsyncStream` loop (iteration ignores cancellation); the
+/// exchange path unwinds because the loop-top id guard breaks when a
+/// newer run installs its buffer. The RESOLVE's drain is the exposed
+/// one: `resolve()` runs it in a bare Task that is not
 /// stored in `run` (issue #12), so abandon cannot cancel it, and abandon
 /// neither expires the hub nor ends the frame iteration. The stale resolve
 /// keeps looping, and its writes target the model-level `pending` — which
@@ -4480,6 +4482,88 @@ private func makePostFailureFixture(chatID: String?) -> (
     #expect(conversation.turns.last?.text.contains("two") == true,
             "the new resolve's listener must survive a stale resolve's watchdog: got \"\(conversation.turns.last?.text ?? "nil")\"")
     #expect(conversation.error == nil)
+}
+
+/// Issue #4: `abandon` ended the run without publishing the pending buffer
+/// and without expiring the hub. Text streamed between two flusher ticks was
+/// lost from the transcript until a reload, and the abandoned run's hub
+/// listener stayed registered indefinitely — with no newer run to trip the
+/// #16 id guard, and the #21 generation-gated watchdog correctly never
+/// firing for a superseded run, nothing ended the stream.
+@Test @MainActor func abandonPublishesTheBufferAndEndsTheChatsStream() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    // Injected seam (#15): the drain's per-frame ribbon update is the only
+    // deterministic signal that a delta reached `pending` while the flusher
+    // is asleep (below) — `turns` cannot show buffered text by design.
+    let ribbon = GenerationActivity()
+    let conversation = ConversationModel(
+        chatID: "chat-1",
+        models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub, activity: ribbon)
+    // The flusher must never tick during this test: the only way text may
+    // reach `turns` is `abandon`'s own publish. The instance knob (#11/#21
+    // precedent) is read per tick, so arming it before the send puts the
+    // drain's first sleep past the end of the test.
+    conversation.flushInterval = .seconds(60)
+
+    conversation.draft = "go"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let firstID = try #require(transport.assistantMessageID)
+    try await waitUntil { hub.hasListener(for: "chat-1") }
+    try await waitUntil { ribbon.activeChatID == "chat-1" }
+
+    let updatesBefore = ribbon.acceptedUpdates
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: firstID,
+        inner: ["type": "response.output_text.delta", "delta": "held text"]))
+    // Proof the delta reached the buffer: the drain's per-frame ribbon update
+    // fired. Proof it is still buffered: the sleeping flusher published
+    // nothing, so the turn is the empty placeholder.
+    try await waitUntil { ribbon.acceptedUpdates > updatesBefore }
+    #expect(conversation.turns.last?.text == "",
+            "the flusher is asleep; nothing may be on screen before abandon")
+
+    conversation.abandon()
+    // Acceptance 1: the buffer is published BEFORE `.ready` — the streamed
+    // text is visible, the phase is ready, and the abandoned turn is settled
+    // (no spinner): the streaming flag was cleared and the non-final publish
+    // preserved it.
+    #expect(conversation.phase == .ready)
+    #expect(conversation.turns.last?.text == "held text")
+    #expect(conversation.turns.last?.streaming == false)
+    // Acceptance 2: the hub teardown. The abandoned run's listener is gone;
+    // its drain wakes on the finished stream, final-flushes the same text
+    // (id-gated, `pending` deliberately not nilled by abandon), and unwinds
+    // generation-inert.
+    #expect(!hub.hasListener(for: "chat-1"),
+            "abandon must end the abandoned run's hub stream")
+
+    // And the chat is reusable: a following send re-subscribes and streams
+    // as if nothing had been abandoned.
+    conversation.flushInterval = ConversationModel.flushInterval
+    conversation.draft = "second"
+    conversation.send()
+    try await transport.awaitCompletion(2)
+    try await waitUntil { hub.hasListener(for: "chat-1") }
+    let secondID = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: secondID,
+        inner: ["type": "response.output_text.delta", "delta": "two"]))
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: secondID,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(5)) {
+        conversation.turns.last?.text == "two" && conversation.phase == .ready
+    }
+    #expect(conversation.error == nil)
+    // The abandoned turn kept its text and stayed settled throughout.
+    let abandoned = try #require(conversation.turns.first { $0.id == firstID })
+    #expect(abandoned.text == "held text")
+    #expect(abandoned.streaming == false)
 }
 
 @Test @MainActor func slowStopDoesNotKillTheNewerRun() async throws {

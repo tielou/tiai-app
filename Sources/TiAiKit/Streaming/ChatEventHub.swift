@@ -215,6 +215,14 @@ public final class ChatEventHub {
         }
     }
 
+    /// Whether a listener for `chatID` is currently registered — the same
+    /// lookup `waitForSubscriber` polls, as a question. Test-support for
+    /// teardown assertions (issue #4): "abandon ended this chat's stream" is
+    /// only observable from outside the hub as the absence of a subscriber.
+    func hasListener(for chatID: String) -> Bool {
+        subscribers.values.contains { $0.chatID == chatID }
+    }
+
     /// Blocks until something is listening to `chatID`.
     ///
     /// A test that injects frames before the conversation has subscribed loses

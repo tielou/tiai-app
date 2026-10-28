@@ -1034,7 +1034,76 @@ public final class ConversationModel {
         run?.cancel()
         post?.cancel()
         post = nil
-        if let index = turns.lastIndex(where: \.isAssistant) { turns[index].streaming = false }
+        // Hub teardown (issue #4). The generation bump alone does not end the
+        // frame stream: `run?.cancel()` cannot stop a `for await` over an
+        // `AsyncStream` — cancellation does not terminate iteration — and the
+        // frame loop's #16 guard is id-based (abandon deliberately does not
+        // clear `pending`), so a superseded drain only breaks out when a NEW
+        // run installs its buffer. If no new run starts, the abandoned drain
+        // keeps its hub subscriber and 60 ms flusher alive indefinitely: the
+        // silence watchdog that used to be the backstop is generation-gated
+        // since #21 and correctly never fires for a superseded run. The
+        // So end the streams here, as `finishLocally` does for stop: the
+        // abandoned drain wakes on the closed stream, exits the loop, and its
+        // final flush — id-gated, and `pending` is still this run's —
+        // republishes the buffer as final and nils it; everything after the
+        // drain is generation-guarded inert. Gated on `phase.isBusy`: an
+        // idle model has nothing of its own streaming, and an orphaned
+        // duplicate of the same chatID abandoning while idle must not expire
+        // the live model's listener (the same accepted trade as `stop`,
+        // which can only fire while busy).
+        if phase.isBusy {
+            hub.expire(chatID: chatID ?? "")
+            // The waiting-listener sweep only under the #9 constraint from
+            // `recordPostError`: the sweep is global over the per-server
+            // shared hub, so it fires only when this model itself has no
+            // chat id — the case where the nil-chatID listener it would
+            // kill is most likely this model's own. Not a proof: two
+            // brand-new-chat models share the hub, and one abandoning can
+            // still sweep the other's waiting listener (filed as #30, same
+            // family as `finishLocally`'s unconditional sweep).
+            // `expire(chatID: "")` never matches a nil-chatID listener.
+            // A residual gap, accepted as pre-existing: a hub listener that
+            // has already adopted a real id while this model's `chatID` is
+            // still nil (the `adopt` hop has not landed) is missed by both
+            // sweeps — the same window `finishLocally` has, and inert
+            // thanks to the id guards.
+            if chatID == nil { hub.expireWaitingListeners() }
+        }
+        // One index for both jobs below, exactly as in `finishLocally`: the
+        // buffer's own turn while a buffer is in flight (the id match is the
+        // truth — a regenerate can have replaced the tail), the last
+        // assistant turn otherwise (drain already flushed, or the run never
+        // got a buffer).
+        let bufferIndex = pending.flatMap { p in turns.firstIndex(where: { $0.id == p.id }) }
+        if let index = bufferIndex ?? turns.lastIndex(where: \.isAssistant) {
+            turns[index].streaming = false
+        }
+        // Publish the buffer *before* declaring ready — the ordering reasons
+        // are `finishLocally`'s (issues #3/#9, and #4 is the same bug on the
+        // abandon path): any first-`.ready` observer — the UI, a test — reads
+        // `turns`, so `.ready` has to imply "the buffer is published". The
+        // streamed deltas live in `pending` between flush ticks, and on the
+        // path this method exists for — backgrounding, where the socket dies
+        // and the app may not — the next tick may never come, so without this
+        // the run's text vanished from the transcript until a reload.
+        //
+        // `publishPending` is keyed by message id, not generation, so the
+        // generation bump above does not suppress it — that is the point: the
+        // abandoned run's streamed text stays visible. It is the non-final
+        // flush, not `flush(final: true)`: the abandoned drain's own final
+        // flush (woken by the `hub.expire` above) stays authoritative for
+        // error and usage, and it settles `streaming` too. The flag is
+        // cleared above BEFORE publishing because the non-final flush
+        // preserves whatever streaming state the turn has — the abandoned
+        // turn must end up settled AND with its text, not spinnered. And
+        // `pending` must NOT be nilled here: the drain's final flush reads it.
+        if let pending, bufferIndex != nil {
+            // The non-final flush flips a busy phase back to `.streaming` when
+            // the buffer is non-empty (`flush`'s phase rule); unobservable —
+            // `phase = .ready` follows in the same synchronous main-actor turn.
+            publishPending(keeping: pending.id)
+        }
         phase = .ready
         // The abandoned run's exchange returns at its first generation guard and
         // never reaches its own ribbon `finish`, so close it here. `finish`
