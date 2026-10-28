@@ -244,9 +244,7 @@ enum AnswerText {
     /// actually applied. Handing the raw string over left the asterisks on screen
     /// — the block structure was rendered but the inline layer was not.
     private static func line(_ text: String, font: UIFont, color: UIColor) -> NSMutableAttributedString {
-        let options = AttributedString.MarkdownParsingOptions(
-            interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        let parsed = (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+        let parsed = MarkdownInline.parse(text)
         let out = NSMutableAttributedString(parsed)
         let full = whole(out)
         out.addAttribute(.foregroundColor, value: color, range: full)

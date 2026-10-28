@@ -172,10 +172,7 @@ struct ScrollableTableView: View {
     /// intent rather than a font, so the fonts are rebuilt from it against the
     /// cell's own monospaced base.
     private func inline(_ string: String, bold: Bool = false) -> AttributedString {
-        let options = AttributedString.MarkdownParsingOptions(
-            interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        let parsed = (try? AttributedString(markdown: string, options: options))
-            ?? AttributedString(string)
+        let parsed = MarkdownInline.parse(string)
         var out = parsed
         let base = Font.system(size: 12, design: .monospaced)
         for run in parsed.runs {

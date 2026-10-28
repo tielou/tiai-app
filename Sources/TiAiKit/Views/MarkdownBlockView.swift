@@ -111,10 +111,12 @@ struct MarkdownBlockView: View {
     /// `.inlineOnlyPreservingWhitespace` because the block splitter already owns
     /// paragraph structure; letting the markdown parser also rewrite newlines
     /// collapses the line breaks in a pasted stack trace.
+    ///
+    /// #23: `MarkdownInline.parse` also repairs the flanking bug Apple has
+    /// with punctuation-wrapped emphasis (`*~ fin ~*` rendered its asterisks
+    /// literally) before the intent→font loops below ever see the runs.
     static func attributed(_ text: String) -> AttributedString {
-        let options = AttributedString.MarkdownParsingOptions(
-            interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        return (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+        MarkdownInline.parse(text)
     }
 }
 
