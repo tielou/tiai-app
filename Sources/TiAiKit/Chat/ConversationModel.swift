@@ -347,7 +347,13 @@ public final class ConversationModel {
         // and asking for one is a guaranteed 404 on an id the server never
         // stored, which would put a red error banner on a perfectly good chat.
         if incognito || chatID.hasPrefix("temporary:") || chatID.hasPrefix("local:") {
-            phase = .ready
+            // #26: same ownership rule #19 established for the plain paths —
+            // a mid-run load of a temporary/local/incognito chat must not
+            // hand the composer back while a run is live. The early return
+            // used to stamp `.ready` unconditionally, unlocking the composer
+            // and disarming reconcile's phase guard for exactly the bug
+            // class #19 closed one branch over.
+            if !phase.isBusy { phase = .ready }
             return
         }
         let cacheKey = DiskCache.key("chat-\(chatID)",
@@ -753,9 +759,16 @@ public final class ConversationModel {
                 // The sticky-failure path never suspends in `waitForUploads`,
                 // so the ribbon raise may still be sitting in the main-actor
                 // queue. Await it first, then close the ribbon directly —
-                // this task already runs on the main actor.
+                // this task already runs on the main actor. The generation
+                // re-check after the await (#29, mirroring #22): `phase`
+                // became `.ready` at the top of this branch, so a fresh send
+                // can raise this chat's next ribbon during `ribbon.value`'s
+                // suspension — an aborted run must not close its successor's
+                // ribbon.
                 await ribbon.value
-                await activity.finish(.stopped, characters: 0, chatID: chatID)
+                if gen == runGeneration {
+                    await activity.finish(.stopped, characters: 0, chatID: chatID)
+                }
                 return
             }
             let files = self.attachments
@@ -988,8 +1001,15 @@ public final class ConversationModel {
         post?.cancel()
         post = nil
         hub.expire(chatID: chatID)
-        // A brand new chat may still be waiting for its id when stop is pressed.
-        hub.expireWaitingListeners()
+        // No `expireWaitingListeners()` sweep here (#30, the #9 rule). The
+        // old comment claimed "a brand new chat may still be waiting for its
+        // id when stop is pressed" — but `stop()` itself refuses to run for
+        // a chat with no id, so this model's own listener is always keyed by
+        // a real id and `expire(chatID:)` above already reaches it. The
+        // global sweep over the per-server shared hub could therefore only
+        // ever kill ANOTHER model's brand-new-chat listener — the exact
+        // hazard #9 established for `recordPostError` (and why `abandon`
+        // sweeps only under `chatID == nil`).
         // One index for both jobs below: the buffer's own turn while a buffer
         // is in flight (the id match is the truth — a regenerate can have
         // replaced the tail), the last assistant turn otherwise (drain already

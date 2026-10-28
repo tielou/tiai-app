@@ -1980,6 +1980,82 @@ enum AskUserFixture {
     #expect(conversation.draft == "hello", "the stopped text returns to the composer either way")
 }
 
+// #30: stop() on an id-carrying chat must not sweep another model's
+// brand-new-chat (nil-chatID) waiting listener off the shared per-server
+// hub. The sweep in finishLocally could never reach its OWN chat's listener
+// (stop refuses a chat with no id), so all it ever did was collateral.
+@Test @MainActor func stopOnOneChatSparesAnotherModelsWaitingListener() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+
+    // Model B: a brand-new chat parked on its first POST — its hub listener
+    // is the waiting one (chatID == nil).
+    let transportB = ScriptedTransport()
+    let b = ConversationModel(
+        chatID: nil, models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transportB), hub: hub)
+    transportB.gateNextCompletion()
+    defer { transportB.releaseCompletion() }
+    b.draft = "new chat question"
+    b.send()
+    try await waitUntil { transportB.isCompletionGateParked }
+    #expect(hub.hasWaitingListener, "B's waiting listener is registered while its POST is parked")
+
+    // Model A: an established chat with a live run. Deliberately NO frames
+    // are fed before the stop: a frame with a real chat id would be ADOPTED
+    // by B's waiting listener (the hub names a waiting listener from the
+    // first frame it sees — that is the design), which would defeat the
+    // point of the test.
+    let transportA = ScriptedTransport()
+    let a = ConversationModel(
+        chatID: "chat-30-stop", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transportA), hub: hub)
+    a.draft = "hello"
+    a.send()
+    try await transportA.awaitCompletion()
+    a.stop()
+    try await waitUntil { a.phase == .ready }
+
+    #expect(hub.hasWaitingListener,
+            "a stop on chat-30-stop must not sweep B's brand-new-chat listener (#9 rule)")
+}
+
+// #26: the temporary:/local:/incognito early return in load() used to stamp
+// `.ready` unconditionally — mid-run, that unlocked the composer and
+// disarmed reconcile's phase guard, the exact bug #19 closed for the plain
+// paths.
+@Test @MainActor func midRunLoadOfATemporaryChatLeavesThePhaseAlone() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "temporary:midrun-26", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+
+    conversation.draft = "first"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    await conversation.load()   // hits the prefix early return
+    #expect(conversation.phase == .waiting,
+            "a mid-run load must not hand the composer back while the run is live")
+
+    conversation.draft = "interloper"
+    conversation.send()
+    #expect(conversation.draft == "interloper",
+            "a send during the live run is refused — the composer stayed locked")
+
+    // The live run finishes normally.
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "temporary:midrun-26", messageID: id, inner: [
+        "choices": [["index": 0, "delta": ["content": "answer"]]],
+    ]))
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "temporary:midrun-26", messageID: id,
+                              inner: ["choices": [["index": 0, "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+    #expect(conversation.turns.last?.text == "answer")
+}
+
 @Test @MainActor func aThumbUpGoesToFeedback() async throws {
     let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
     let transport = ScriptedTransport()
@@ -3820,20 +3896,17 @@ private func makePostFailureFixture(chatID: String?) -> (
     #expect(conversation.draft.isEmpty, "nothing is put back in the composer")
 }
 
-/// Issue #25, the waiting case. `load()` has no busy gate: it writes `.ready`
-/// mid-run without bumping the generation or cancelling the POST, and the
-/// next send overwrites the `post` slot with the old POST task still alive.
-/// When that orphaned POST later dies with a real failure, its catch runs on
-/// the NEWER run's busy phase: the old `phase.isBusy` guard alone let it
-/// stamp its error banner, arm the #9 rollback for a send the newer run
-/// never made, and `hub.expire(chatID:)` the newer run's listener. The fix
-/// is the gen guard first in `recordPostError` (plus the slot-write cancel).
+/// Issue #25, the waiting case. A superseded run's POST dying after a NEW
+/// run took the `post` slot used to be reachable through `load()`'s
+/// temporary-prefix hole (it wrote `.ready` mid-run, letting a send
+/// supersede a live run and orphan the POST into the new slot). #26 closed
+/// that hole, so the supersede here goes through `abandon()` — the
+/// protection under test is unchanged: when the orphaned POST later dies
+/// with a real failure, its catch runs while the NEWER phase is busy, and
+/// only the gen guard first in `recordPostError` (plus the slot-write
+/// cancel) keeps it from stamping its banner and expiring the newer run's
+/// listener.
 @Test @MainActor func supersededPostFailureDoesNotKillTheNewerRun() async throws {
-    // A `temporary:` chat — the shape an incognito conversation keeps after
-    // deriving its id. It is the remaining mid-run phase un-gate in `load()`:
-    // the prefix early-return writes `.ready` before issue #19's
-    // `runInFlight` guard (filed as a follow-up), which is what lets a send
-    // supersede a live run and orphan its POST into the new slot.
     let (conversation, transport, hub) = makePostFailureFixture(chatID: "temporary:sid-1")
     transport.gateNextCompletion()
 
@@ -3845,10 +3918,10 @@ private func makePostFailureFixture(chatID: String?) -> (
     // Run 1's assistant id, read from the recorded POST body.
     let firstID = try #require(transport.assistantMessageID)
 
-    // The supersede: re-entering the chat mid-run. The prefix branch returns
-    // `.ready` unconditionally, composer included, while run 1's POST is
-    // still parked inside the transport.
-    await conversation.load()
+    // The supersede. `abandon` bumps the generation and settles the phase
+    // while run 1's POST stays parked (the gate ignores cancellation — the
+    // same non-cooperative wait #22 lives off).
+    conversation.abandon()
     #expect(conversation.phase == .ready)
 
     conversation.draft = "second"
@@ -3901,8 +3974,9 @@ private func makePostFailureFixture(chatID: String?) -> (
     #expect(transport.isCompletionGateParked)
     let firstID = try #require(transport.assistantMessageID)
 
-    // Supersede via the temporary-prefix early-return in load(); see the waiting test.
-    await conversation.load()
+    // Supersede via abandon(); see the waiting test for why (#26 closed the
+    // load hole this test used to exploit).
+    conversation.abandon()
     #expect(conversation.phase == .ready)
 
     conversation.draft = "second"

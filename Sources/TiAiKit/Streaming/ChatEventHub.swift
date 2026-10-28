@@ -223,6 +223,14 @@ public final class ChatEventHub {
         subscribers.values.contains { $0.chatID == chatID }
     }
 
+    /// Whether a WAITING listener (a brand-new chat whose id the socket has
+    /// not named yet — `chatID == nil`) is registered. Test-support for the
+    /// #9 sweep constraint (#30): a stop on one chat must not sweep another
+    /// model's waiting listener.
+    var hasWaitingListener: Bool {
+        subscribers.values.contains { $0.chatID == nil }
+    }
+
     /// Blocks until something is listening to `chatID`.
     ///
     /// A test that injects frames before the conversation has subscribed loses
