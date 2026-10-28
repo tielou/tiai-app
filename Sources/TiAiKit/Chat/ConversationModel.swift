@@ -1460,7 +1460,7 @@ public final class ConversationModel {
             // answer, a parked question is never corrected later: the run is
             // stopped until the user answers, so a question that came through
             // unreadable has nothing that will ever fix it.
-            await awaitQuestion(messageID: assistantID)
+            await awaitQuestion(messageID: assistantID, gen: gen)
             // G5 (#17) — the mirror of resolve's R5. The refetch loop is a
             // long await: abandoning the parked run bumps the generation, but
             // this task keeps waiting (the refetch is uncancellable in
@@ -2153,7 +2153,7 @@ public final class ConversationModel {
             if outcome.parked {
                 // Same as the first run: keep looking until the question has
                 // actually landed, because nothing later will fix it.
-                await self.awaitQuestion(messageID: messageID)
+                await self.awaitQuestion(messageID: messageID, gen: gen)
                 guard self.isCurrent(gen) else { return }  // R5: superseded mid-refetch
                 self.phase = .ready
                 return
@@ -2197,11 +2197,27 @@ public final class ConversationModel {
     /// Bounded, and it gives up into the free-text fallback rather than spinning:
     /// a "Preparing the question…" that never resolves is the same dead end with
     /// a nicer animation, and at least a text field can be typed into.
-    private func awaitQuestion(messageID: String) async {
+    private func awaitQuestion(messageID: String, gen: Int) async {
         mark(messageID, questionIncoming: true)
         defer { mark(messageID, questionIncoming: false) }
         for attempt in 0..<10 {
+            // #27: stand down promptly once this run is superseded. The loop
+            // is a long, uncancellable-in-practice await (a hung GET extends
+            // it past every sleep), and since #25 nothing incidental wakes it
+            // any more — pre-#25 a superseded POST failure's ungated
+            // `hub.expire` finished the parked drain's listener by accident.
+            // Without this guard a superseded park grinds through all ten
+            // refetch attempts (~11s of sleeps, ten GETs, its hub subscriber
+            // pinned by the still-live exchange frame) until the G5/R5 guard
+            // drops it at the end. Cancellation covers the exchange side
+            // (abandon's `run?.cancel()` — the swallowed `try?` sleep returns
+            // immediately); `isCurrent` covers resolve's untracked twin,
+            // which no cancel ever reaches. Same ownership idiom as G5/R5,
+            // one level earlier: bail while the work is still pointless
+            // instead of after it.
+            guard isCurrent(gen), !Task.isCancelled else { return }
             await refresh(messageID: messageID)
+            guard isCurrent(gen), !Task.isCancelled else { return }
             guard let turn = turns.first(where: { $0.id == messageID }),
                   let awaiting = turn.awaitingCall,
                   !awaiting.hasStructuredArguments

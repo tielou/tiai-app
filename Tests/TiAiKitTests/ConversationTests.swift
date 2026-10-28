@@ -401,6 +401,10 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     }
 
     var paths: [String] { guarded { _paths } }
+    /// GET /api/v1/chats/{id} requests (the chat-detail refetch), counted.
+    var chatFetchCount: Int {
+        guarded { _paths.filter { $0.hasPrefix("/api/v1/chats/") && !$0.contains("/messages") }.count }
+    }
     var completionBodies: [Data] { guarded { _completionBodies } }
     var uploads: [Data] { guarded { _uploads } }
     var resolveBodies: [Data] { guarded { _resolveBodies } }
@@ -1408,6 +1412,64 @@ enum AskUserFixture {
     #expect(conversation.phase == .ready)
     #expect(conversation.error == nil)
     #expect(conversation.turns.count == 4)
+}
+
+/// Issue #27: a superseded park must stand down promptly, not grind through
+/// the refetch loop. Since #25 removed the accidental unblock (a superseded
+/// POST failure's ungated `hub.expire` finishing the parked drain's
+/// listener), a parked `awaitQuestion` that gets abandoned kept fetching
+/// until its ten attempts ran out — bounded, but up to ~11s of pointless
+/// GETs with the run's hub subscriber pinned alongside. The fix is the
+/// G5/R5 ownership idiom one level earlier: generation/cancellation guards
+/// inside the loop.
+@Test @MainActor func abandonStandsDownAParkedRefetchPromptly() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+    // AC #27: prove no timer is what saves the parked run. The watchdog
+    // budget sits far outside the window this test asserts stand-down in.
+    conversation.silenceLimit = .seconds(30)
+    defer { conversation.silenceLimit = ConversationModel.silenceLimit }
+
+    conversation.draft = "book me a trip"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let assistantID = try #require(transport.assistantMessageID)
+
+    // Every refetch answers with a still-unreadable question (truncated
+    // arguments -> `hasStructuredArguments == false`), so the loop can
+    // never finish on its own merits: without the fix it runs all ten
+    // attempts (~11s of sleeps, ten GETs) after the abandon.
+    transport.chatDetailOverride = Data(
+        """
+        {"id":"chat-1","title":"T","updated_at":1,"created_at":1,"chat":{"models":["local-personal"],
+         "history":{"currentId":"\(assistantID)","messages":{
+           "user-1":{"id":"user-1","role":"user","content":"hi","childrenIds":["\(assistantID)"]},
+           "\(assistantID)":{"id":"\(assistantID)","role":"assistant","content":"","parentId":"user-1","done":false,
+             "output":[{"type":"function_call","call_id":"call_1","name":"ask_user","status":"pending",
+                        "arguments":"{\\"questions\\":[{\\"id\\":\\"a\\",\\"question\\":\\"A?\\"}]"}]}}}}}
+        """.utf8)
+
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: assistantID,
+        inner: ["done": false, "output": [AskUserFixture.outputItem]]))
+    // The park landed and the refetch loop is spinning (first GET done;
+    // later attempts are behind 200ms+ sleeps).
+    try await waitUntil { transport.chatFetchCount >= 1 }
+    #expect(conversation.phase != .ready)
+
+    conversation.abandon()
+    // The listener half of the AC: abandon's own `hub.expire` ends the chat
+    // stream at supersede time (true since #4 — pinned here as the AC asks).
+    #expect(!hub.hasListener(for: "chat-1"),
+            "the abandoned run's hub listener must be gone at supersede time")
+
+    // The stand-down half: at most the one GET already in flight when
+    // `run?.cancel()` landed may still complete; the loop itself must not
+    // start another attempt. The unfixed code would add three or more GETs
+    // inside this window (sleeps of 200/400/600ms).
+    let baseline = transport.chatFetchCount
+    try await Task.sleep(for: .milliseconds(1500))
+    #expect(transport.chatFetchCount <= baseline + 1,
+            "superseded refetch loop kept grinding: \(transport.chatFetchCount - baseline) extra GETs after abandon")
 }
 
 @Test func askUserPromptParsesTheRealSchema() {
