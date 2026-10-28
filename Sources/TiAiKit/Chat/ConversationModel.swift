@@ -352,7 +352,10 @@ public final class ConversationModel {
             // hand the composer back while a run is live. The early return
             // used to stamp `.ready` unconditionally, unlocking the composer
             // and disarming reconcile's phase guard for exactly the bug
-            // class #19 closed one branch over.
+            // class #19 closed one branch over. The lost accidental self-heal
+            // (an unconditional `.ready` settling a stuck-busy temporary
+            // chat) has no reachable case: `.stopping` always resolves via
+            // finishLocally, `.streaming` via the silence watchdog.
             if !phase.isBusy { phase = .ready }
             return
         }
@@ -1411,11 +1414,10 @@ public final class ConversationModel {
         // this point is provably nil or a strictly older run's task: the G3
         // guard above and this write are one main-actor synchronous region,
         // and there is one `post = Task` write per exchange and one exchange
-        // per generation — so anything in the slot now belongs to an older run
-        // (`load()` mid-run neither bumps the generation nor cancels the POST,
-        // and the next send reaches here with the old task still alive).
-        // Cancelling it reclaims the orphaned POST, and that task's catch
-        // self-silences via `Task.isCancelled`.
+        // per generation — so anything in the slot now belongs to an older run.
+        // (The path that used to leave one: mid-run `load()` supersede, closed
+        // since #19/#26.) Cancelling it reclaims the orphaned POST, and that
+        // task's catch self-silences via `Task.isCancelled`.
         post?.cancel()
         post = Task {
             do { try await self.client.stream(request).drain() }
@@ -2403,11 +2405,12 @@ public final class ConversationModel {
     /// a send the newer run never made, and expiring the newer run's hub
     /// listener. `Task.isCancelled` at the call site covers a same-gen
     /// retirement (the slot owner cancelled the task); this covers cross-gen
-    /// supersession, where the supersede path — `load()` has no busy gate and
-    /// neither bumps the generation nor cancels the POST, and the next send
-    /// overwrites the `post` slot with the old task alive — leaves the old POST
-    /// uncancelled. `runGeneration` is monotonic, so the equality check is the
-    /// whole ownership test; no second gate is needed.
+    /// supersession. Since #19/#26 closed the mid-run `load()` supersede hole
+    /// and `abandon` cancels the POST (whose catch then self-silences on
+    /// `Task.isCancelled`), no reachable path leaves an uncancelled stale POST
+    /// any more — the guard is defense-in-depth for the next supersede path,
+    /// not a live unblock. `runGeneration` is monotonic, so the equality check
+    /// is the whole ownership test; no second gate is needed.
     private func recordPostError(_ error: Error, gen: Int) {
         guard isCurrent(gen) else { return }
         guard phase.isBusy else { return }

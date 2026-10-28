@@ -3897,15 +3897,16 @@ private func makePostFailureFixture(chatID: String?) -> (
 }
 
 /// Issue #25, the waiting case. A superseded run's POST dying after a NEW
-/// run took the `post` slot used to be reachable through `load()`'s
-/// temporary-prefix hole (it wrote `.ready` mid-run, letting a send
-/// supersede a live run and orphan the POST into the new slot). #26 closed
-/// that hole, so the supersede here goes through `abandon()` — the
-/// protection under test is unchanged: when the orphaned POST later dies
-/// with a real failure, its catch runs while the NEWER phase is busy, and
-/// only the gen guard first in `recordPostError` (plus the slot-write
-/// cancel) keeps it from stamping its banner and expiring the newer run's
-/// listener.
+/// run took the `post` slot must not touch the newer run: no banner, no
+/// #9 rollback, no expiring the newer listener. The supersede here goes
+/// through `abandon()` (the load hole this test used to exploit is closed
+/// since #26) — which means the inertness under test now comes from
+/// abandon's `post?.cancel()` plus the catch's `Task.isCancelled`
+/// self-silence rather than from `recordPostError`'s gen guard; that guard
+/// remains defense-in-depth for any future supersede path that leaves the
+/// stale POST uncancelled (see its doc). What this pins end-to-end: a
+/// stopped-and-replaced run's late POST failure is invisible to the newer
+/// run.
 @Test @MainActor func supersededPostFailureDoesNotKillTheNewerRun() async throws {
     let (conversation, transport, hub) = makePostFailureFixture(chatID: "temporary:sid-1")
     transport.gateNextCompletion()
