@@ -171,12 +171,8 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
             guard let id, !id.isEmpty else { return nil }
             let name = (value["name"] ?? inner["filename"])?.stringValue ?? "attachment"
             let mime = (inner["meta"]?["content_type"] ?? inner["type"])?.stringValue ?? ""
-            let looksLikeImage = mime.hasPrefix("image/")
-                || ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif"]
-                    .contains((name as NSString).pathExtension.lowercased())
             return MessageAttachment(
-                id: id, name: name, isImage: looksLikeImage || mime.hasPrefix("image/"),
-                mimeType: mime)
+                id: id, name: name, isImage: Self.fileEntryIsImage(value), mimeType: mime)
         }
         // ...and a picture the sender put straight into the message, which is
         // where a vision model is actually handed its image. The app's own
@@ -187,6 +183,22 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
             return MessageAttachment(id: url, name: "image", isImage: true, dataURL: url)
         }
         return fromFiles + fromContent
+    }
+
+    /// Whether a stored file entry is an image: its mime type says so, or its
+    /// name carries an image extension.
+    ///
+    /// The single answer to "is this stored file a picture?" — the file chips
+    /// above use it, and the image trim (#2) uses it to decide which entries of
+    /// a trimmed message survive. Both sides of a rewrite must classify
+    /// identically or the transcript and the server diverge.
+    public static func fileEntryIsImage(_ value: JSONValue) -> Bool {
+        let inner = value["file"] ?? value
+        let name = (value["name"] ?? inner["filename"])?.stringValue ?? "attachment"
+        let mime = (inner["meta"]?["content_type"] ?? inner["type"])?.stringValue ?? ""
+        return mime.hasPrefix("image/")
+            || ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif"]
+                .contains((name as NSString).pathExtension.lowercased())
     }
 
     /// `image_url` targets inside a multipart message body, in order.

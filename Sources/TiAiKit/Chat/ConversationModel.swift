@@ -41,6 +41,11 @@ public final class ConversationModel {
     /// The UI offers `trimOldestImagesToFit()` while this is non-nil; the send
     /// itself stays blocked either way, because the engine would 500.
     public private(set) var imageTrim: ImageTrimOffer?
+    /// Re-entrancy gate for `trimOldestImagesToFit`: the phase never goes busy
+    /// during a trim, so without this a second confirm could run a concurrent
+    /// trim whose recompute passes the confirm-gate (turns not yet mutated)
+    /// and re-trims an already-trimmed message into a double placeholder.
+    private var isTrimming = false
     /// Takes the error banner away. Errors used to clear themselves on the next
     /// send or on the next successful run, which is fine for a failure that
     /// fixes itself but not for one the user has already read — a banner that
@@ -278,12 +283,25 @@ public final class ConversationModel {
     /// server mutations — which is why the UI gates this behind a confirm
     /// dialog that lists exactly what will be replaced.
     public func trimOldestImagesToFit() async {
-        guard let chatID, !phase.isBusy else { return }
+        guard let chatID, !phase.isBusy, !isTrimming else { return }
+        isTrimming = true
+        defer { isTrimming = false }
         error = nil
         // Recomputed against the current state rather than trusting the
         // stored offer, which may predate the user opening the dialog.
+        let confirmed = imageTrim
         var offer = Self.imageTrimOffer(
             in: turns, projected: projectedImageCount(outgoing: attachments), cap: imageCap)
+        // Confirm-gate fidelity: the user confirmed `confirmed`. If the state
+        // got worse while the dialog was open — the recomputed trim would
+        // drop MORE images than were confirmed — touch nothing: refresh the
+        // offer so the user sees the bigger number and confirms again.
+        // Trimming fewer than confirmed is honest (the trim stops as soon as
+        // it fits); trimming more is an unconfirmed, irreversible mutation.
+        if let confirmed, let offer, offer.dropTotal > confirmed.dropTotal {
+            imageTrim = offer
+            return
+        }
         imageTrim = offer
         guard let targets = offer?.targets else { return }
         for target in targets {
@@ -304,44 +322,79 @@ public final class ConversationModel {
             in: turns, projected: projectedImageCount(outgoing: attachments), cap: imageCap)
     }
 
+    /// Test seam: drop the cached chat detail, so trim paths see the
+    /// "session-local message the refetch never covered" shape — kept files
+    /// must then be rebuilt from the turn's attachment chips.
+    func debugClearDetailForTrimTest() { detail = nil }
+
     /// Rewrite one persisted message without its images: text and non-image
     /// blocks preserved verbatim, image blocks dropped, a placeholder added,
-    /// and an explicit empty `files` array — the server overwrites the row
-    /// with exactly what the body says, so omitting `files` is the
-    /// silent-delete trap; the empty array is the explicit "no files".
-    /// The local transcript and the cached detail are updated to match.
+    /// and `files` narrowed to the message's non-image entries — the server
+    /// overwrites the row with exactly what the body says, so omitting
+    /// `files` is the silent-delete trap, and sending `[]` would destroy a
+    /// PDF riding along with the images. A message whose files are all
+    /// images still sends the explicit empty array: that is the honest "no
+    /// files". The local transcript and the cached detail are updated to match.
     private func trimImages(messageID: String, chatID: String) async throws {
         let placeholder = Self.imageTrimPlaceholder
         let stored = detail?.messages[messageID]
         let turnIndex = turns.firstIndex(where: { $0.id == messageID })
         let newContent: MessageContent
+        // The separator the local text needs to match a future refetch: block
+        // content renders as its text parts joined with "\n"
+        // (`MessageContent.text`), while text content is stored verbatim, so
+        // the "\n\n" written below is exactly what a refetch will show.
+        let textSeparator: String
         switch stored?.content {
         case let .blocks(blocks)?:
             var kept = blocks.filter { $0["type"]?.stringValue != "image_url" }
             kept.append(.object(["type": .string("text"), "text": .string(placeholder)]))
             newContent = .blocks(kept)
+            textSeparator = "\n"
         case let .text(value)?:
             newContent = .text(value.isEmpty ? placeholder : value + "\n\n" + placeholder)
+            textSeparator = "\n\n"
         case nil:
             // No cached detail for this message (a turn from this session that
             // the last refetch never saw): fall back to its rendered text.
             let text = turnIndex.map { turns[$0].text } ?? ""
             newContent = .text(text.isEmpty ? placeholder : text + "\n\n" + placeholder)
+            textSeparator = "\n\n"
         }
+        // Stored detail is the truth for file entries; when this session's
+        // message was never in the last refetch, rebuild the non-image ones
+        // from the local turn (byte-for-byte the regenerate/edit resend
+        // shape) instead of silently clearing the row's files.
+        let keptFiles = stored.map { Self.nonImageFileEntries($0.files) }
+            ?? Self.resentFilePayload(turnIndex.map { turns[$0].attachments } ?? [])
         try await client.updateMessage(
-            chatID: chatID, messageID: messageID, content: newContent, files: [])
+            chatID: chatID, messageID: messageID, content: newContent, files: keptFiles)
         if var stored {
             stored.content = newContent
-            stored.files = []
+            stored.files = keptFiles
             detail?.messages[messageID] = stored
         }
         if let turnIndex {
             var turn = turns[turnIndex]
             let text = turn.text
-            turn.text = text.isEmpty ? placeholder : text + "\n\n" + placeholder
+            turn.text = text.isEmpty ? placeholder : text + textSeparator + placeholder
             turn.attachments.removeAll { $0.isImage }
             turn.contentImageURLs = []
             turns[turnIndex] = turn
+        }
+    }
+
+    /// The stored file entries that survive a trim: everything except the
+    /// entries `ChatMessage.fileEntryIsImage` calls an image. An entry with
+    /// no id cannot be classified (the transcript drops it too) and is kept:
+    /// keeping can only over-count the image budget, which the guard handles,
+    /// while deleting is irreversible.
+    static func nonImageFileEntries(_ files: [JSONValue]?) -> [JSONValue] {
+        (files ?? []).filter { value in
+            let inner = value["file"] ?? value
+            let id = (inner["id"] ?? value["id"])?.stringValue
+            guard let id, !id.isEmpty else { return true }
+            return !ChatMessage.fileEntryIsImage(value)
         }
     }
 

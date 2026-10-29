@@ -29,12 +29,15 @@ private func trimServer() -> Server {
 /// after it. `imageOnlyAt` makes those user messages carry *no* text part
 /// (image blocks alone); `extraBlockAt` adds a distinctive non-image block to
 /// those user messages so the "non-image content is preserved verbatim" rule
-/// can be pinned.
+/// can be pinned. `filesAt` gives those user messages a non-image `files`
+/// entry (a PDF) riding along with the image, so the "a trim must not destroy
+/// non-image files" rule can be pinned.
 private func trimChatDetail(
     chatID: String,
     images: Int,
     imageOnlyAt: Set<Int> = [],
-    extraBlockAt: Set<Int> = []
+    extraBlockAt: Set<Int> = [],
+    filesAt: Set<Int> = []
 ) -> Data {
     var entries: [String] = []
     var previousAssistant: String?
@@ -52,10 +55,14 @@ private func trimChatDetail(
         if extraBlockAt.contains(i) {
             blocks.append("{\"type\":\"custom_keep\",\"keep\":\(i)}")
         }
+        // A PDF file entry next to the image: the trim must keep it.
+        let filesJSON = filesAt.contains(i)
+            ? ",\"files\":[{\"id\":\"doc-\(i)\",\"name\":\"report.pdf\",\"file\":{\"id\":\"doc-\(i)\",\"meta\":{\"content_type\":\"application/pdf\"}}}]"
+            : ""
         entries.append(
             """
             "\(user)":{"id":"\(user)","role":"user","done":true,"parentId":\(userParent),"childrenIds":["\(assistant)"],\
-            "content":[\(blocks.joined(separator: ","))]}
+            "content":[\(blocks.joined(separator: ","))]\(filesJSON)}
             """)
         entries.append(
             """
@@ -93,10 +100,6 @@ private func updateBody(_ data: Data) throws -> [String: Any] {
 /// a bare string or a block array.
 private func contentBlocks(_ body: [String: Any]) -> [[String: Any]] {
     (body["content"] as? [[String: Any]]) ?? []
-}
-
-private func contentText(_ body: [String: Any]) -> String? {
-    body["content"] as? String
 }
 
 // MARK: - (a) the offer
@@ -262,15 +265,118 @@ private func contentText(_ body: [String: Any]) -> String? {
 
     #expect(transport.messageUpdateBodies.count == 2)
     let first = try updateBody(transport.messageUpdateBodies[0])
-    // No text existed, so the content is the placeholder and nothing else.
-    if let text = contentText(first) {
-        #expect(text == ConversationModel.imageTrimPlaceholder)
-    } else {
-        let blocks = contentBlocks(first)
-        #expect(blocks.count == 1)
-        #expect(blocks[0]["type"] as? String == "text")
-        #expect(blocks[0]["text"] as? String == ConversationModel.imageTrimPlaceholder)
-    }
+    // The stored content was a block array (image block only), so the trimmed
+    // content is blocks too: the placeholder and nothing else.
+    let blocks = contentBlocks(first)
+    #expect(blocks.count == 1)
+    #expect(blocks[0]["type"] as? String == "text")
+    #expect(blocks[0]["text"] as? String == ConversationModel.imageTrimPlaceholder)
+}
+
+// MARK: - (g) a trim keeps the non-image files of a trimmed message
+
+@Test @MainActor func trimKeepsNonImageFilesInBodyAndLocally() async throws {
+    let transport = ScriptedTransport()
+    let conversation = makeTrimConversation(
+        chatID: "chat-trim-files", transport: transport, cap: 3)
+    transport.chatDetailOverride = trimChatDetail(
+        chatID: "chat-trim-files", images: 5, filesAt: [1])
+    await conversation.load()
+    // Sanity: the PDF rides along with the image before the trim.
+    #expect(conversation.turns[0].attachments.contains {
+        $0.id == "doc-1" && !$0.isImage
+    }, "the seeded PDF attachment did not load")
+
+    conversation.draft = "one more question"
+    conversation.send()
+    try await Task.sleep(for: .milliseconds(300))
+    await conversation.trimOldestImagesToFit()
+
+    #expect(transport.messageUpdateBodies.count == 2)
+    // The first trimmed message carried image + PDF: the body's `files` must
+    // be exactly the PDF entry — sending `[]` here would destroy the PDF
+    // server-side, undisclosed.
+    let first = try updateBody(transport.messageUpdateBodies[0])
+    let files = try #require(first["files"] as? [[String: Any]])
+    #expect(files.count == 1, "files must be exactly the non-image entry, got: \(files)")
+    #expect(files[0]["id"] as? String == "doc-1")
+    #expect(files[0]["name"] as? String == "report.pdf")
+    // The second trimmed message had no files at all: the explicit empty
+    // array stays (the omitted-`files` silent-delete trap from aad089f).
+    let second = try updateBody(transport.messageUpdateBodies[1])
+    let secondFiles = try #require(second["files"] as? [Any])
+    #expect(secondFiles.isEmpty, "an all-image message still sends the explicit empty array")
+
+    // The local transcript matches: the trimmed turn keeps the PDF chip and
+    // lost only the image.
+    let trimmed = conversation.turns[0]
+    #expect(trimmed.attachments.map(\.id) == ["doc-1"])
+    #expect(trimmed.contentImageURLs.isEmpty)
+}
+
+// MARK: - (h) the trim never drops more than the user confirmed
+
+@Test @MainActor func staleOfferRefreshesInsteadOfOverTrimming() async throws {
+    let transport = ScriptedTransport()
+    let conversation = makeTrimConversation(
+        chatID: "chat-trim-stale", transport: transport, cap: 3)
+    transport.chatDetailOverride = trimChatDetail(chatID: "chat-trim-stale", images: 5)
+    await conversation.load()
+
+    conversation.draft = "one more question"
+    conversation.send()
+    try await Task.sleep(for: .milliseconds(300))
+    // The dialog the user is looking at says "Remove 2".
+    #expect(conversation.imageTrim?.dropTotal == 2)
+
+    // The state gets worse while the dialog is open: another image is on its
+    // way in, so a recomputed trim would drop 3. Trimming 3 on a confirmation
+    // for 2 would be an unconfirmed, irreversible server mutation.
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "late.png", mimeType: "image/png")
+    try await waitTrim { conversation.attachments.count == 1 }
+
+    await conversation.trimOldestImagesToFit()
+    // Nothing was touched; the offer was refreshed to the bigger number so
+    // the user sees and confirms it.
+    #expect(transport.messageUpdateBodies.isEmpty,
+            "a stale offer must not be trimmed beyond the confirmed amount")
+    let refreshed = try #require(conversation.imageTrim)
+    #expect(refreshed.dropTotal == 3)
+    #expect(refreshed.targets.map(\.messageID) == ["user-1", "user-2", "user-3"])
+
+    // Confirming again (against the refreshed offer) trims the refreshed
+    // targets.
+    await conversation.trimOldestImagesToFit()
+    #expect(transport.messageUpdateBodies.count == 3)
+    #expect(conversation.imageTrim == nil)
+}
+
+// MARK: - (i) the local text after a trim equals what a refetch renders
+
+@Test @MainActor func trimmedLocalTextMatchesRefetchRendering() async throws {
+    let transport = ScriptedTransport()
+    let conversation = makeTrimConversation(
+        chatID: "chat-trim-refetch", transport: transport, cap: 3)
+    transport.chatDetailOverride = trimChatDetail(chatID: "chat-trim-refetch", images: 5)
+    await conversation.load()
+
+    conversation.draft = "one more question"
+    conversation.send()
+    try await Task.sleep(for: .milliseconds(300))
+    await conversation.trimOldestImagesToFit()
+
+    // What a refetch would render for the new stored content: blocks
+    // content's text parts joined the way `MessageContent.text` joins them.
+    // The local apply must produce exactly this, or the bubble changes text
+    // on the next reload.
+    let first = try updateBody(transport.messageUpdateBodies[0])
+    let contentData = try JSONSerialization.data(
+        withJSONObject: try #require(first["content"]))
+    let storedContent = try JSONDecoder().decode(MessageContent.self, from: contentData)
+    #expect(conversation.turns[0].text == storedContent.text,
+            "local text diverges from what a refetch would render")
+    #expect(conversation.turns[0].text
+        == "pic 1\n\(ConversationModel.imageTrimPlaceholder)")
 }
 
 // MARK: - (f) nothing is touched at or below the cap
@@ -324,4 +430,59 @@ private func contentText(_ body: [String: Any]) -> String? {
     #expect(offer.imagesInChat == 4)
     #expect(offer.dropTotal == 1)
     #expect(offer.targets.map(\.messageID) == ["user-2"])
+}
+
+// MARK: - stored-nil rebuild: a session-local message with no cached detail
+
+@Test @MainActor func trimWithoutCachedDetailRebuildsKeptFilesFromLocalTurn() async throws {
+    // The trim target has NO cached detail (the last refetch never saw this
+    // session's message). Sending `files: []` here would silently destroy the
+    // row's PDF server-side — the kept non-image entries must be rebuilt from
+    // the local turn instead, in the regenerate/edit resend shape.
+    let transport = ScriptedTransport()
+    let conversation = makeTrimConversation(
+        chatID: "chat-trim-nodetail", transport: transport, cap: 3)
+    transport.chatDetailOverride = trimChatDetail(
+        chatID: "chat-trim-nodetail", images: 5, filesAt: [1])
+    await conversation.load()
+    // The local turn carries the PDF chip; the detail cache is then dropped,
+    // reproducing "a turn this session knows that the refetch never covered".
+    #expect(conversation.turns[0].attachments.contains { $0.id == "doc-1" && !$0.isImage })
+    // Drop the detail cache: the trim must rebuild the kept PDF from the
+    // turn's own attachment chip — the regenerate/edit resend shape — because
+    // nothing else survives for a message the refetch never covered.
+    transport.chatDetailOverride = nil
+    conversation.debugClearDetailForTrimTest()
+    conversation.draft = "next"
+    conversation.send()
+    try await Task.sleep(for: .milliseconds(300))
+    await conversation.trimOldestImagesToFit()
+
+    #expect(!transport.messageUpdateBodies.isEmpty)
+    let first = try updateBody(transport.messageUpdateBodies[0])
+    let files = try #require(first["files"] as? [[String: Any]])
+    #expect(files.count == 1, "kept files must be rebuilt from the local turn, got: \(files)")
+    #expect(files[0]["id"] as? String == "doc-1")
+}
+
+// MARK: - re-entrancy gate
+
+@Test @MainActor func concurrentTrimCallsDoNotDoubleTrim() async throws {
+    let transport = ScriptedTransport()
+    let conversation = makeTrimConversation(
+        chatID: "chat-trim-reentry", transport: transport, cap: 3)
+    transport.chatDetailOverride = trimChatDetail(chatID: "chat-trim-reentry", images: 5)
+    await conversation.load()
+    conversation.draft = "go"
+    conversation.send()
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(conversation.imageTrim != nil)
+    // Two confirms in flight (the button stays live during a trim because the
+    // phase never goes busy): exactly one trim's worth of writes may happen.
+    async let a: Void = conversation.trimOldestImagesToFit()
+    async let b: Void = conversation.trimOldestImagesToFit()
+    await a
+    await b
+    #expect(transport.messageUpdateBodies.count == 2,
+            "exactly the two targeted messages, once each: got \(transport.messageUpdateBodies.count)")
 }
