@@ -4758,3 +4758,150 @@ private func makePostFailureFixture(chatID: String?) -> (
     }
     #expect(conversation.error == nil)
 }
+
+// MARK: - Issue #33: the drain watchdog is a silence detector, not a run cap
+
+/// A chat detail whose tree carries the assistant's message already written
+/// and `done: true` — the shape the server has once the run finished on its
+/// side. Used by the #33 tests to make the reconcile fallback observable:
+/// text that only exists here could only have arrived via the record, not
+/// the live stream.
+private func chatDetailWithStoredAnswer(_ chatID: String, messageID: String, text: String) -> Data {
+    Data("""
+    {"id":"\(chatID)","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"\(messageID)","messages":{
+       "user-1":{"id":"user-1","role":"user","content":"go","done":true,"parentId":null,"childrenIds":["\(messageID)"]},
+       "\(messageID)":{"id":"\(messageID)","role":"assistant","content":"\(text)","model":"local-personal","done":true,"parentId":"user-1","childrenIds":[]}}}}}
+    """.utf8)
+}
+
+/// Issue #33: the watchdog was installed once per drain and never re-armed,
+/// so it was an absolute cap on live streaming — any run longer than
+/// `silenceLimit` got `hub.expire(chatID:)` fired at it mid-generation while
+/// tokens were still flowing, and fell into the chunky reconcile fallback
+/// (truncated text, false banners) even though the server was writing every
+/// word. A steady trickle of frames for THIS message must keep the live
+/// stream alive indefinitely: each frame re-arms the budget.
+@Test @MainActor func steadyFramesKeepTheStreamAlivePastTheSilenceLimit() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+    // The budget is read when the drain installs its timer, so it must be
+    // set before the run starts (instance-knob contract from #21).
+    conversation.silenceLimit = .milliseconds(300)
+
+    conversation.draft = "go"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    // Ten deltas ~90 ms apart: ~900 ms of wall time, three times the
+    // watchdog budget, with a gap no wider than a third of it. Pre-fix the
+    // watchdog fires at 300 ms regardless of the frames, the live listener
+    // dies, and the text truncates.
+    var expected = ""
+    for i in 0..<10 {
+        hub.receive(Frame.fixture(
+            kind: "response:completion", chatID: "chat-1", messageID: id,
+            inner: ["type": "response.output_text.delta", "delta": "t\(i)-"]))
+        expected += "t\(i)-"
+        // Per-frame proof the live stream is still publishing this run's text.
+        try await waitUntil { conversation.turns.last?.text == expected }
+        try await Task.sleep(for: .milliseconds(90))
+    }
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: id,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+
+    #expect(conversation.turns.last?.text == expected,
+            "a run with steady frames must stream live past the silence limit, not be expired: got \"\(conversation.turns.last?.text ?? "nil")\"")
+    #expect(conversation.error == nil,
+            "a healthy long run must not fall into the reconcile fallback: \(conversation.error ?? "nil")")
+}
+
+/// The other side of #33: re-arming must not turn the watchdog into a no-op.
+/// One frame proves the run was alive and buys exactly one more budget; when
+/// nothing follows it, the watchdog still fires and the run settles via the
+/// reconcile fallback on what the server stored. The stored text grows past
+/// the streamed text, so landing it proves the record — not the live stream —
+/// ended the run.
+@Test @MainActor func oneFrameThenSilenceStillExpiresIntoTheStoredAnswer() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+    conversation.silenceLimit = .milliseconds(200)
+
+    conversation.draft = "go"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+    // The server finishes writing the full answer on its side; only the
+    // reconcile fetch can bring it here.
+    transport.chatDetailOverride =
+        chatDetailWithStoredAnswer("chat-1", messageID: id, text: "partial answer.")
+
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: id,
+        inner: ["type": "response.output_text.delta", "delta": "partial "]))
+    try await waitUntil { conversation.turns.last?.text == "partial " }
+
+    // Then silence. The frame re-armed the watchdog once; the re-armed timer
+    // must still fire.
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+    let row = try #require(conversation.turns.first { $0.id == id })
+    #expect(row.text == "partial answer.",
+            "a run that goes silent after one frame must still settle via the stored record: got \"\(row.text)\"")
+    #expect(!row.streaming)
+    #expect(conversation.error == nil,
+            "an answer that landed off the record is not an empty answer: \(conversation.error ?? "nil")")
+}
+
+/// Issue #33's filter rule: only frames for THIS run's message re-arm the
+/// watchdog. Frames for another message id on the same chat are already
+/// filtered out of the drain's accounting (`sawAnyFrame` ignores them, #9);
+/// they must not buy the run silence budget either, or a chatty neighbour
+/// would keep a dead run's listener alive forever. The pace below (a frame
+/// every ~70 ms against a 250 ms budget) would keep a re-arming watchdog
+/// permanently unarmed if foreign frames counted — the run must still fall
+/// back to reconcile on schedule.
+@Test @MainActor func foreignFramesDoNotReArmTheSilenceWatchdog() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-1")
+    conversation.silenceLimit = .milliseconds(250)
+
+    conversation.draft = "go"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+    transport.chatDetailOverride =
+        chatDetailWithStoredAnswer("chat-1", messageID: id, text: "partial answer.")
+
+    // One frame for THIS message — the run is genuinely live and the
+    // watchdog is armed from it.
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: id,
+        inner: ["type": "response.output_text.delta", "delta": "partial "]))
+    try await waitUntil { conversation.turns.last?.text == "partial " }
+
+    // Then ONLY FOREIGN frames, faster than the budget, for ~1.4 s — far
+    // beyond silenceLimit. This is the discriminator: the fixed code must
+    // settle ~silenceLimit after the last OWN frame, i.e. WHILE the foreign
+    // burst is still arriving. If foreign frames re-armed, the watchdog
+    // would only fire after the burst ended (~1.4 s + budget), past the
+    // 1 s ceiling below — so a regression fails on the timeout, not on the
+    // text assertions.
+    let burst = Task { @MainActor in
+        for _ in 0..<20 {
+            hub.receive(Frame.fixture(
+                kind: "response:completion", chatID: "chat-1", messageID: "some-other-message",
+                inner: ["type": "response.output_text.delta", "delta": "foreign-"]))
+            try? await Task.sleep(for: .milliseconds(70))
+        }
+    }
+
+    try await waitUntil(timeout: .seconds(1)) { conversation.phase == .ready }
+    await burst.value
+    let row = try #require(conversation.turns.first { $0.id == id })
+    #expect(row.text == "partial answer.",
+            "foreign frames must not keep this run's live listener alive: the run must fall back to the record: got \"\(row.text)\"")
+    #expect(row.text.contains("foreign") == false,
+            "a foreign frame's text must never reach this message: \(row.text)")
+    #expect(conversation.error == nil,
+            "settling on the stored record is not a failure: \(conversation.error ?? "nil")")
+}

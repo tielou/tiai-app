@@ -102,8 +102,13 @@ public final class ConversationModel {
     /// the thing regenerate and edit change.
     private var leafID: String?
 
-    /// How long to wait on a silent stream before calling it dead. Longer than
-    /// the slowest cold prefill you have seen, shorter than someone's patience.
+    /// How long to wait on a silent stream before calling it dead: no frame
+    /// for this run's message for this long means the stream is dead. It is a
+    /// silence budget, not a run cap — every frame this drain attributes to
+    /// this message re-arms it (issue #33), so a long run that keeps talking
+    /// is never cut off. Longer than the slowest legitimate gap (cold
+    /// prefill, a thinking pause) you have seen, shorter than someone's
+    /// patience.
     static let silenceLimit: Duration = .seconds(60)
     /// How long a turn may sit between a `finish_reason` and the tool result that
     /// follows it. Long enough for a slow MCP server, short enough that a tool
@@ -1734,6 +1739,16 @@ public final class ConversationModel {
     /// * `pending?.id == assistantID` — a resolve reuses the parked message
     ///   id, so ids can collide across runs; this check is what encodes
     ///   "the watchdog only fires while this run still owns `pending`".
+    ///
+    /// Cancellation safety (relies on this type's `@MainActor` isolation):
+    /// after the sleep, the isCancelled check, both fire-time gates and the
+    /// `expire` run as ONE main-actor job with no suspension point, so a
+    /// `cancel()` from the frame loop can never interleave between the check
+    /// and the fire — a cancelled timer either never starts its block or
+    /// returns at the isCancelled guard. If this Task ever loses MainActor
+    /// inheritance (`Task.detached`, a nonisolated refactor), that property
+    /// silently disappears and re-arming per frame could false-fire on a
+    /// cancellation race. Keep it on the actor.
     private func hubExpireTimer(after limit: Duration, gen: Int, assistantID: String) -> Task<Void, Never> {
         Task { [hub] in
             try? await Task.sleep(for: limit)
@@ -1783,7 +1798,9 @@ public final class ConversationModel {
                 self?.publishPending(keeping: assistantID)
             }
         }
-        let watchdog = hubExpireTimer(after: silenceLimit, gen: gen, assistantID: assistantID)
+        // Re-armed on every frame attributed to this message below, so this
+        // measures silence, not total run time (issue #33).
+        var watchdog = hubExpireTimer(after: silenceLimit, gen: gen, assistantID: assistantID)
 
         var sawToolArguments = false
         var erroredOnce = false
@@ -1813,6 +1830,19 @@ public final class ConversationModel {
             // Only frames for this message count — the filter above is what
             // makes that true, so the flag goes directly under it (issue #9).
             outcome.sawAnyFrame = true
+            // Issue #33: a frame for THIS message is proof the stream is
+            // alive, so the silence budget restarts here. The watchdog used
+            // to be installed once per drain and never re-armed: it was an
+            // absolute 60 s cap on live streaming. Healthy long runs got
+            // `hub.expire(chatID:)` fired at them mid-generation, fell into
+            // the chunky reconcile fallback, and looked dead (truncated
+            // text, false "server sent nothing" banners) while the server
+            // kept writing every word — leave-and-re-enter showed the full
+            // answer. Frames for OTHER message ids never reach this line
+            // (the filter above `continue`s past them) and must not re-arm:
+            // a chatty neighbour must not keep a dead run's listener alive.
+            watchdog.cancel()
+            watchdog = hubExpireTimer(after: silenceLimit, gen: gen, assistantID: assistantID)
             if let delta = frame.delta { pending?.text += delta }
             if let thinking = frame.reasoningDelta { pending?.reasoning += thinking }
             if let pending {
@@ -1851,7 +1881,8 @@ public final class ConversationModel {
                 //
                 // Bounded rather than infinite: if the tool never reports back,
                 // the stream really is over and the turn settles on what was
-                // stored. The silence watchdog stays as the outer limit.
+                // stored. The silence watchdog stays as the backstop for a
+                // run that goes silent (no frames to re-arm it).
                 if pending?.awaitsTool == true
                     || (sawToolArguments && pending?.calls.isEmpty != false) {
                     sawToolArguments = false
@@ -2404,9 +2435,10 @@ public final class ConversationModel {
     /// Tuning for the drain's silence watchdog, same reasoning as
     /// `flushInterval`: a test that has to prove a stale watchdog did *not*
     /// fire cannot sit out a 60 s timer, so the limit is an instance knob.
-    /// The static stays the production default. Note the budget is read when
-    /// the drain INSTALLS its timer, so a test that wants a short watchdog
-    /// must set this before the run starts, not after.
+    /// The static stays the production default. The budget is read when a
+    /// timer is (re-)armed — install and every per-frame re-arm — so a test
+    /// that wants a short watchdog should set this before the run starts;
+    /// a mid-run change only takes effect at the next re-arm.
     var silenceLimit: Duration = ConversationModel.silenceLimit
 
     /// A failed POST is reported only if the run has not already ended on its own
