@@ -973,13 +973,40 @@ public final class ConversationModel {
     /// whole generation, so there is no other channel to shout down. A 200 here
     /// is not proof anything stopped — hence `stopping` rather than `ready`, and
     /// the terminal frame is what actually ends it.
+    ///
+    /// Issue #28: a run on a chat the server does not know yet has no server to
+    /// ask — there is no chat id, so there is no route to POST. Pressing Stop
+    /// there used to be a no-op, which left the button dead for the whole
+    /// pre-chat window (the upload wait, and the completion POST whose chat id
+    /// the stream has not named yet) on a brand-new chat: the chat sat in
+    /// `.waiting` and then shipped the message the user had just tried to
+    /// abort. The abort is therefore purely local:
+    /// `finishLocally(chatID: nil, …)` cancels the run Task, and cancellation
+    /// *is* the stop marker the run's own guards read — #22 built exactly that
+    /// guard for `send`'s upload wait, and it is the only suspension between
+    /// the send and the POST (`ensureChat` names a brand-new chat from the
+    /// stream, it does not make a request of its own). The generation is
+    /// deliberately not bumped: those guards finish the ribbon and restore the
+    /// draft behind `gen == runGeneration`, and every other generation gate in
+    /// the run would go inert instead of doing its local-finish work.
+    ///
+    /// The button keeps the same shape either way — busy means Stop works — and
+    /// the local abort settles straight to `.ready`: `.stopping` means "the
+    /// server has been asked", and here nobody was.
     public func stop() {
-        guard let chatID, phase.isBusy else { return }
+        guard phase.isBusy else { return }
         // A stop belongs to the run it stops: capture the generation, never bump
         // it. If a newer run starts while the stop POST is in flight, the slow
         // stop must not come back and finish *that* run (issue #5).
         let gen = runGeneration
         userStopped = true
+        guard let chatID else {
+            // Issue #28: nothing to ask. Cancel the run where it is parked and
+            // let its own cancellation guards do the local finish (draft back
+            // to the composer, ribbon closed, no banner, no completion POST).
+            finishLocally(chatID: nil, gen: gen)
+            return
+        }
         phase = .stopping
         Task {
             do {
@@ -1003,21 +1030,47 @@ public final class ConversationModel {
     }
 
     /// Ends the run in the app, whatever the server does next.
-    private func finishLocally(chatID: String, gen: Int) {
+    ///
+    /// A nil `chatID` is the issue #28 case: a run on a chat the server never
+    /// learned about, so Stop has nothing to ask and aborts locally.
+    private func finishLocally(chatID: String?, gen: Int) {
         guard gen == runGeneration else { return }
+        // Captured before the nil-ing below: whether the completion POST was
+        // open, i.e. whether THIS model could own a waiting hub listener.
+        let hadOpenPost = post != nil
         run?.cancel()
         post?.cancel()
         post = nil
-        hub.expire(chatID: chatID)
-        // No `expireWaitingListeners()` sweep here (#30, the #9 rule). The
-        // old comment claimed "a brand new chat may still be waiting for its
-        // id when stop is pressed" — but `stop()` itself refuses to run for
-        // a chat with no id, so this model's own listener is always keyed by
-        // a real id and `expire(chatID:)` above already reaches it. The
-        // global sweep over the per-server shared hub could therefore only
-        // ever kill ANOTHER model's brand-new-chat listener — the exact
-        // hazard #9 established for `recordPostError` (and why `abandon`
-        // sweeps only under `chatID == nil`).
+        if let chatID {
+            hub.expire(chatID: chatID)
+            // No `expireWaitingListeners()` sweep on this branch (#30, the #9
+            // rule). This model's own listener is keyed by the real id above
+            // and `expire(chatID:)` already reaches it, so the global sweep
+            // over the per-server shared hub could only ever kill ANOTHER
+            // model's brand-new-chat listener — the exact hazard #9
+            // established for `recordPostError` (and why `abandon` sweeps
+            // only under `chatID == nil`).
+        } else {
+            // Issue #28: with no id there is nothing to expire by id, and
+            // cancelling the Task does not end a `for await` over a hub stream
+            // — only the server stopping does, and there is no server chat to
+            // stop. So this is `abandon`'s teardown for the same problem: a
+            // run that had already installed its `framesAwaitingChatID`
+            // listener (the completion POST is open, the id not yet adopted)
+            // must not go on streaming into `turns` after the phase says
+            // `.ready`. The sweep is global, so it stays under #9's
+            // constraint — this model has no id, which is the case where the
+            // waiting listener it may sweep is most likely its own. The
+            // accepted residual is #30's, unchanged: two brand-new-chat models
+            // on one shared hub, one Stop sweeping the other's listener.
+            // Blast-radius gate (review of #28): in the upload-wait window
+            // `exchange` has not started, so THIS model provably has no waiting
+            // listener and the sweep could only ever hit another model's —
+            // pure hazard, nothing to gain. Only sweep once the POST is open.
+            if hadOpenPost {
+                hub.expireWaitingListeners()
+            }
+        }
         // One index for both jobs below: the buffer's own turn while a buffer
         // is in flight (the id match is the truth — a regenerate can have
         // replaced the tail), the last assistant turn otherwise (drain already
@@ -1564,15 +1617,34 @@ public final class ConversationModel {
                 guard isCurrent(gen) else { return }
                 let settled = turns.first(where: { $0.id == assistantID })?.text ?? ""
                 if settled.isEmpty {
-                    // "The server sent nothing" is an accusation, and it was
-                    // being made about the wrong party. iOS kills the socket on
-                    // a background sojourn; if the server record still says the
-                    // message is unfinished, the answer is on its way and the
-                    // thing that failed was our connection. Saying so is the
-                    // difference between a bug report and a dead end.
-                    outcome.failure = Self.emptyAnswerFailure(
-                        reported: outcome.reportedError,
-                        serverStillWriting: detail?.messages[assistantID].map { !$0.done } ?? false)
+                    // Issue #28: a run the reader stopped is not an empty
+                    // answer. The `phase == .stopping` branch above already
+                    // says a stop is not a failure, but it only catches the
+                    // ordering where the drain unwinds before `finishLocally`
+                    // settles the phase — which is the usual ordering for a
+                    // stored chat (the terminal frame wins the race) and never
+                    // the ordering of the #28 local abort, where the phase has
+                    // been `.ready` since the button press and — for a chat the
+                    // stream never named — `reconcileUntilClosed` has no id to
+                    // read back from and comes straight back. `userStopped` is
+                    // the durable marker for the same fact: it is set by
+                    // `stop()` and cleared at the start of every drain, so it
+                    // says "this run ended because the reader said so" whatever
+                    // the interleaving. Saying "The server sent nothing."
+                    // there blamed the server for the user's own tap.
+                    if userStopped {
+                        leafID = assistantID
+                    } else {
+                        // "The server sent nothing" is an accusation, and it was
+                        // being made about the wrong party. iOS kills the socket on
+                        // a background sojourn; if the server record still says the
+                        // message is unfinished, the answer is on its way and the
+                        // thing that failed was our connection. Saying so is the
+                        // difference between a bug report and a dead end.
+                        outcome.failure = Self.emptyAnswerFailure(
+                            reported: outcome.reportedError,
+                            serverStillWriting: detail?.messages[assistantID].map { !$0.done } ?? false)
+                    }
                 } else {
                     leafID = assistantID
                 }

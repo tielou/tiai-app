@@ -2042,6 +2042,116 @@ enum AskUserFixture {
     #expect(conversation.draft == "hello", "the stopped text returns to the composer either way")
 }
 
+// #28: the same window on a BRAND-NEW chat. `stop()` used to early-return for
+// a model with no chat id — but there is no server chat to shout at in that
+// window, so the button was simply dead: the chat sat in `.waiting` until the
+// hung upload landed and then POSTed the message the user had just tried to
+// abort. The abort is local: cancelling the run Task is the marker #22's
+// guard in `send`'s upload wait reads, so the local-finish contract is the
+// same one — draft back in the composer, ribbon closed, no banner, no POST.
+@Test @MainActor func stopDuringTheUploadWaitOfANewChatAbortsLocally() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let ribbon = GenerationActivity()
+    let conversation = ConversationModel(
+        chatID: nil,
+        models: [ChatModel.stub("local-personal", caps: ["vision": true])],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub, activity: ribbon)
+
+    transport.gateNextUpload()
+    defer { transport.releaseUpload() }
+    conversation.attach(data: Data([0xFF, 0xD8, 0xFF]), name: "shot.jpg", mimeType: "image/jpeg")
+    try await waitUntil { transport.isUploadGateParked }
+
+    conversation.draft = "hello"
+    conversation.send()
+    #expect(conversation.phase == .waiting)
+    // The ribbon went up unclaimed: a brand-new chat has no id to own it yet.
+    try await waitUntil { ribbon.isRibbonActive }
+    #expect(ribbon.activeChatID == nil)
+
+    conversation.stop()
+    // There is no round trip to wait for — nothing server-side knows about this
+    // exchange — so the abort settles in the same main-actor turn. No
+    // `.stopping` either: that state means "the server has been asked", and
+    // here nobody was.
+    try await waitUntil(timeout: .milliseconds(300)) { conversation.phase == .ready }
+
+    // The upload lands successfully: the run wakes on the cancellation marker.
+    transport.releaseUpload()
+    try await waitUntil { transport.uploads.count == 1 }
+    // Settle window: without the fix the run reaches `exchange` here — and
+    // pre-fix `stop()` was a no-op, so the phase never left `.waiting` at all.
+    try await Task.sleep(for: .milliseconds(150))
+
+    #expect(transport.completionBodies.isEmpty,
+            "a stopped brand-new chat must not POST a completion once its upload lands")
+    #expect(transport.paths.contains { $0.contains("/stop") } == false,
+            "there is no server chat to stop — the abort is local, so no stop route may be called")
+    #expect(conversation.error == nil,
+            "a stop the user asked for is not an error — no banner")
+    #expect(conversation.phase == .ready,
+            "the settled phase must stay settled — no flip back to .waiting")
+    #expect(conversation.turns.isEmpty,
+            "no phantom turns for a send that never posted")
+    #expect(!ribbon.isRibbonActive, "the cancelled run must close the ribbon it raised")
+    #expect(ribbon.activeChatID == nil)
+    // The #22 local-finish contract: the message was never posted, so the text
+    // goes back to the composer, and the picture that was still on the wire
+    // lands as a chip (it was never consumed — the steal happens after the
+    // cancellation guard), so a retry is one press away.
+    #expect(conversation.draft == "hello")
+    try await waitUntil { conversation.attachments.count == 1 }
+    // Re-assert after the settle: nothing late re-posts, re-errors or re-raises.
+    try await Task.sleep(for: .milliseconds(150))
+    #expect(transport.completionBodies.isEmpty)
+    #expect(conversation.error == nil)
+    #expect(conversation.phase == .ready)
+    #expect(!ribbon.isRibbonActive)
+}
+
+// #28, the last pre-chat window: the completion POST is open and the stream
+// has not named the chat yet, so this model still has no id. Stop cannot ask
+// the server, so the abort is local — and cancelling the run Task is not
+// enough, because a `for await` over a hub stream does not observe
+// cancellation: the hub teardown has to end it, or the stopped run keeps
+// writing into a transcript whose phase already says `.ready`.
+@Test @MainActor func stopOnANewChatWhoseIdTheStreamHasNotNamedEndsTheStream() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let ribbon = GenerationActivity()
+    let conversation = ConversationModel(
+        chatID: nil,
+        models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub, activity: ribbon)
+
+    transport.gateNextCompletion()
+    defer { transport.releaseCompletion() }
+    conversation.draft = "hello"
+    conversation.send()
+    try await waitUntil { transport.isCompletionGateParked }
+    #expect(conversation.chatID == nil)
+    #expect(hub.hasWaitingListener, "the new chat's listener is waiting for its id")
+
+    conversation.stop()
+    try await waitUntil(timeout: .milliseconds(300)) { conversation.phase == .ready }
+    #expect(!hub.hasWaitingListener,
+            "the stopped run's waiting listener must be ended — nothing else closes the stream")
+
+    // The completion POST is let through: the server answers into a chat
+    // nobody is listening to any more. Nothing may arrive late enough to
+    // re-error, re-stream or re-raise.
+    transport.releaseCompletion()
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(conversation.phase == .ready)
+    #expect(conversation.error == nil, "a stop the user asked for is not an error")
+    #expect(!ribbon.isRibbonActive, "the stopped run must not leave the ribbon up")
+}
+
 // #30: stop() on an id-carrying chat must not sweep another model's
 // brand-new-chat (nil-chatID) waiting listener off the shared per-server
 // hub. The sweep in finishLocally could never reach its OWN chat's listener
