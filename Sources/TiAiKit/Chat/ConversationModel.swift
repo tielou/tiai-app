@@ -2072,10 +2072,16 @@ public final class ConversationModel {
             pending = Turn(id: assistantID, role: "assistant", streaming: true)
         }
         let flusher = Task { [weak self] in
+            // Issue #24: the reveal cursor lives here, in the tick loop that
+            // owns it — one owner, no shared mutable state, and a superseded
+            // drain's flusher dies with its cursor unpublished-partial.
+            // A resume starts from the text already on screen: revealing from
+            // zero would blank the pre-resume answer for a tick.
+            var revealed = continuing ? (self?.pending?.text.count ?? 0) : 0
             while !Task.isCancelled {
                 try? await Task.sleep(for: self?.flushInterval ?? Self.flushInterval)
                 guard !Task.isCancelled else { return }
-                self?.publishPending(keeping: assistantID)
+                revealed = self?.revealTick(keeping: assistantID, from: revealed) ?? revealed
             }
         }
         // Re-armed on every frame attributed to this message below, so this
@@ -2712,6 +2718,20 @@ public final class ConversationModel {
     /// production default.
     var flushInterval: Duration = ConversationModel.flushInterval
 
+    /// Issue #24: typewriter reveal step, in graphemes per flush tick.
+    /// Nil disables the reveal (every tick publishes the whole buffer, the
+    /// pre-#24 behaviour). The default advances the published prefix by at
+    /// most `max(revealStep, backlog/4)` graphemes per tick — bursts of
+    /// several words become a smooth flow, and the proportional catch-up
+    /// keeps the visible text roughly a quarter-second behind the server no
+    /// matter how bursty the arrival. The final flush of a run (done, stop,
+    /// error, tool park) always publishes the complete text, so the reveal
+    /// can never hide or lose a word; that ordering is the same one 60ccb0c
+    /// established for the buffer-before-ready publish.
+    /// An instance knob for the same reason as `flushInterval`: a test has
+    /// to pin pacing without waiting on wall-clock timing twice over.
+    var revealStep: Int? = 3
+
     /// Tuning for the drain's silence watchdog, same reasoning as
     /// `flushInterval`: a test that has to prove a stale watchdog did *not*
     /// fire cannot sit out a 60 s timer, so the limit is an instance knob.
@@ -2779,6 +2799,33 @@ public final class ConversationModel {
     private func publishPending(keeping id: String) {
         guard let pending, pending.id == id else { return }
         flush(pending)
+    }
+
+    /// One typewriter tick (#24): advance the published prefix of the pending
+    /// buffer toward its full text and return the new cursor. With the knob
+    /// unset this is exactly the old `publishPending` — full buffer, cursor
+    /// parked at the end — so setting the knob to nil restores the pre-#24
+    /// path byte-for-byte.
+    /// Ownership is unchanged: the write goes through `flush`, which resolves
+    /// the destination by message id at write time (#14), and a buffer that
+    /// is no longer this run's returns the cursor untouched (#11/#16).
+    private func revealTick(keeping id: String, from cursor: Int) -> Int {
+        guard let pending, pending.id == id else { return cursor }
+        let full = pending.text.count
+        guard let step = revealStep, cursor < full else {
+            flush(pending)
+            return full
+        }
+        // Proportional catch-up: a burst is smoothed to `step` per tick while
+        // small, and a backlog that keeps growing drains at a quarter per
+        // tick, so the reveal trails the server by roughly a quarter-second
+        // and always converges before the answer ends.
+        let advance = max(step, (full - cursor) / 4)
+        let target = min(full, cursor + advance)
+        var shown = pending
+        shown.text = String(pending.text.prefix(target))
+        flush(shown)
+        return target
     }
 
     /// Publishes buffered text. Only touches `turns` on a flush, so the view
