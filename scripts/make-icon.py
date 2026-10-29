@@ -5,10 +5,11 @@ TestFlight rejects a build whose asset catalog has no AppIcon, so the output is
 committed rather than remembered -- same convention as the control-centre app,
 where the icon is generated from the PWA's own generator.
 
-This one is a placeholder with a point to make: a dark, quiet tile with a
-speech bubble and a dot, drawn from geometry so it is the same file on every
-machine and every CI run. Replace the drawing when there is a real mark; keep
-the pipeline.
+The mark: a chat bubble that is also a cat. The bubble body carries two ears
+and a tail that curl out of the same silhouette, and inside it the typing
+indicator -- two ink dots and one teal, the app's whole "someone is thinking"
+moment in three circles. Everything is drawn from geometry at 4x and reduced
+with LANCZOS, so it is the same file on every machine and every CI run.
 
     python3 scripts/make-icon.py
 """
@@ -18,7 +19,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 SIZE = 1024
-OUT = Path(__file__).resolve().parent.parent / "App" / "Assets.xcassets" / "AppIcon.appiconset"
+SS = SIZE * 4  # supersample canvas; the downsample is the antialias
 
 # Deep slate with a hint of teal: reads as "the house machine", not as a
 # vendor's brand colour, and it keeps the SF Symbols in the app the only accent.
@@ -26,50 +27,66 @@ TOP = (16, 22, 28)
 BOTTOM = (26, 44, 52)
 INK = (238, 244, 246)
 ACCENT = (108, 196, 178)
+DARK = (22, 28, 34)
 
 
 def gradient() -> Image.Image:
-    img = Image.new("RGB", (SIZE, SIZE), TOP)
+    img = Image.new("RGB", (SS, SS), TOP)
     draw = ImageDraw.Draw(img)
-    for y in range(SIZE):
-        t = y / (SIZE - 1)
+    for y in range(SS):
+        t = y / (SS - 1)
         colour = tuple(round(a + (b - a) * t) for a, b in zip(TOP, BOTTOM))
-        draw.line([(0, y), (SIZE, y)], fill=colour)
+        draw.line([(0, y), (SS, y)], fill=colour)
     return img
 
 
-def bubble(draw: ImageDraw.ImageDraw) -> None:
-    """A speech bubble with a tail, drawn as a stroked rounded rect."""
-    margin = int(SIZE * 0.22)
-    box = [margin, margin, SIZE - margin, int(SIZE * 0.70)]
-    radius = int((box[3] - box[1]) * 0.34)
-    width = int(SIZE * 0.045)
-    draw.rounded_rectangle(box, radius=radius, outline=INK, width=width)
-
-    # The tail: a small wedge off the lower-left, same stroke weight.
-    tail_top = (box[0] + radius, box[3] - width // 2)
-    tail_tip = (box[0] + int(radius * 0.35), int(box[3] + SIZE * 0.085))
-    tail_right = (box[0] + int(radius * 1.55), box[3] - width // 2)
-    draw.line([tail_top, tail_tip, tail_right], fill=INK, width=width, joint="curve")
-
-
-def dot(draw: ImageDraw.ImageDraw) -> None:
-    """The one accent: a dot where the message would be."""
-    r = int(SIZE * 0.075)
-    cx, cy = SIZE // 2, int(SIZE * 0.455)
-    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=ACCENT)
-
-
 def main() -> None:
-    img = gradient().convert("RGBA")
+    img = gradient()
     draw = ImageDraw.Draw(img)
-    bubble(draw)
-    dot(draw)
+
+    # The bubble body. Everything cat-shaped is drawn BEHIND it, so the ears
+    # and the tail fuse into one outline instead of showing stroke seams.
+    bw, bh = int(SS * 0.60), int(SS * 0.47)
+    cx, cy = SS // 2, int(SS * 0.505)
+    box = [cx - bw // 2, cy - bh // 2, cx + bw // 2, cy + bh // 2]
+    radius = int(bh * 0.36)
+
+    # The tail: an arc whose ends hide under the bubble, so it reads as
+    # growing out of the lower-right corner.
+    tail_w = int(SS * 0.052)
+    draw.arc(
+        [box[2] - int(SS * 0.16), box[3] - int(SS * 0.17),
+         box[2] + int(SS * 0.15), box[3] + int(SS * 0.14)],
+        210, 355, fill=INK, width=tail_w,
+    )
+
+    # The ears: plain triangles standing on the top edge, their bases tucked
+    # under the corner radius so no notch shows.
+    ear_w, ear_h = int(bw * 0.24), int(bh * 0.30)
+    for side in (-1, 1):
+        ex = cx + side * int(bw * 0.27)
+        base = box[1] + radius // 3
+        draw.polygon(
+            [(ex - ear_w // 2, base), (ex, base - ear_h), (ex + ear_w // 2, base)],
+            fill=INK,
+        )
+
+    draw.rounded_rectangle(box, radius=radius, fill=INK)
+
+    # The typing indicator: the message itself. Side dots ink, the middle one
+    # the accent -- the only teal on the tile, where the dot was before.
+    r_small, r_big = int(SS * 0.030), int(SS * 0.042)
+    gap = int(SS * 0.110)
+    for dx, r, colour in ((-gap, r_small, DARK), (0, r_big, ACCENT), (gap, r_small, DARK)):
+        draw.ellipse([cx + dx - r, cy - r, cx + dx + r, cy + r], fill=colour)
 
     OUT.mkdir(parents=True, exist_ok=True)
     icon = img.resize((SIZE, SIZE), Image.LANCZOS)
     icon.save(OUT / "icon-1024.png", optimize=True)
     print(f"wrote {OUT / 'icon-1024.png'}")
+
+
+OUT = Path(__file__).resolve().parent.parent / "App" / "Assets.xcassets" / "AppIcon.appiconset"
 
 
 if __name__ == "__main__":
