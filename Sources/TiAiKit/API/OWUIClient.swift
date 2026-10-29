@@ -478,7 +478,10 @@ public struct OWUIClient: Sendable {
     /// `content` is a full `MessageContent`, not a string, and `files` rides
     /// along when there are any: the server overwrites the stored row with
     /// exactly what this body says, so an edit that names only the text
-    /// silently deletes the message's pictures.
+    /// silently deletes the message's pictures. An explicit empty `files`
+    /// array is sent verbatim — that is the image trim's way of *clearing*
+    /// the row's files (issue #2); nil means "not naming files at all", an
+    /// empty array means "the row has no files now".
     public func updateMessage(
         chatID: String, messageID: String, content: MessageContent, files: [JSONValue]? = nil
     ) async throws {
@@ -487,7 +490,7 @@ public struct OWUIClient: Sendable {
         case let .text(value): body["content"] = .string(value)
         case let .blocks(values): body["content"] = .array(values)
         }
-        if let files, !files.isEmpty { body["files"] = .array(files) }
+        if let files { body["files"] = .array(files) }
         let data = (try? JSONEncoder().encode(body)) ?? Data("{}".utf8)
         let _: JSONValue = try await request(
             "POST", "/chats/\(chatID)/messages/\(messageID)", bodyData: data)

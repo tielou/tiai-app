@@ -369,6 +369,13 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
     private var _chatDetailOverride: Data?
     private var _chatDetailQueue: [Data] = []
     private var _failUploads = false
+    private var _messageUpdateFailureAfter: Int?
+    /// When set, the (N+1)th and later `updateMessage` POSTs throw instead of
+    /// landing — the fixture for a trim that fails mid-way (issue #2): the
+    /// first update lands, the next one does not.
+    var messageUpdateFailureAfter: Int? {
+        get { guarded { _messageUpdateFailureAfter } } set { guarded { _messageUpdateFailureAfter = newValue } }
+    }
     private var _completionFailure: Error?
     private var _completionFailuresByID: [String: Error] = [:]
 
@@ -680,6 +687,12 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
             // untouched, and a Task that is merely already cancelled is not
             // thrown at by a gate that never held its request.
             try await cooperativeMessageUpdateGate.parkIfArmed()
+            // Checked before recording: a rejected update never happened, so
+            // it does not count toward the failure threshold either.
+            if let after = guarded({ _messageUpdateFailureAfter }),
+               guarded({ _messageUpdateBodies.count }) >= after {
+                throw APIError.unreachable("message update rejected")
+            }
             guarded { _messageUpdateBodies.append(request.httpBody ?? Data()) }
             return (Data("{}".utf8), response(for: request, 200))
         }

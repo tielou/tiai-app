@@ -35,12 +35,18 @@ public final class ConversationModel {
     public private(set) var turns: [Turn] = []
     public private(set) var phase: Phase = .ready
     public private(set) var error: String?
+    /// Set when a send was refused for crossing the image budget and there is
+    /// something the client can do about it: the oldest persisted images that
+    /// must be replaced with placeholders to let the send through (issue #2).
+    /// The UI offers `trimOldestImagesToFit()` while this is non-nil; the send
+    /// itself stays blocked either way, because the engine would 500.
+    public private(set) var imageTrim: ImageTrimOffer?
     /// Takes the error banner away. Errors used to clear themselves on the next
     /// send or on the next successful run, which is fine for a failure that
     /// fixes itself but not for one the user has already read — a banner that
     /// outlives its meaning is noise, and the dismiss affordance has to be
     /// honest about what it dismisses (issue #9).
-    public func dismissError() { error = nil }
+    public func dismissError() { error = nil; imageTrim = nil }
     public private(set) var title: String
     /// Nil until the chat exists. It is set by `createChat`, not by the caller —
     /// a new conversation learns its own id mid-send.
@@ -138,6 +144,14 @@ public final class ConversationModel {
     /// files-vs-content double-count below.
     nonisolated static let maxImagesPerRequest = 50
 
+    /// Test seam: shrink the cap so a test can drive the over-cap path with
+    /// five messages instead of fifty-one. Nil (production) uses
+    /// `maxImagesPerRequest`.
+    var maxImagesPerRequestOverride: Int?
+
+    /// The effective image cap for this conversation.
+    private var imageCap: Int { maxImagesPerRequestOverride ?? Self.maxImagesPerRequest }
+
     /// The images the next completion would put in front of the engine: every
     /// image already on the loaded branch, plus what the message being sent
     /// adds.
@@ -154,25 +168,28 @@ public final class ConversationModel {
     /// Counted regardless of whether the current model has vision — the cap is
     /// about the stored conversation the server rebuilds, not this model's eyes.
     nonisolated static func imageCount(in turns: [Turn], outgoing: [PendingAttachment]) -> Int {
+        turns.reduce(0) { $0 + imageCount(in: $1) } + outgoing.filter(\.isImage).count
+    }
+
+    /// The images one message puts in front of the engine — the per-message
+    /// half of `imageCount(in:outgoing:)`, split out so the trim offer can
+    /// walk the branch oldest-first one message at a time.
+    nonisolated static func imageCount(in turn: Turn) -> Int {
         func key(for url: String) -> String {
             let prefix = "file_id://"
             return url.hasPrefix(prefix) ? String(url.dropFirst(prefix.count)) : url
         }
-        var total = 0
-        for turn in turns {
-            let imageFiles = turn.attachments.filter(\.isImage).map(\.id)
-            var files = Set(imageFiles)
-            var count = imageFiles.count
-            for url in turn.contentImageURLs {
-                // A block that is one of this message's files is that file and
-                // not an extra image — but it absorbs only one block, so a
-                // second identical block still counts.
-                if files.remove(key(for: url)) != nil { continue }
-                count += 1
-            }
-            total += count
+        let imageFiles = turn.attachments.filter(\.isImage).map(\.id)
+        var files = Set(imageFiles)
+        var count = imageFiles.count
+        for url in turn.contentImageURLs {
+            // A block that is one of this message's files is that file and
+            // not an extra image — but it absorbs only one block, so a
+            // second identical block still counts.
+            if files.remove(key(for: url)) != nil { continue }
+            count += 1
         }
-        return total + outgoing.filter(\.isImage).count
+        return count
     }
 
     /// The refusal shown when the next request would cross
@@ -189,11 +206,143 @@ public final class ConversationModel {
     private func imageLimitMessage(outgoing: [PendingAttachment]) -> String? {
         let inFlight = uploadsInFlightImages
         let count = Self.imageCount(in: turns, outgoing: outgoing) + inFlight
-        guard count > Self.maxImagesPerRequest else { return nil }
+        guard count > imageCap else { imageTrim = nil; return nil }
+        // Issue #2: the refusal is also the decision point for the way out.
+        // If the over-cap images live in persisted messages the client can
+        // rewrite, offer the trim; the send stays blocked until it happens.
+        imageTrim = Self.imageTrimOffer(
+            in: turns, projected: count, cap: imageCap)
         let subject = outgoing.contains(where: \.isImage) || inFlight > 0
             ? "This message would send \(count) images"
             : "This chat already contains \(count) images"
-        return "\(subject) — the model can see at most \(Self.maxImagesPerRequest) per request. Start a new chat to keep using images."
+        return "\(subject) — the model can see at most \(imageCap) per request. Start a new chat to keep using images."
+    }
+
+    // MARK: - image trim (issue #2)
+
+    /// The text that replaces a removed image, in the stored message and in
+    /// the local transcript.
+    public static let imageTrimPlaceholder = "[image removed — over model image budget]"
+
+    /// The projection the cap is compared against: persisted images plus what
+    /// the pending send adds, including uploads still on the wire.
+    private func projectedImageCount(outgoing: [PendingAttachment]) -> Int {
+        Self.imageCount(in: turns, outgoing: outgoing) + uploadsInFlightImages
+    }
+
+    /// The trim offer for an over-cap projection: walk the branch oldest-first
+    /// and take whole messages until the excess is covered. Whole messages,
+    /// not individual images, because the trim rewrites a message wholesale
+    /// (the server overwrites the row) — a message is either trimmed or it is
+    /// not. Nil when nothing can be trimmed (e.g. a fresh chat whose excess
+    /// is entirely the attachments of the message being sent).
+    static func imageTrimOffer(in turns: [Turn], projected: Int, cap: Int) -> ImageTrimOffer? {
+        var excess = projected - cap
+        guard excess > 0 else { return nil }
+        var targets: [ImageTrimOffer.Target] = []
+        for turn in turns {
+            let images = imageCount(in: turn)
+            guard images > 0 else { continue }
+            targets.append(ImageTrimOffer.Target(
+                messageID: turn.id, dropCount: images, preview: trimPreview(for: turn)))
+            excess -= images
+            if excess <= 0 { break }
+        }
+        guard !targets.isEmpty else { return nil }
+        return ImageTrimOffer(
+            imagesInChat: projected,
+            cap: cap,
+            dropTotal: targets.reduce(0) { $0 + $1.dropCount },
+            targets: targets)
+    }
+
+    /// One line describing a message for the confirmation dialog: its first
+    /// line of text (or a label when it is image-only) and its date.
+    static func trimPreview(for turn: Turn) -> String {
+        let firstLine = (turn.text.split(whereSeparator: \.isNewline).first.map(String.init)
+            ?? "").trimmingCharacters(in: .whitespaces)
+        let label = firstLine.isEmpty
+            ? "image-only message"
+            : (firstLine.count > 60 ? String(firstLine.prefix(60)) + "…" : firstLine)
+        return "\(label) · \(turn.createdAt.formatted(date: .abbreviated, time: .omitted))"
+    }
+
+    /// Replace the oldest persisted images with placeholders until the
+    /// projection fits, so an image-heavy chat keeps working instead of
+    /// dead-ending (issue #2). Nothing is re-sent afterwards: the user presses
+    /// send again once the banner clears.
+    ///
+    /// Each update is independently consistent server-side, so a failure
+    /// mid-trim leaves the completed trims applied, surfaces the error, and
+    /// recomputes the offer against what is left. There is no undo — these are
+    /// server mutations — which is why the UI gates this behind a confirm
+    /// dialog that lists exactly what will be replaced.
+    public func trimOldestImagesToFit() async {
+        guard let chatID, !phase.isBusy else { return }
+        error = nil
+        // Recomputed against the current state rather than trusting the
+        // stored offer, which may predate the user opening the dialog.
+        var offer = Self.imageTrimOffer(
+            in: turns, projected: projectedImageCount(outgoing: attachments), cap: imageCap)
+        imageTrim = offer
+        guard let targets = offer?.targets else { return }
+        for target in targets {
+            // Re-check before every message: the point is to stop as soon as
+            // the projection fits, not to trim the whole target list blindly.
+            guard projectedImageCount(outgoing: attachments) > imageCap else { break }
+            do {
+                try await trimImages(messageID: target.messageID, chatID: chatID)
+            } catch {
+                self.error = "Could not remove the oldest images: \(error.localizedDescription)"
+                offer = Self.imageTrimOffer(
+                    in: turns, projected: projectedImageCount(outgoing: attachments), cap: imageCap)
+                imageTrim = offer
+                return
+            }
+        }
+        imageTrim = Self.imageTrimOffer(
+            in: turns, projected: projectedImageCount(outgoing: attachments), cap: imageCap)
+    }
+
+    /// Rewrite one persisted message without its images: text and non-image
+    /// blocks preserved verbatim, image blocks dropped, a placeholder added,
+    /// and an explicit empty `files` array — the server overwrites the row
+    /// with exactly what the body says, so omitting `files` is the
+    /// silent-delete trap; the empty array is the explicit "no files".
+    /// The local transcript and the cached detail are updated to match.
+    private func trimImages(messageID: String, chatID: String) async throws {
+        let placeholder = Self.imageTrimPlaceholder
+        let stored = detail?.messages[messageID]
+        let turnIndex = turns.firstIndex(where: { $0.id == messageID })
+        let newContent: MessageContent
+        switch stored?.content {
+        case let .blocks(blocks)?:
+            var kept = blocks.filter { $0["type"]?.stringValue != "image_url" }
+            kept.append(.object(["type": .string("text"), "text": .string(placeholder)]))
+            newContent = .blocks(kept)
+        case let .text(value)?:
+            newContent = .text(value.isEmpty ? placeholder : value + "\n\n" + placeholder)
+        case nil:
+            // No cached detail for this message (a turn from this session that
+            // the last refetch never saw): fall back to its rendered text.
+            let text = turnIndex.map { turns[$0].text } ?? ""
+            newContent = .text(text.isEmpty ? placeholder : text + "\n\n" + placeholder)
+        }
+        try await client.updateMessage(
+            chatID: chatID, messageID: messageID, content: newContent, files: [])
+        if var stored {
+            stored.content = newContent
+            stored.files = []
+            detail?.messages[messageID] = stored
+        }
+        if let turnIndex {
+            var turn = turns[turnIndex]
+            let text = turn.text
+            turn.text = text.isEmpty ? placeholder : text + "\n\n" + placeholder
+            turn.attachments.removeAll { $0.isImage }
+            turn.contentImageURLs = []
+            turns[turnIndex] = turn
+        }
     }
 
     /// A chat that is never saved.
@@ -2745,5 +2894,41 @@ public final class ConversationModel {
             }
         }
         return out
+    }
+}
+
+/// The offer the image guard makes when a send is refused for crossing the
+/// per-request image budget and the excess is in persisted messages the client
+/// can rewrite (issue #2). Carries everything the confirmation dialog needs:
+/// the numbers, and one preview line per message that will lose its images.
+public struct ImageTrimOffer: Equatable, Sendable {
+    /// One message the trim will rewrite, oldest-first in the offer's list.
+    public struct Target: Equatable, Sendable {
+        public let messageID: String
+        /// How many images this message currently contributes — all of them
+        /// go, because the trim rewrites a message wholesale.
+        public let dropCount: Int
+        /// One line describing the message (first text line or an
+        /// image-only label, plus its date) for the confirm dialog.
+        public let preview: String
+    }
+
+    /// The projected image count when the offer was made (persisted images
+    /// plus the pending send and any uploads still on the wire).
+    public let imagesInChat: Int
+    /// The cap the projection crossed.
+    public let cap: Int
+    /// Total images the trim will drop — the N in "Remove N oldest images".
+    public let dropTotal: Int
+    /// The messages the trim will rewrite, oldest-first.
+    public let targets: [Target]
+
+    /// The confirm dialog's body: the preview the AC asks for — which images
+    /// (messages, dates) will be replaced with a placeholder. There is no
+    /// undo (these are server mutations); this gate is what satisfies that
+    /// requirement.
+    public var confirmationMessage: String {
+        let lines = targets.map { "• \($0.preview)" }.joined(separator: "\n")
+        return "The \(dropTotal) oldest images will be replaced with a placeholder:\n\(lines)"
     }
 }

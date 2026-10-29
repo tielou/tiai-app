@@ -130,6 +130,11 @@ public struct ConversationView: View {
     /// the composer is the only place that knows which one it was.
     @State private var authFinished: ((Bool) -> Void)?
 
+    /// The image-trim offer awaiting confirmation in the error banner (issue #2).
+    /// Kept in the view, not the model: the model owns the offer, the view owns
+    /// the dialog.
+    @State private var pendingTrim: ImageTrimOffer?
+
     struct AuthorizeRequest: Identifiable, Hashable {
         let url: URL
         var id: String { url.absoluteString }
@@ -180,6 +185,34 @@ public struct ConversationView: View {
                         .font(.footnote)
                         .foregroundStyle(.red)
                     Spacer(minLength: 8)
+                    // Issue #2: the over-cap refusal used to be a dead end. The
+                    // model now says which oldest images would have to go; this
+                    // offers the way out. Confirm-gated because it rewrites
+                    // persisted messages server-side and there is no undo.
+                    if let trim = conversation.imageTrim, !conversation.phase.isBusy {
+                        Button("Remove \(trim.dropTotal) oldest image\(trim.dropTotal == 1 ? "" : "s")") {
+                            pendingTrim = trim
+                        }
+                        .font(.footnote)
+                        .confirmationDialog(
+                            "Remove the oldest images?",
+                            isPresented: Binding(
+                                get: { pendingTrim != nil },
+                                set: { if !$0 { pendingTrim = nil } }
+                            ),
+                            titleVisibility: .visible
+                        ) {
+                            Button("Remove \(trim.dropTotal) oldest image\(trim.dropTotal == 1 ? "" : "s")",
+                                role: .destructive
+                            ) {
+                                pendingTrim = nil
+                                Task { await conversation.trimOldestImagesToFit() }
+                            }
+                            Button("Cancel", role: .cancel) { pendingTrim = nil }
+                        } message: {
+                            Text((pendingTrim ?? trim).confirmationMessage)
+                        }
+                    }
                     // The one retry that can be offered honestly: the last
                     // question is known, and re-running it is the same operation
                     // the toolbar's regenerate already does. Not offered while
