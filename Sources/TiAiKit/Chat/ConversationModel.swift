@@ -327,14 +327,20 @@ public final class ConversationModel {
     /// must then be rebuilt from the turn's attachment chips.
     func debugClearDetailForTrimTest() { detail = nil }
 
-    /// Rewrite one persisted message without its images: text and non-image
-    /// blocks preserved verbatim, image blocks dropped, a placeholder added,
-    /// and `files` narrowed to the message's non-image entries — the server
+    /// Rewrite one persisted message without its images: the text parts kept,
+    /// the images dropped, a placeholder added, and `files` narrowed to the
+    /// message's non-image entries — the server
     /// overwrites the row with exactly what the body says, so omitting
     /// `files` is the silent-delete trap, and sending `[]` would destroy a
     /// PDF riding along with the images. A message whose files are all
     /// images still sends the explicit empty array: that is the honest "no
     /// files". The local transcript and the cached detail are updated to match.
+    ///
+    /// Content is always sent as a plain string: the message-upsert endpoint
+    /// rejects block arrays (`Input should be a valid string`, verified live —
+    /// a 422 on every write). Block content therefore collapses to its text
+    /// parts joined the way a refetch renders them; non-text, non-image blocks
+    /// cannot survive that and are dropped with the images.
     private func trimImages(messageID: String, chatID: String) async throws {
         let placeholder = Self.imageTrimPlaceholder
         let stored = detail?.messages[messageID]
@@ -347,9 +353,9 @@ public final class ConversationModel {
         let textSeparator: String
         switch stored?.content {
         case let .blocks(blocks)?:
-            var kept = blocks.filter { $0["type"]?.stringValue != "image_url" }
-            kept.append(.object(["type": .string("text"), "text": .string(placeholder)]))
-            newContent = .blocks(kept)
+            let text = blocks.compactMap { $0.objectValue?["text"]?.stringValue }
+                .joined(separator: "\n")
+            newContent = .text(text.isEmpty ? placeholder : text + "\n" + placeholder)
             textSeparator = "\n"
         case let .text(value)?:
             newContent = .text(value.isEmpty ? placeholder : value + "\n\n" + placeholder)

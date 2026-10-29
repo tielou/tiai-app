@@ -96,10 +96,11 @@ private func updateBody(_ data: Data) throws -> [String: Any] {
     try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
 }
 
-/// The `content` of an update body as blocks, whether the server-side shape was
-/// a bare string or a block array.
-private func contentBlocks(_ body: [String: Any]) -> [[String: Any]] {
-    (body["content"] as? [[String: Any]]) ?? []
+/// The `content` of an update body. The message-upsert endpoint rejects block
+/// arrays (`Input should be a valid string`, verified against the live
+/// server), so every trim write must carry a plain string.
+private func contentText(_ body: [String: Any]) throws -> String {
+    try #require(body["content"] as? String)
 }
 
 // MARK: - (a) the offer
@@ -193,12 +194,9 @@ private func contentBlocks(_ body: [String: Any]) -> [[String: Any]] {
         let json = try updateBody(body)
         let files = try #require(json["files"] as? [Any])
         #expect(files.isEmpty, "files must be the explicit empty array")
-        let blocks = contentBlocks(json)
-        #expect(!blocks.isEmpty)
-        let texts = blocks.compactMap { $0["text"] as? String }
-        #expect(texts.contains(ConversationModel.imageTrimPlaceholder))
-        #expect(!blocks.contains { ($0["type"] as? String) == "image_url" },
-                "no image blocks survive the trim")
+        let text = try contentText(json)
+        #expect(text.contains(ConversationModel.imageTrimPlaceholder))
+        #expect(!text.contains("IMG"), "no image payload survives the trim")
     }
 
     // (d) after the trim the guard no longer refuses, and the send proceeds.
@@ -217,9 +215,9 @@ private func contentBlocks(_ body: [String: Any]) -> [[String: Any]] {
     #expect(trimmed.allSatisfy { $0.contentImageURLs.isEmpty && $0.attachments.isEmpty })
 }
 
-// MARK: - (c) text and non-image blocks survive verbatim
+// MARK: - (c) text survives; the server only takes strings, so blocks collapse
 
-@Test @MainActor func trimPreservesTextAndNonImageBlocks() async throws {
+@Test @MainActor func trimPreservesTextAndDropsNonTextBlocks() async throws {
     let transport = ScriptedTransport()
     let conversation = makeTrimConversation(
         chatID: "chat-trim-keep", transport: transport, cap: 3)
@@ -234,18 +232,16 @@ private func contentBlocks(_ body: [String: Any]) -> [[String: Any]] {
 
     #expect(transport.messageUpdateBodies.count == 2)
     let first = try updateBody(transport.messageUpdateBodies[0])
-    let blocks = contentBlocks(first)
-    // The text part is preserved verbatim, the placeholder is added, and the
-    // distinctive non-image block survives untouched.
-    let texts = blocks.compactMap { $0["text"] as? String }
-    #expect(texts.contains("pic 1"))
-    #expect(texts.contains(ConversationModel.imageTrimPlaceholder))
-    let kept = blocks.first { ($0["type"] as? String) == "custom_keep" }
-    #expect(kept?["keep"] as? Int == 1, "non-image blocks must be preserved verbatim")
+    // The text part is preserved and the placeholder added, joined the way a
+    // refetch renders block content. Non-text blocks cannot survive: the
+    // upsert endpoint takes strings only, so they are dropped with the images.
+    let text = try contentText(first)
+    #expect(text.contains("pic 1"))
+    #expect(text.contains(ConversationModel.imageTrimPlaceholder))
+    #expect(!text.contains("custom_keep"))
     // The second trimmed message had no extra block — only text + placeholder.
     let second = try updateBody(transport.messageUpdateBodies[1])
-    #expect(contentBlocks(second).compactMap { $0["text"] as? String }.contains("pic 2"))
-    #expect(!contentBlocks(second).contains { ($0["type"] as? String) == "custom_keep" })
+    #expect(try contentText(second).contains("pic 2"))
 }
 
 // MARK: - (e) an image-only message becomes the placeholder alone
@@ -265,12 +261,9 @@ private func contentBlocks(_ body: [String: Any]) -> [[String: Any]] {
 
     #expect(transport.messageUpdateBodies.count == 2)
     let first = try updateBody(transport.messageUpdateBodies[0])
-    // The stored content was a block array (image block only), so the trimmed
-    // content is blocks too: the placeholder and nothing else.
-    let blocks = contentBlocks(first)
-    #expect(blocks.count == 1)
-    #expect(blocks[0]["type"] as? String == "text")
-    #expect(blocks[0]["text"] as? String == ConversationModel.imageTrimPlaceholder)
+    // The stored content was a block array (image block only): with no text
+    // part to keep, the trimmed content is the placeholder and nothing else.
+    #expect(try contentText(first) == ConversationModel.imageTrimPlaceholder)
 }
 
 // MARK: - (g) a trim keeps the non-image files of a trimmed message
@@ -365,15 +358,12 @@ private func contentBlocks(_ body: [String: Any]) -> [[String: Any]] {
     try await Task.sleep(for: .milliseconds(300))
     await conversation.trimOldestImagesToFit()
 
-    // What a refetch would render for the new stored content: blocks
-    // content's text parts joined the way `MessageContent.text` joins them.
-    // The local apply must produce exactly this, or the bubble changes text
-    // on the next reload.
+    // What a refetch would render for the new stored content: the plain
+    // string the server now holds. The local apply must produce exactly
+    // this, or the bubble changes text on the next reload.
     let first = try updateBody(transport.messageUpdateBodies[0])
-    let contentData = try JSONSerialization.data(
-        withJSONObject: try #require(first["content"]))
-    let storedContent = try JSONDecoder().decode(MessageContent.self, from: contentData)
-    #expect(conversation.turns[0].text == storedContent.text,
+    let storedText = try contentText(first)
+    #expect(conversation.turns[0].text == storedText,
             "local text diverges from what a refetch would render")
     #expect(conversation.turns[0].text
         == "pic 1\n\(ConversationModel.imageTrimPlaceholder)")
