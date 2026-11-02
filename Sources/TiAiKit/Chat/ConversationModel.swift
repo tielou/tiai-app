@@ -977,6 +977,13 @@ public final class ConversationModel {
             return
         }
         draft = ""
+        lastSendText = text
+        // #34: the discard-on-stop puts the chat back where the send found
+        // it. The name `ensureChat` gives a new chat is captured here (the
+        // last point it still holds its pre-send value). Attachments are NOT
+        // restored — see the accepted-cost note in `stop()`'s nil branch.
+        titleBeforeLastSend = title
+        placeholderBeforeLastSend = titleIsPlaceholder
         error = nil
         // Set here rather than inside the task: the button's feedback should not
         // wait for a scheduling hop, and a caller that then awaits something
@@ -1319,7 +1326,41 @@ public final class ConversationModel {
             // Issue #28: nothing to ask. Cancel the run where it is parked and
             // let its own cancellation guards do the local finish (draft back
             // to the composer, ribbon closed, no banner, no completion POST).
+            //
+            // Issue #34 (product call): and then DISCARD the chat. A stop here
+            // means "this message did not happen", so the transcript goes back
+            // to empty and the text goes back to the composer — the same
+            // never-happened shape #22's upload-wait abort has. The accepted
+            // cost, deliberately accepted: if the completion POST was already
+            // open, the server finishes a chat nobody is watching, and that
+            // chat shows up in the chat list with its full answer. There is
+            // no id to address a real stop until the first frame names one;
+            // racing that window with a deferred stop (option (b) on the
+            // issue) was passed over for this simpler, honest shape.
+            //
+            // Safe to clear mid-flight: every stream write is resolved by
+            // message id at write time (#14), so a drain still in flight
+            // skips these removed turns instead of resurrecting them, and
+            // `leafID` is meaningless for the next send — a brand-new chat
+            // posts no parent until an id exists.
             finishLocally(chatID: nil, gen: gen)
+            turns = []
+            leafID = nil
+            // Same rule as #22's abort: text returns only if the composer is
+            // still empty — anything typed since the press wins.
+            if draft.isEmpty { draft = lastSendText }
+            // Undo `ensureChat`'s rename: a chat that never happened keeps the
+            // name it had before the send named it after the message.
+            title = titleBeforeLastSend
+            titleIsPlaceholder = placeholderBeforeLastSend
+            // Accepted cost (review of #34): attachments are NOT put back. By
+            // the time a stop can discard the chat, the run Task has stolen
+            // the *landed* files into `exchange` and cleared `attachments`;
+            // the only snapshot available at `send()` is the still-uploading
+            // state, and restoring a half-uploaded chip is a worse bug than
+            // the rare loss (a brand-new chat, stopped mid-first-send, that
+            // had a file attached). The text — the thing the issue is about —
+            // always comes back.
             return
         }
         phase = .stopping
@@ -1908,6 +1949,21 @@ public final class ConversationModel {
             // nothing." — the misattribution this rollback exists to fix.
             return
         }
+        if chatID == nil, userStopped, !turns.contains(where: { $0.id == assistantID }) {
+            // #34: the stop-discarded shape. A stop on a brand-new chat
+            // discarded the transcript while this exchange was still
+            // unwinding (stop never bumps the generation, so the guards
+            // above cannot see the discard, and cancellation is not observed
+            // between the drain and here). Everything below — `leafID`, the
+            // reconcile, the final flush — belongs to a chat that no longer
+            // exists locally: writing `leafID` would leave a dangling parent
+            // for the next send. Narrowly shaped on purpose: a missing row
+            // alone is not enough (a mid-run reload can legitimately drop it
+            // and #19's reconcile below re-adds it) — the nil id plus the
+            // user-stop marker is what says "discarded".
+            await activity.finish(.stopped, characters: 0, chatID: nil)
+            return
+        }
         if outcome.sawTerminal {
             leafID = assistantID
         } else if outcome.failure == nil {
@@ -2080,6 +2136,16 @@ public final class ConversationModel {
     /// to it, so the post-run refetch is skipped — it would only be a network call
     /// racing with the screen that just stopped showing things.
     private var userStopped = false
+    /// The text of the most recent `send()`, kept so a stop on a brand-new
+    /// chat can put it back in the composer when discarding the chat (#34).
+    /// Not cleared on success — a stale value is only ever read by the nil-
+    /// chatID stop branch, and only when the composer is empty.
+    private var lastSendText = ""
+    /// The pre-send chat name captured at `send()` for the same reason as
+    /// `lastSendText` (#34): the discard restores the name `ensureChat` gave
+    /// a chat that turned out to never happen.
+    private var titleBeforeLastSend = ""
+    private var placeholderBeforeLastSend = false
 
     struct DrainOutcome {
         var sawTerminal = false
@@ -3011,6 +3077,13 @@ public final class ConversationModel {
     /// Takes the id the server chose, once.
     private func adopt(chatID: String) {
         guard self.chatID == nil else { return }
+        // #34: the callback only ever means "my live run's chat just got
+        // named". A stop on a brand-new chat discards the chat and settles
+        // the phase; a frame that arrived *before* the stop can still queue
+        // this hop, and adopting then would hand the discarded model a real
+        // id — the next load() would resurrect the phantom chat into the
+        // empty transcript. Only a busy model still owns a run to adopt for.
+        guard phase.isBusy else { return }
         self.chatID = chatID
         // Issue #20: a brand-new chat raised its ribbon with no owner (there
         // was no id yet), and an unclaimed ribbon matches *any* finish — any

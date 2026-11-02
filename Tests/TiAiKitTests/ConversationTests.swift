@@ -2155,6 +2155,14 @@ enum AskUserFixture {
     #expect(!hub.hasWaitingListener,
             "the stopped run's waiting listener must be ended — nothing else closes the stream")
 
+    // #34 (product call): a stop on a brand-new chat DISCARDS it — the
+    // transcript goes back to empty and the text goes back to the composer,
+    // as if the send had never happened.
+    #expect(conversation.turns.isEmpty,
+            "the phantom chat is discarded: \(conversation.turns)")
+    #expect(conversation.draft == "hello",
+            "the message returns to the composer")
+
     // The completion POST is let through: the server answers into a chat
     // nobody is listening to any more. Nothing may arrive late enough to
     // re-error, re-stream or re-raise.
@@ -2163,6 +2171,23 @@ enum AskUserFixture {
     #expect(conversation.phase == .ready)
     #expect(conversation.error == nil, "a stop the user asked for is not an error")
     #expect(!ribbon.isRibbonActive, "the stopped run must not leave the ribbon up")
+    // The late POST landing must not resurrect the discarded chat: every
+    // stream write resolves its message id at write time (#14), and the
+    // discarded turns are gone.
+    #expect(conversation.turns.isEmpty,
+            "nothing from the stopped run may repopulate the discarded chat: \(conversation.turns)")
+    // The discard must be durable against the stopped run's own unwind: a
+    // dangling `leafID` would make the NEXT send post a parent id from the
+    // discarded chat, and a late adopt would re-identify it.
+    #expect(conversation.chatID == nil, "a stopped new chat stays unnamed")
+    conversation.draft = "retry"
+    conversation.send()
+    try await transport.awaitCompletion(2)
+    let body = try #require(transport.completionBody)
+    let json = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+    // `.root` encodes an explicit null; a dangling leaf would be a string id.
+    #expect(json?["parent_id"] is NSNull,
+            "the send after a discard starts a fresh chat, no parent from the discarded one: \(json?["parent_id"] ?? "nil")")
 }
 
 // #30: stop() on an id-carrying chat must not sweep another model's
