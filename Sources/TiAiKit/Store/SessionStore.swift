@@ -65,6 +65,23 @@ public final class SessionStore {
     @ObservationIgnored private var hub: ChatEventHub?
     @ObservationIgnored private var hubServer: Server?
 
+    /// The session's feature/tool intent, shared by every chat (issue #35).
+    ///
+    /// Mirrors `eventHub()`'s caching shape but keys on `server.baseURL`
+    /// only, not the whole `Server`: a token refresh must not throw away
+    /// what the user switched on, while a server switch must — one
+    /// instance's tools and features are not another's.
+    public func runPreferences() -> RunPreferences {
+        if let prefs, prefsServer == server.baseURL { return prefs }
+        let prefs = RunPreferences()
+        self.prefs = prefs
+        prefsServer = server.baseURL
+        return prefs
+    }
+
+    @ObservationIgnored private var prefs: RunPreferences?
+    @ObservationIgnored private var prefsServer: URL?
+
     // MARK: - connecting
 
     public func setURL(_ text: String) {

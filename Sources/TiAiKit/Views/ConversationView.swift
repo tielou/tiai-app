@@ -69,9 +69,13 @@ public struct ConversationView: View {
         guard !seededTools else { return }
         seededTools = true
         guard conversation.tools.isEmpty else { return }
-        conversation.tools = tools
-            .filter { !$0.id.hasPrefix("server:") && $0.available }
-            .map(\.id)
+        let workspace = tools.filter { !$0.id.hasPrefix("server:") && $0.available }
+        conversation.seedTools(
+            defaultIDs: workspace.map(\.id),
+            available: tools.map {
+                (id: $0.id, available: $0.available,
+                 needsAuth: $0.authorizeURL(base: conversation.serverURL) != nil)
+            })
     }
 
     /// Fetch a file the answer linked and hand it to the share sheet. The link is
@@ -165,7 +169,8 @@ public struct ConversationView: View {
             title: title,
             models: models,
             client: session.client,
-            hub: session.eventHub())
+            hub: session.eventHub(),
+            prefs: session.runPreferences())
         // Something shared from another app arrives as a composed prompt. It
         // lands in the composer rather than being sent: "share to my assistant"
         // is a request to be shown, not a licence to post.

@@ -638,8 +638,8 @@ struct AddToChatSheet: View {
         let picked = tool.id
         send {
             onAuthorize(url) { finished in
-                if finished, !conversation.tools.contains(picked) {
-                    conversation.tools.append(picked)
+                if finished {
+                    conversation.setTool(picked, on: true)
                 }
             }
         }()
@@ -650,7 +650,7 @@ struct AddToChatSheet: View {
             get: { conversation.tools.contains(tool.id) },
             set: { on in
                 guard on else {
-                    conversation.tools.removeAll { $0 == tool.id }
+                    conversation.setTool(tool.id, on: false)
                     return
                 }
                 // An unauthenticated server cannot serve anything, so switching
@@ -661,14 +661,14 @@ struct AddToChatSheet: View {
                     startSignIn(tool)
                     return
                 }
-                conversation.tools.append(tool.id)
+                conversation.setTool(tool.id, on: true)
             })
     }
 
     private func binding(for feature: ChatFeature) -> Binding<Bool> {
         Binding(
             get: { conversation.features[feature.rawValue] ?? false },
-            set: { conversation.features[feature.rawValue] = $0 })
+            set: { conversation.setFeature(feature.rawValue, on: $0) })
     }
 }
 

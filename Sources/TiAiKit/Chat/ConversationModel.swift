@@ -446,7 +446,8 @@ public final class ConversationModel {
         incognito: Bool = false,
         client: OWUIClient,
         hub: ChatEventHub,
-        activity: GenerationActivity = .shared
+        activity: GenerationActivity = .shared,
+        prefs: RunPreferences = RunPreferences()
     ) {
         self.incognito = incognito
         self.chatID = chatID
@@ -454,11 +455,19 @@ public final class ConversationModel {
         self.client = client
         self.hub = hub
         self.activity = activity
+        self.prefs = prefs
         self.models = models
         modelIDs = models.map(\.id)
         model = models.first?.id ?? ""
-        features = Self.seedFeatures(for: models.first, incognito: incognito)
+        features = Self.applyFeaturePrefs(
+            seed: Self.seedFeatures(for: models.first, incognito: incognito),
+            model: models.first, incognito: incognito, prefs: prefs)
     }
+
+    /// The session's feature/tool intent (issue #35). Read-only here: the only
+    /// ways in are `setFeature`/`setTool`, so a chat can never write an intent
+    /// it did not express.
+    private let prefs: RunPreferences
 
     /// The toggles a model starts a chat with.
     ///
@@ -497,6 +506,43 @@ public final class ConversationModel {
         return seeded
     }
 
+    /// Overlay the session's feature intent on a per-chat seed (issue #35).
+    ///
+    /// Applied wherever a seed is produced — init and the `setModels` fill —
+    /// so a chat opened after the user toggled something in another chat
+    /// starts with that choice. Two asymmetries, both about the send path
+    /// shipping `features` wholesale to the server:
+    ///
+    /// * A pref-**false** only turns off a key the seed already contains.
+    ///   Turning off a seeded default is the user's own intent; introducing
+    ///   a `false` for a key the model never had leaks an unknown key onto
+    ///   the wire.
+    /// * A pref-**true** only lands where the model reports the capability
+    ///   (`supports(_:)`'s empty-capabilities-means-supports rule included),
+    ///   and never for the incognito exclusions `seedFeatures` makes —
+    ///   memory and web search stay out of a chat that is meant to vanish.
+    ///   An unsupported key stays absent, not false.
+    static func applyFeaturePrefs(
+        seed: [String: Bool],
+        model: ChatModel?,
+        incognito: Bool,
+        prefs: RunPreferences
+    ) -> [String: Bool] {
+        guard !prefs.features.isEmpty else { return seed }
+        var seeded = seed
+        for (key, value) in prefs.features {
+            if !value {
+                if seeded[key] != nil { seeded[key] = false }
+                continue
+            }
+            guard let feature = ChatFeature(rawValue: key),
+                  let model, model.supports(feature) else { continue }
+            if incognito, feature == .memory || feature == .webSearch { continue }
+            seeded[key] = true
+        }
+        return seeded
+    }
+
     public var canSend: Bool {
         // A photo with no caption is a message. Requiring text made the send
         // button sit there disabled after a picture was attached, which read as
@@ -517,11 +563,72 @@ public final class ConversationModel {
         // A chat can open before the model list arrives, which leaves the
         // toggles unseeded. Fill them in, but never over a choice the user has
         // already made in this chat.
-        if features.isEmpty { features = Self.seedFeatures(for: models.first, incognito: incognito) }
+        if features.isEmpty {
+            features = Self.applyFeaturePrefs(
+                seed: Self.seedFeatures(for: models.first, incognito: incognito),
+                model: models.first, incognito: incognito, prefs: prefs)
+        }
+    }
+
+    /// Record a feature toggle as both this chat's state and the session's
+    /// intent, so the next chat opened starts with the same choice (issue #35).
+    public func setFeature(_ key: String, on: Bool) {
+        features[key] = on
+        // #35: the read side refuses to let session intent re-enable
+        // memory/web_search in an incognito chat; the write side must not
+        // smuggle that intent into the session either, or toggling it inside
+        // an incognito chat would leak it to every later normal chat.
+        let incognitoExcluded = incognito
+            && (key == ChatFeature.memory.rawValue || key == ChatFeature.webSearch.rawValue)
+        if !incognitoExcluded {
+            prefs.features[key] = on
+        }
+    }
+
+    /// Record a tool toggle as both this chat's state and the session's
+    /// intent, so the next chat opened seeds the same set (issue #35).
+    public func setTool(_ id: String, on: Bool) {
+        if on {
+            if !tools.contains(id) { tools.append(id) }
+        } else {
+            tools.removeAll { $0 == id }
+        }
+        prefs.tools[id] = on
+    }
+
+    /// Seed this chat's tool ids from the workspace defaults, overlaid with
+    /// the session's tool intent (issue #35).
+    ///
+    /// Same once-only semantics as the old view-side seed: only while nothing
+    /// is selected, so switching everything off stays switched off. Pref-false
+    /// ids are subtracted from the defaults; a pref-true id is added only if
+    /// it is in `available`, actually available, and needs no sign-in — an
+    /// unauthenticated MCP server cannot serve anything, and selecting it by
+    /// default would put a broken tool in every request.
+    public func seedTools(
+        defaultIDs: [String],
+        available: [(id: String, available: Bool, needsAuth: Bool)] = []
+    ) {
+        guard tools.isEmpty else { return }
+        var seeded = defaultIDs
+        seeded.removeAll { prefs.tools[$0] == false }
+        // Iterate `available`, not `prefs.tools`: dictionary order is unstable,
+        // and the appended ids land in `tool_ids` on the wire — the order must
+        // be a function of the tool list, not of a hash.
+        for tool in available where prefs.tools[tool.id] == true {
+            guard tool.available, !tool.needsAuth, !seeded.contains(tool.id) else { continue }
+            seeded.append(tool.id)
+        }
+        tools = seeded
     }
 
     /// Called when the model changes: the defaults belong to the model, so the
     /// toggles have to follow it rather than keep the previous model's settings.
+    ///
+    /// Deliberately does NOT apply the session prefs (issue #35, pinned): a
+    /// model change means "give me this model's defaults", and the seed
+    /// already respects the model's capabilities. The session intent is
+    /// re-applied when the next chat opens, not on a mid-chat model switch.
     public func select(model id: String, from models: [ChatModel]) {
         model = id
         features = Self.seedFeatures(for: models.first { $0.id == id }, incognito: incognito)

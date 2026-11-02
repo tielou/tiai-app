@@ -5028,3 +5028,167 @@ private func chatDetailWithStoredAnswer(_ chatID: String, messageID: String, tex
     #expect(conversation.error == nil,
             "settling on the stored record is not a failure: \(conversation.error ?? "nil")")
 }
+
+// MARK: - session-run preferences (issue #35)
+
+/// A conversation wired like every other test here, but sharing a caller-owned
+/// `RunPreferences` so stickiness across chats is observable.
+@MainActor
+private func prefsConversation(
+    models: [ChatModel], incognito: Bool = false, prefs: RunPreferences
+) -> ConversationModel {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    return ConversationModel(
+        chatID: nil, models: models, incognito: incognito,
+        client: OWUIClient(server: server, transport: ScriptedTransport()),
+        hub: ChatEventHub(server: server),
+        prefs: prefs)
+}
+
+@Test @MainActor func aFeatureSwitchedOnInOneChatSticksAcrossChats() {
+    // image_generation is the one toggle seedFeatures never seeds, so a true
+    // in chat B can only come from the session intent.
+    let model = ChatModel.stub("m1", caps: ["image_generation": true, "web_search": true])
+    let prefs = RunPreferences()
+    let a = prefsConversation(models: [model], prefs: prefs)
+    #expect(a.features[ChatFeature.imageGeneration.rawValue] == nil)
+    a.setFeature(ChatFeature.imageGeneration.rawValue, on: true)
+    #expect(a.features[ChatFeature.imageGeneration.rawValue] == true)
+
+    let b = prefsConversation(models: [model], prefs: prefs)
+    #expect(b.features[ChatFeature.imageGeneration.rawValue] == true,
+            "a feature switched on this session must be on in the next chat too")
+}
+
+@Test @MainActor func aFeatureSwitchedOffInOneChatStaysOffInLaterChats() {
+    let model = ChatModel.stub("m2", caps: ["web_search": true])
+    let prefs = RunPreferences()
+    let a = prefsConversation(models: [model], prefs: prefs)
+    #expect(a.features[ChatFeature.webSearch.rawValue] == true, "seeded on by the capability")
+    a.setFeature(ChatFeature.webSearch.rawValue, on: false)
+    #expect(a.features[ChatFeature.webSearch.rawValue] == false)
+
+    let b = prefsConversation(models: [model], prefs: prefs)
+    #expect(b.features[ChatFeature.webSearch.rawValue] == false,
+            "the seed says on, the session says off — the session wins")
+}
+
+@Test @MainActor func aToolSwitchedOffStaysOffWhenTheNextChatSeeds() {
+    let prefs = RunPreferences()
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let a = ConversationModel(
+        chatID: nil, client: OWUIClient(server: server, transport: ScriptedTransport()),
+        hub: ChatEventHub(server: server), prefs: prefs)
+    a.seedTools(defaultIDs: ["pdf", "reader"])
+    #expect(a.tools == ["pdf", "reader"])
+    a.setTool("pdf", on: false)
+    #expect(a.tools == ["reader"])
+
+    let b = ConversationModel(
+        chatID: nil, client: OWUIClient(server: server, transport: ScriptedTransport()),
+        hub: ChatEventHub(server: server), prefs: prefs)
+    b.seedTools(defaultIDs: ["pdf", "reader"])
+    #expect(b.tools == ["reader"], "the pref-false pdf must not come back in a new chat")
+}
+
+@Test @MainActor func aSessionFeatureTheModelDoesNotSupportStaysAbsentNotFalse() {
+    // The send path ships `features` wholesale; a key the model never
+    // advertised must not ride along, not even as a false.
+    let prefs = RunPreferences()
+    prefs.features[ChatFeature.webSearch.rawValue] = true
+    let unsupported = ChatModel.stub("no-web", caps: ["vision": true])
+    let b = prefsConversation(models: [unsupported], prefs: prefs)
+    #expect(b.features[ChatFeature.webSearch.rawValue] == nil,
+            "unsupported pref-true must stay absent: \(b.features)")
+}
+
+@Test @MainActor func incognitoKeepsMemoryOutOfTheOverlay() {
+    // seedFeatures keeps memory out of incognito chats; the session overlay
+    // must not smuggle it back in.
+    let prefs = RunPreferences()
+    prefs.features[ChatFeature.memory.rawValue] = true
+    let model = ChatModel.stub("mem", caps: ["memory": true])
+    let b = prefsConversation(models: [model], incognito: true, prefs: prefs)
+    #expect(b.features[ChatFeature.memory.rawValue] == nil,
+            "a chat that leaves no trace does not remember: \(b.features)")
+}
+
+@Test @MainActor func incognitoDoesNotWriteMemoryOrSearchIntoTheSessionEither() {
+    // The mirror of the overlay guard on the WRITE side: toggling memory or
+    // web_search on inside an incognito chat updates that chat only — the
+    // session intent must stay clean, or the intent would land in every
+    // later normal chat.
+    let prefs = RunPreferences()
+    let model = ChatModel.stub("mem", caps: ["memory": true, "web_search": true])
+    let b = prefsConversation(models: [model], incognito: true, prefs: prefs)
+    b.setFeature(ChatFeature.memory.rawValue, on: true)
+    b.setFeature(ChatFeature.webSearch.rawValue, on: true)
+    #expect(b.features[ChatFeature.memory.rawValue] == true,
+            "the incognito chat itself still honours the toggle")
+    #expect(prefs.features[ChatFeature.memory.rawValue] == nil)
+    #expect(prefs.features[ChatFeature.webSearch.rawValue] == nil)
+    // A non-excluded feature still writes through from an incognito chat.
+    b.setFeature(ChatFeature.codeInterpreter.rawValue, on: true)
+    #expect(prefs.features[ChatFeature.codeInterpreter.rawValue] == true)
+}
+
+@Test @MainActor func aSessionToolNeedingSignInIsNotSeeded() {
+    // An unauthenticated MCP server cannot serve anything; seeding it on
+    // would put a broken tool in every request.
+    let prefs = RunPreferences()
+    prefs.tools["server:mcp:1"] = true
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let b = ConversationModel(
+        chatID: nil, client: OWUIClient(server: server, transport: ScriptedTransport()),
+        hub: ChatEventHub(server: server), prefs: prefs)
+    b.seedTools(defaultIDs: [], available: [(id: "server:mcp:1", available: true, needsAuth: true)])
+    #expect(b.tools.isEmpty, "needsAuth gates the pref-true: \(b.tools)")
+}
+
+@Test @MainActor func selectingAModelReseedsFromTheModelNotTheSession() {
+    // Pinned behavior: a model change means "this model's defaults", so the
+    // session overlay is deliberately NOT applied there.
+    let prefs = RunPreferences()
+    let first = ChatModel.stub("first", caps: ["web_search": true])
+    let second = ChatModel.stub("second", caps: ["memory": true])
+    let a = prefsConversation(models: [first], prefs: prefs)
+    a.setFeature(ChatFeature.webSearch.rawValue, on: false)
+    let prefsBefore = prefs.features
+
+    a.select(model: "second", from: [first, second])
+    #expect(a.features == ConversationModel.seedFeatures(for: second, incognito: false),
+            "the reseed is the new model's pure seed: \(a.features)")
+    #expect(a.features[ChatFeature.webSearch.rawValue] == nil)
+    #expect(prefs.features == prefsBefore, "reseeding must not rewrite the session intent")
+}
+
+/// A credential store that forgets everything, so the test never touches the
+/// real keychain.
+private struct NoopCredentials: CredentialStore {
+    func readToken() -> String? { "token-1" }
+    func writeToken(_ token: String) {}
+    func readPassword() -> String? { nil }
+    func writePassword(_ password: String) {}
+    func clearPassword() {}
+    func clearAll() {}
+}
+
+@Test @MainActor func runPreferencesSurviveATokenRefreshButNotAServerChange() {
+    let suite = "runprefs-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let session = SessionStore(credentials: NoopCredentials(), defaults: defaults)
+    session.setURL("https://a.invalid")
+    let first = session.runPreferences()
+    #expect(session.runPreferences() === first, "one instance per server")
+
+    // A token refresh changes the token, not the server: the user's toggles
+    // from five minutes ago are still their toggles.
+    session.signOut()  // clears the token in place; baseURL untouched
+    #expect(session.runPreferences() === first,
+            "a token change must not throw away the session's intent")
+
+    session.setURL("https://b.invalid")
+    #expect(session.runPreferences() !== first,
+            "another instance's tools and features are not these ones")
+}
