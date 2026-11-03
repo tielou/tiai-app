@@ -2230,6 +2230,90 @@ enum AskUserFixture {
             "a stop on chat-30-stop must not sweep B's brand-new-chat listener (#9 rule)")
 }
 
+// #36 (the root fix of the #30 family): the global waiting-listener sweep
+// is gone, so this is structural, not gated. Two BRAND-NEW-CHAT models on
+// one shared hub — the case #30 documented as the accepted residual (one
+// Stop sweeping the other's pre-id listener). Each model now ends exactly
+// the listener it installed, by the token it passed at install.
+@Test @MainActor func stopOnOneNewChatSparesAnotherNewChatListener() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+
+    let transportA = ScriptedTransport()
+    let a = ConversationModel(
+        chatID: nil, models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transportA), hub: hub)
+    let transportB = ScriptedTransport()
+    let b = ConversationModel(
+        chatID: nil, models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transportB), hub: hub)
+    transportA.gateNextCompletion()
+    transportB.gateNextCompletion()
+    defer { transportA.releaseCompletion(); transportB.releaseCompletion() }
+    a.draft = "first question"
+    a.send()
+    b.draft = "second question"
+    b.send()
+    try await waitUntil { transportA.isCompletionGateParked && transportB.isCompletionGateParked }
+    #expect(a.chatID == nil && b.chatID == nil)
+    #expect(hub.hasWaitingListener, "both runs are pre-id listeners now")
+
+    a.stop()
+    try await waitUntil(timeout: .milliseconds(300)) { a.phase == .ready }
+
+    // B's listener must be ALIVE, not merely present: the first frame
+    // naming a chat is what adopts it. If A's stop had swept B's listener
+    // off the hub (the old global-sweep behavior), nothing would be
+    // listening and the adoption would never happen.
+    for frame in Frames.run(chat: "chat-b", message: "m-b", answer: "b's answer") {
+        hub.receive(frame)
+    }
+    try await waitUntil(timeout: .milliseconds(300)) { b.chatID == "chat-b" }
+    #expect(b.chatID == "chat-b",
+            "A's stop must not sweep B's brand-new-chat listener off the shared hub (#36)")
+}
+
+// #36: token-scoped expiry ends EXACTLY one listener — and it works after
+// the listener has already adopted a real chat id, the documented residual
+// the two id-based sweeps missed (a listener that adopted while the model's
+// chatID was still nil was addressed by neither).
+@Test @MainActor func expireWaitingTokenEndsExactlyOneAdoptedListener() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let tokenA = UUID()
+    let tokenB = UUID()
+    let streamA = hub.framesAwaitingChatID(token: tokenA) { _ in }
+    let streamB = hub.framesAwaitingChatID(token: tokenB) { _ in }
+    let aEnded = Task { () -> Bool in
+        for await _ in streamA { }
+        return true
+    }
+    let bCount = Task { () -> Int in
+        var n = 0
+        for await _ in streamB { n += 1 }
+        return n
+    }
+    try await Task.sleep(for: .milliseconds(20))
+    // Both listeners adopt "chat-x" from the first frame (the hub names
+    // every waiting listener from the first frame carrying an id — that
+    // is the design), so neither is "waiting" any more: the old
+    // expireWaitingListeners() would now find nothing to sweep.
+    for frame in Frames.run(chat: "chat-x", message: "m1", answer: "hi") {
+        hub.receive(frame)
+    }
+    #expect(!hub.hasWaitingListener, "both adopted an id")
+
+    hub.expire(waitingToken: tokenA)
+    #expect(await aEnded.value,
+            "A's stream ends on its token even though it adopted a chat id (the residual #36 closes)")
+
+    // B is untouched and still receiving frames for the adopted chat.
+    hub.receive(.fixture(kind: "response:completion", chatID: "chat-x", messageID: "m2",
+                         inner: ["type": "response.output_text.delta", "delta": "more", "output_index": 1]))
+    hub.expire(chatID: "chat-x")  // ends B, now keyed by the adopted id
+    let n = await bCount.value
+    #expect(n >= 4, "B kept receiving after A's token expired: got \(n)")
+}
+
 // #26: the temporary:/local:/incognito early return in load() used to stamp
 // `.ready` unconditionally — mid-run, that unlocked the composer and
 // disarmed reconcile's phase guard, the exact bug #19 closed for the plain
@@ -3389,7 +3473,7 @@ enum AskUserFixture {
 @Test @MainActor func aWaitingListenerAdoptsTheChatItHearsFrom() async throws {
     let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
     var adopted: String?
-    let stream = hub.framesAwaitingChatID { adopted = $0 }
+    let stream = hub.framesAwaitingChatID(token: UUID()) { adopted = $0 }
     let collector = Task { () -> [String] in
         var kinds: [String] = []
         for await frame in stream { kinds.append(frame.kind) }
@@ -3412,7 +3496,7 @@ enum AskUserFixture {
 @Test @MainActor func aWaitingListenerIgnoresFramesWithoutAChat() throws {
     let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
     var adopted: String?
-    _ = hub.framesAwaitingChatID { adopted = $0 }
+    _ = hub.framesAwaitingChatID(token: UUID()) { adopted = $0 }
     // A frame that cannot name its chat adopts nothing.
     let bare = Frame([
         "data": ["type": "chat:completion", "data": ["done": false]],
@@ -4011,10 +4095,11 @@ private func makePostFailureFixture(chatID: String?) -> (
     try await waitUntil { conversation.attachments.count == 1 }
 
     conversation.send()
-    // This wait IS the regression. A new chat's `framesAwaitingChatID`
-    // listener has chatID nil; the 60 s silence watchdog expires "" and never
-    // matches it. Without `expireWaitingListeners` in `recordPostError` this
-    // times out — the run hangs forever on a POST that already failed.
+    // This wait IS the regression. A new chat's pre-id listener is
+    // addressed by the token #36 installed; the 60 s silence watchdog
+    // expires "" and never matches it. Without the token expiry in
+    // `recordPostError` this times out — the run hangs forever on a POST
+    // that already failed.
     try await waitUntil { conversation.phase == .ready }
 
     #expect(conversation.turns.isEmpty,

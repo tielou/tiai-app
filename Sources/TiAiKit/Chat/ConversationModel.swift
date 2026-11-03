@@ -93,6 +93,16 @@ public final class ConversationModel {
     private let hub: ChatEventHub
     private var run: Task<Void, Never>?
     private var post: Task<Void, Never>?
+    /// #36: the hub token of the pre-id ("waiting") listener THIS model
+    /// installed for the current run, nil when it subscribed by chat id.
+    /// It is the precise address of this model's own listener, so teardown
+    /// ends exactly it — replacing the global `expireWaitingListeners()`
+    /// sweep and every blast-radius gate that guarded it (#9, #28, #30).
+    /// Held for the whole run: expiring an already-adopted or already-removed
+    /// token is a no-op, so there is no race with the adopt hop — and the
+    /// adopted-id residual #30 documented is covered, because the subscriber
+    /// keeps its token as its key through adoption.
+    @ObservationIgnored private var waitingToken: UUID?
     /// Which run currently owns this model's state. Bumped when a run starts
     /// (send/edit/regenerate) or the current one is given up (abandon). A run
     /// that captured an older generation was superseded mid-await and must not
@@ -1391,41 +1401,24 @@ public final class ConversationModel {
     /// learned about, so Stop has nothing to ask and aborts locally.
     private func finishLocally(chatID: String?, gen: Int) {
         guard gen == runGeneration else { return }
-        // Captured before the nil-ing below: whether the completion POST was
-        // open, i.e. whether THIS model could own a waiting hub listener.
-        let hadOpenPost = post != nil
         run?.cancel()
         post?.cancel()
         post = nil
         if let chatID {
             hub.expire(chatID: chatID)
-            // No `expireWaitingListeners()` sweep on this branch (#30, the #9
-            // rule). This model's own listener is keyed by the real id above
-            // and `expire(chatID:)` already reaches it, so the global sweep
-            // over the per-server shared hub could only ever kill ANOTHER
-            // model's brand-new-chat listener — the exact hazard #9
-            // established for `recordPostError` (and why `abandon` sweeps
-            // only under `chatID == nil`).
-        } else {
-            // Issue #28: with no id there is nothing to expire by id, and
-            // cancelling the Task does not end a `for await` over a hub stream
-            // — only the server stopping does, and there is no server chat to
-            // stop. So this is `abandon`'s teardown for the same problem: a
-            // run that had already installed its `framesAwaitingChatID`
-            // listener (the completion POST is open, the id not yet adopted)
-            // must not go on streaming into `turns` after the phase says
-            // `.ready`. The sweep is global, so it stays under #9's
-            // constraint — this model has no id, which is the case where the
-            // waiting listener it may sweep is most likely its own. The
-            // accepted residual is #30's, unchanged: two brand-new-chat models
-            // on one shared hub, one Stop sweeping the other's listener.
-            // Blast-radius gate (review of #28): in the upload-wait window
-            // `exchange` has not started, so THIS model provably has no waiting
-            // listener and the sweep could only ever hit another model's —
-            // pure hazard, nothing to gain. Only sweep once the POST is open.
-            if hadOpenPost {
-                hub.expireWaitingListeners()
-            }
+        }
+        // #36: end exactly this model's pre-id listener, if this run
+        // installed one (nil token: it subscribed by id, or never got to
+        // install one — e.g. the upload-wait window). This replaces the
+        // global `expireWaitingListeners()` sweep and its two blast-radius
+        // gates (#9's `chatID == nil`, #28's `hadOpenPost`): a token can
+        // only ever address the listener THIS model installed, so the
+        // cross-model hazard those gates could only bound is structurally
+        // gone, and the adopted-id residual is covered too (the token
+        // survives adoption).
+        if let token = waitingToken {
+            hub.expire(waitingToken: token)
+            waitingToken = nil
         }
         // One index for both jobs below: the buffer's own turn while a buffer
         // is in flight (the id match is the truth — a regenerate can have
@@ -1491,21 +1484,16 @@ public final class ConversationModel {
         // which can only fire while busy).
         if phase.isBusy {
             hub.expire(chatID: chatID ?? "")
-            // The waiting-listener sweep only under the #9 constraint from
-            // `recordPostError`: the sweep is global over the per-server
-            // shared hub, so it fires only when this model itself has no
-            // chat id — the case where the nil-chatID listener it would
-            // kill is most likely this model's own. Not a proof: two
-            // brand-new-chat models share the hub, and one abandoning can
-            // still sweep the other's waiting listener (filed as #30, same
-            // family as `finishLocally`'s unconditional sweep).
-            // `expire(chatID: "")` never matches a nil-chatID listener.
-            // A residual gap, accepted as pre-existing: a hub listener that
-            // has already adopted a real id while this model's `chatID` is
-            // still nil (the `adopt` hop has not landed) is missed by both
-            // sweeps — the same window `finishLocally` has, and inert
-            // thanks to the id guards.
-            if chatID == nil { hub.expireWaitingListeners() }
+            // #36: exactly this model's pre-id listener, token-addressed —
+            // replacing the #9-gated global sweep this site used to make
+            // (and with it the adopted-id residual this comment used to
+            // document: `expire(chatID: "")` never matched a nil-chatID
+            // listener, and the sweep missed an adopted one; the token
+            // reaches both states).
+            if let token = waitingToken {
+                hub.expire(waitingToken: token)
+                waitingToken = nil
+            }
         }
         // One index for both jobs below, exactly as in `finishLocally`: the
         // buffer's own turn while a buffer is in flight (the id match is the
@@ -1769,12 +1757,21 @@ public final class ConversationModel {
         // request is still in flight, and the socket has no replay.
         let newChat = chat == Self.awaitingChatID
         // A brand new chat has no id to filter on, so the listener adopts the
-        // first one it hears a frame for.
-        let frames = newChat
-            ? hub.framesAwaitingChatID { [weak self] id in
+        // first one it hears a frame for. #36: the token installed here is
+        // the precise address of this run's pre-id listener — every
+        // teardown path (finishLocally, abandon, recordPostError) ends
+        // exactly it, never another model's.
+        let frames: AsyncStream<ChatEventSocket.Frame>
+        if newChat {
+            let token = UUID()
+            waitingToken = token
+            frames = hub.framesAwaitingChatID(token: token) { [weak self] id in
                 Task { @MainActor in self?.adopt(chatID: id) }
             }
-            : hub.frames(for: chat)
+        } else {
+            waitingToken = nil
+            frames = hub.frames(for: chat)
+        }
         let request = CompletionRequest(
             model: model,
             messages: Self.systemPrefixed(history,
@@ -2947,17 +2944,19 @@ public final class ConversationModel {
             postFailureMessage = message
             // Unblock the drain: nothing will ever arrive on this run's
             // listener now. An existing chat's listener is keyed by id, and
-            // `expire(chatID:)` reaches it. A new chat's `framesAwaitingChatID`
-            // listener has chatID nil, which `expire(chatID: "")` never
-            // matches, so it needs `expireWaitingListeners` — without it that
-            // drain sat out the 60 s silence watchdog and then reported
-            // "The server sent nothing." But the sweep is global and the hub
-            // is shared per server (`SessionStore`): firing it on an existing
-            // chat's failure would expire OTHER conversations' pending
-            // new-chat listeners, so it runs only in the one case that needs
-            // it — the nil-chatID listener of a brand-new chat.
+            // `expire(chatID:)` reaches it. A new chat's listener is the
+            // pre-id one — #36 made it addressable by the token this model
+            // installed, so a failed first message ends exactly it (the old
+            // global sweep needed #9's `chatID == nil` gate to avoid
+            // expiring OTHER conversations' pending new-chat listeners;
+            // that hazard is structurally gone). Without this the drain sat
+            // out the 60 s silence watchdog and then reported
+            // "The server sent nothing."
             hub.expire(chatID: chatID ?? "")
-            if chatID == nil { hub.expireWaitingListeners() }
+            if let token = waitingToken {
+                hub.expire(waitingToken: token)
+                waitingToken = nil
+            }
         }
     }
 

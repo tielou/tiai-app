@@ -165,11 +165,22 @@ public final class ChatEventHub {
     /// app-created chats kept a truncated first line while browser-created ones
     /// got a summary. So the first message goes out without an id and the app
     /// learns the server's from the first frame that carries one.
+    ///
+    /// #36: the caller supplies `token`, which becomes the subscriber's
+    /// identity, and `expire(waitingToken:)` ends exactly that listener. This
+    /// replaces the global `expireWaitingListeners()` sweep: a model can
+    /// address its own pre-id listener precisely, so one model stopping can
+    /// never end another's — the hazard #9, #28 and #30 could only ever bound
+    /// by gates is structurally gone. The token keeps working after the
+    /// listener adopts a real id (the subscriber keeps its token as its key
+    /// through adoption), which also closes #30's documented residual: a
+    /// listener that adopted an id while the model's chatID was still nil was
+    /// addressed by neither of the old sweeps.
     public func framesAwaitingChatID(
+        token: UUID,
         _ onAdopt: @escaping (String) -> Void
     ) -> AsyncStream<ChatEventSocket.Frame> {
         let (stream, continuation) = AsyncStream.makeStream(of: ChatEventSocket.Frame.self)
-        let token = UUID()
         subscribers[token] = Subscriber(
             chatID: nil, onAdopt: onAdopt, continuation: continuation)
         continuation.onTermination = { [weak self] _ in
@@ -188,13 +199,16 @@ public final class ChatEventHub {
         }
     }
 
-    /// Ends a listener that never learned its chat, so a failed first message
-    /// cannot leave a spinner running forever.
-    public func expireWaitingListeners() {
-        for (token, subscriber) in subscribers where subscriber.chatID == nil {
-            subscriber.continuation.finish()
-            subscribers[token] = nil
-        }
+    /// Ends exactly the listener registered under `token` by
+    /// `framesAwaitingChatID(token:_:)` — whether it is still waiting or has
+    /// since adopted a chat id (the subscriber keeps its token as its dict
+    /// key through adoption). An absent or already-removed token is a no-op,
+    /// so a caller may hold it for a whole run without racing the adopt hop.
+    /// #36: this is what the global `expireWaitingListeners()` sweep should
+    /// have been from the start; the sweep is gone.
+    public func expire(waitingToken token: UUID) {
+        subscribers[token]?.continuation.finish()
+        subscribers[token] = nil
     }
 
     /// Delivers a frame to matching listeners. Split out from the socket
