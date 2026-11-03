@@ -4952,7 +4952,11 @@ private func chatDetailWithStoredAnswer(_ chatID: String, messageID: String, tex
             inner: ["type": "response.output_text.delta", "delta": "t\(i)-"]))
         expected += "t\(i)-"
         // Per-frame proof the live stream is still publishing this run's text.
-        try await waitUntil { conversation.turns.last?.text == expected }
+        // 5 s, not the 2 s default: publishing is main-actor work (drain
+        // consuming the frame, then the 60 ms flusher) and on a loaded CI
+        // runner that queues behind every other @MainActor test, so the tight
+        // default flakes with no real defect. Matches the phase waits below.
+        try await waitUntil(timeout: .seconds(5)) { conversation.turns.last?.text == expected }
         try await Task.sleep(for: .milliseconds(90))
     }
     hub.receive(Frame.fixture(
@@ -4988,7 +4992,9 @@ private func chatDetailWithStoredAnswer(_ chatID: String, messageID: String, tex
     hub.receive(Frame.fixture(
         kind: "response:completion", chatID: "chat-1", messageID: id,
         inner: ["type": "response.output_text.delta", "delta": "partial "]))
-    try await waitUntil { conversation.turns.last?.text == "partial " }
+    // 5 s for the main-actor-scheduling reason documented in the ten-frame
+    // test above (the CI runner starves the drain + flusher past 2 s).
+    try await waitUntil(timeout: .seconds(5)) { conversation.turns.last?.text == "partial " }
 
     // Then silence. The frame re-armed the watchdog once; the re-armed timer
     // must still fire.
@@ -5025,7 +5031,9 @@ private func chatDetailWithStoredAnswer(_ chatID: String, messageID: String, tex
     hub.receive(Frame.fixture(
         kind: "response:completion", chatID: "chat-1", messageID: id,
         inner: ["type": "response.output_text.delta", "delta": "partial "]))
-    try await waitUntil { conversation.turns.last?.text == "partial " }
+    // 5 s for the main-actor-scheduling reason documented in the ten-frame
+    // test above (the CI runner starves the drain + flusher past 2 s).
+    try await waitUntil(timeout: .seconds(5)) { conversation.turns.last?.text == "partial " }
 
     // Then ONLY FOREIGN frames, faster than the budget, for ~1.4 s — far
     // beyond silenceLimit. This is the discriminator: the fixed code must
