@@ -2314,6 +2314,97 @@ enum AskUserFixture {
     #expect(n >= 4, "B kept receiving after A's token expired: got \(n)")
 }
 
+// #42, the live shape: a brand-new chat whose stream never names it.
+// The hub hands a waiting listener nothing until a frame carries a
+// chat_id (by design — unrelated chatter must not capture a new chat),
+// so a run whose frames never arrive, or arrive without an id, leaves
+// the model with chatID nil — and the old watchdog expired
+// `chatID ?? ""`: nothing, ever. The run stayed "running" forever (the
+// live case: an hour over a server record that had been done for fifty
+// minutes). The watchdog must be able to end the run by TOKEN.
+@Test @MainActor func aNewChatThatIsNeverNamedStillEndsOnTheWatchdog() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: nil, models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.silenceLimit = .milliseconds(300)
+    defer { conversation.silenceLimit = ConversationModel.silenceLimit }
+    conversation.draft = "make me a deck"
+    conversation.send()
+    try await transport.awaitCompletion()
+
+    // A frame that carries text but no chat_id: the hub drops it for the
+    // waiting listener (no adoption, no delivery), which is exactly the
+    // dead-air shape the live incident streamed into.
+    let aid = try #require(transport.assistantMessageID)
+    let bare = ChatEventSocket.Frame([
+        "message_id": aid,
+        "data": ["type": "response:completion", "data": [
+            "type": "response.output_text.delta", "delta": "slide one", "output_index": 1,
+        ]],
+    ])
+    hub.receive(try #require(bare))
+    #expect(conversation.chatID == nil, "nothing ever named this chat")
+
+    // Pre-fix this never happens: the watchdog fires, expires "",
+    // matches no subscriber, and the run hangs busy forever.
+    try await waitUntil(timeout: .seconds(3)) { conversation.phase == .ready }
+    #expect(conversation.phase == .ready,
+            "a never-named new chat must settle when the silence watchdog fires (#42)")
+}
+
+// #42's backstop for the pathologies we have NOT diagnosed: a stream that
+// keeps talking and never terminates outruns the silence watchdog (every
+// frame re-arms it, #33). The run ceiling is never re-armed and ends the
+// stream on wall-clock regardless; the caller's reconcile then reads the
+// truth off the server record — the leave-and-re-enter recovery, on a bound.
+@Test @MainActor func theRunCeilingEndsAStreamThatNeverStopsTalking() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-42", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    // The silence watchdog must be structurally unable to be the one that
+    // ends this run; only the ceiling may.
+    conversation.silenceLimit = .seconds(30)
+    conversation.runCeiling = .milliseconds(400)
+    // The ceiling unwinds the drain without a terminal, which lands in
+    // reconcile; this transport stubs no chat-detail GET, and a failed
+    // read just burns budget ticks — shrink the budget so the test does
+    // not sit out five minutes of it.
+    conversation.reconcileInterval = .milliseconds(20)
+    conversation.reconcileBudget = 3
+    defer {
+        conversation.silenceLimit = ConversationModel.silenceLimit
+        conversation.runCeiling = ConversationModel.runCeiling
+        conversation.reconcileInterval = .seconds(2)
+        conversation.reconcileBudget = 150
+    }
+    conversation.draft = "hello"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let aid = try #require(transport.assistantMessageID)
+
+    func delta(_ word: String) {
+        hub.receive(.fixture(kind: "response:completion", chatID: "chat-42", messageID: aid,
+            inner: ["type": "response.output_text.delta", "delta": word, "output_index": 1]))
+    }
+    delta("one")
+    try await waitUntil { conversation.turns.last?.text.contains("one") == true }
+    // Chatter past the ceiling: a frame every 150 ms, a tenth of the
+    // silence budget — the watchdog can never fire here.
+    for word in ["two", "three", "four", "five"] {
+        try await Task.sleep(for: .milliseconds(150))
+        delta(word)
+    }
+    try await waitUntil(timeout: .seconds(3)) { conversation.phase == .ready }
+    #expect(conversation.phase == .ready,
+            "the ceiling must end a stream that never goes quiet and never terminates (#42)")
+}
+
 // #26: the temporary:/local:/incognito early return in load() used to stamp
 // `.ready` unconditionally — mid-run, that unlocked the composer and
 // disarmed reconcile's phase guard, the exact bug #19 closed for the plain

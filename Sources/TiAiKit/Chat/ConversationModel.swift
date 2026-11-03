@@ -131,6 +131,20 @@ public final class ConversationModel {
     /// prefill, a thinking pause) you have seen, shorter than someone's
     /// patience.
     static let silenceLimit: Duration = .seconds(60)
+    /// #42: the absolute ceiling on one live run, independent of frame
+    /// activity. The silence watchdog measures quiet and can be outrun by a
+    /// stream that never goes quiet and never terminates — a terminal frame
+    /// that is filtered, mis-keyed, or never emitted at all. The live case
+    /// was a chat whose frames never carried a chat id: the watchdog fired
+    /// every 60 s and expired nothing (no adopted id to expire by), and the
+    /// run stayed "running" for an hour over a server record that had been
+    /// `done` for fifty minutes. When the ceiling fires the stream ends
+    /// whatever the frame traffic looks like, and the caller's reconcile
+    /// reads the truth off the server record — the "leave and re-enter
+    /// fixes it" recovery the user already trusts, on a bound. Generous on
+    /// purpose: a healthy long run (twenty tool calls, a weasyprint build,
+    /// a slow local prefill) must never meet it.
+    static let runCeiling: Duration = .seconds(900)
     /// How long a turn may sit between a `finish_reason` and the tool result that
     /// follows it. Long enough for a slow MCP server, short enough that a tool
     /// which died silently does not leave the composer spinning for three minutes.
@@ -1483,7 +1497,11 @@ public final class ConversationModel {
         // the live model's listener (the same accepted trade as `stop`,
         // which can only fire while busy).
         if phase.isBusy {
-            hub.expire(chatID: chatID ?? "")
+            if let chat = chatID {
+                hub.expire(chatID: chat)
+            } else if let token = waitingToken {
+                hub.expire(waitingToken: token)
+            }
             // #36: exactly this model's pre-id listener, token-addressed —
             // replacing the #9-gated global sweep this site used to make
             // (and with it the adopted-id residual this comment used to
@@ -2204,7 +2222,20 @@ public final class ConversationModel {
             try? await Task.sleep(for: limit)
             guard !Task.isCancelled else { return }
             guard isCurrent(gen), pending?.id == assistantID else { return }
-            hub.expire(chatID: chatID ?? "")
+            // #42: pick the ADDRESS of this run's listener, not just the
+            // id this model happens to hold. An existing chat's listener is
+            // keyed by the chat id. A brand-new chat's listener may never
+            // have adopted one — if no frame ever carried a chat_id, the
+            // old unconditional `hub.expire(chatID: chatID ?? "")` expired
+            // "" (nothing, ever), the stream never ended, and the run hung
+            // "running" forever while the server sat on a finished record.
+            // The #36 token reaches this model's subscriber whether it
+            // adopted an id or not, so the watchdog lands in both shapes.
+            if let chat = chatID {
+                hub.expire(chatID: chat)
+            } else if let token = waitingToken {
+                hub.expire(waitingToken: token)
+            }
         }
     }
 
@@ -2257,6 +2288,14 @@ public final class ConversationModel {
         // Re-armed on every frame attributed to this message below, so this
         // measures silence, not total run time (issue #33).
         var watchdog = hubExpireTimer(after: silenceLimit, gen: gen, assistantID: assistantID)
+        // #42: the absolute backstop, NEVER re-armed. The silence watchdog
+        // can be outrun by a stream that keeps talking and never terminates
+        // (terminal frame filtered, mis-keyed, or never sent); the ceiling
+        // ends the stream on wall-clock regardless, and the caller's
+        // reconcile reads the truth off the server record. Same gen/pending
+        // gates as the watchdog, so a superseded drain's ceiling can never
+        // expire a newer run's listener (#21's lesson).
+        let ceiling = hubExpireTimer(after: runCeiling, gen: gen, assistantID: assistantID)
 
         var sawToolArguments = false
         var erroredOnce = false
@@ -2387,6 +2426,7 @@ public final class ConversationModel {
             if frame.isAwaitingUser { outcome.parked = true; break }
         }
         watchdog.cancel()
+        ceiling.cancel()
         grace?.cancel()
         flusher.cancel()
 
@@ -2911,6 +2951,13 @@ public final class ConversationModel {
     /// a mid-run change only takes effect at the next re-arm.
     var silenceLimit: Duration = ConversationModel.silenceLimit
 
+    /// Tuning for the #42 run ceiling, same reasoning as `silenceLimit`: a
+    /// test has to prove the ceiling fired (and that a healthy run did not
+    /// meet it) without sitting out fifteen minutes. The static stays the
+    /// production default; the budget is read once when the drain installs
+    /// the timer, so set it before the run starts.
+    var runCeiling: Duration = ConversationModel.runCeiling
+
     /// A failed POST is reported only if the run has not already ended on its own
     /// terms — a stream closed by `stop()` errors on the way out, and calling
     /// that a failure would be a lie the user cannot act on.
@@ -2952,7 +2999,11 @@ public final class ConversationModel {
             // that hazard is structurally gone). Without this the drain sat
             // out the 60 s silence watchdog and then reported
             // "The server sent nothing."
-            hub.expire(chatID: chatID ?? "")
+            if let chat = chatID {
+                hub.expire(chatID: chat)
+            } else if let token = waitingToken {
+                hub.expire(waitingToken: token)
+            }
             if let token = waitingToken {
                 hub.expire(waitingToken: token)
                 waitingToken = nil
