@@ -130,7 +130,22 @@ public final class ChatMessageQueue {
 public final class MessageQueueStore {
     public init() {}
 
-    private var queues: [String: ChatMessageQueue] = [:]
+    /// A lookup cache, not observed state.
+    ///
+    /// `ConversationView.init` builds its `ConversationModel` eagerly on every
+    /// body pass (before `State` dedups it), and a brand-new chat mints a fresh
+    /// stand-in key each time — so `queue(for:)` inserts a new entry into this
+    /// dictionary during view evaluation. Left observed, that write publishes a
+    /// change to the very view that is mid-update, which re-runs the body, which
+    /// builds another model with another fresh key, and the app spins at 100% CPU
+    /// on the New Chat screen before the first frame settles.
+    ///
+    /// Nothing needs to observe the dictionary: the strip renders
+    /// `conversation.queue.items` — the individual `ChatMessageQueue`, which is
+    /// itself `@Observable` — and a re-key republishes by reassigning
+    /// `ConversationModel.queue`. The mapping from key to queue is an
+    /// implementation detail of the cache, so it is `@ObservationIgnored`.
+    @ObservationIgnored private var queues: [String: ChatMessageQueue] = [:]
 
     public func queue(for key: String) -> ChatMessageQueue {
         if let found = queues[key] { return found }
