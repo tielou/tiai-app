@@ -9,6 +9,11 @@ import Foundation
 public struct OWUIClient: Sendable {
     public let server: Server
     private let transport: any APITransport
+    /// The GET retry backoff, injectable so a test can exercise the whole retry
+    /// ladder without sleeping through the ~17 s a real container restart
+    /// deserves. Defaults to the production ladder; only the sleep durations
+    /// change, never the number of attempts.
+    var retryLadder: [TimeInterval] = OWUIClient.retryDelays
 
     public init(server: Server, transport: any APITransport = URLSessionTransport()) {
         self.server = server
@@ -122,7 +127,7 @@ public struct OWUIClient: Sendable {
                 last = error
                 let transient = (error as? APIError)?.isTransient ?? false
                 guard transient, attempt + 1 < attempts else { throw error }
-                try? await Task.sleep(for: .seconds(Self.retryDelays[attempt]))
+                try? await Task.sleep(for: .seconds(retryLadder[attempt]))
             }
         }
         throw last
