@@ -463,6 +463,68 @@ public final class ConversationModel {
     /// mid-run `claim` can order itself after `start` (issue #20).
     private var ribbonRaise: Task<Void, Never>?
 
+    // MARK: - the send-while-generating queue (issue #37)
+
+    /// The queue for *this* chat, shared by every model instance that shows it.
+    ///
+    /// Read-only here in the sense that nothing but this model writes to it; the
+    /// view reads it to draw the strip. It is a `var` only because a brand-new
+    /// chat's queue is re-keyed onto the id the server chooses (`rekeyQueue`).
+    public private(set) var queue: ChatMessageQueue
+    private let queues: MessageQueueStore
+    /// The key a chat that does not exist yet queues under, and the key it is
+    /// moved off when the server names it.
+    private let freshQueueKey: String
+    private var queueKey: String
+
+    /// Test seam, mirroring `maxImagesPerRequestOverride`: the toggle is read
+    /// live (not snapshotted at init) so flipping it in Settings takes effect
+    /// in the chat you are looking at, and so a test can pin either behaviour
+    /// without touching the shared defaults store.
+    var queueWhileGeneratingOverride: Bool?
+
+    /// Read at the fork, not captured: the setting is meant to be live.
+    private var queueEnabled: Bool {
+        queueWhileGeneratingOverride ?? SettingsStore.shared.defaults.queueWhileGenerating
+    }
+
+    /// A queued message the user pressed "send now" on: it goes out alone, as
+    /// soon as the run it interrupted has actually stopped.
+    private var steerPending: (text: String, files: [PendingAttachment])?
+
+    /// The queued item an in-flight upload belongs to, when the user picked a
+    /// file for a message that is already queued. Resolved again when the
+    /// upload answers, because by then the item may have been edited away.
+    private var uploadLandingTarget: ChatMessageQueue.Item?
+
+    /// Whether the run that is currently ours came out of the queue.
+    ///
+    /// `stop()` needs it because the two paths put an interrupted message back
+    /// in different places: a composer send goes back to the draft, a queued
+    /// one goes back to the queue. Restoring a queued message into the draft
+    /// would drop everything still waiting behind it.
+    private var lastRunWasQueued = false
+    /// What the queued run was carrying, for that put-back.
+    private var lastQueuedRun: (text: String, files: [PendingAttachment])?
+
+    /// Files picked while a run is in flight, on the wire.
+    ///
+    /// Deliberately not the composer's `uploadsInFlight`/`uploading`: a queued
+    /// message's upload and a composer send must not hold each other up, and
+    /// `uploading` means "the composer is waiting" to both `canSend` and `send`.
+    /// Counting a queue upload there would either lock the composer behind a
+    /// file that is already somebody's message, or let a composer send wait on
+    /// it in `waitForUploads` and abort on its failure.
+    private var queueUploadsInFlight = 0
+
+    /// The give-up timer for a queue upload that never answers.
+    ///
+    /// An item waiting on its file holds the queue — that is the point — but a
+    /// transport that ignores its own timeout must not hold it forever. The
+    /// composer send has `uploadWaitLimit` for exactly this; the queue gets the
+    /// same bound, armed when a drain actually finds itself waiting.
+    private var queueUploadDeadline: Task<Void, Never>?
+
     public init(
         chatID: String?,
         title: String = "New Chat",
@@ -471,9 +533,18 @@ public final class ConversationModel {
         client: OWUIClient,
         hub: ChatEventHub,
         activity: GenerationActivity = .shared,
-        prefs: RunPreferences = RunPreferences()
+        prefs: RunPreferences = RunPreferences(),
+        queues: MessageQueueStore = MessageQueueStore()
     ) {
         self.incognito = incognito
+        // A chat the server has not named yet cannot own a queue by id, so it
+        // gets a stand-in key of its own — not a shared "new chat" key, which
+        // would let two half-written chats read each other's queued messages.
+        let freshKey = "new:\(UUID().uuidString)"
+        self.queues = queues
+        self.freshQueueKey = freshKey
+        self.queueKey = chatID ?? freshKey
+        self.queue = queues.queue(for: chatID ?? freshKey)
         self.chatID = chatID
         self.title = title
         self.client = client
@@ -492,6 +563,197 @@ public final class ConversationModel {
     /// ways in are `setFeature`/`setTool`, so a chat can never write an intent
     /// it did not express.
     private let prefs: RunPreferences
+
+    /// Moves this chat's queue onto its real id once the server has chosen one.
+    ///
+    /// Without this, messages queued for a chat that was still unnamed would
+    /// stay under a key nothing else looks at, and the chat would open empty.
+    private func rekeyQueue() {
+        guard let chatID, queueKey != chatID else { return }
+        queues.migrate(from: queueKey, to: chatID)
+        queueKey = chatID
+        queue = queues.queue(for: chatID)
+    }
+
+    // MARK: - draining the queue
+
+    /// Where the files a run is about to carry came from.
+    ///
+    /// The distinction is the whole reason `send`'s body is factored into
+    /// `beginRun`: a composer send owns `attachments` and the upload bookkeeping
+    /// around them, and a queued run owns neither. Handing a queued run the
+    /// composer's files — or letting it clear them — is how a message queued
+    /// five minutes ago would send the picture attached for the next one.
+    enum RunFiles {
+        /// The composer's own, taken after its uploads have landed.
+        case composer
+        /// Already-uploaded files handed over by the queue (issue #37).
+        case taken([PendingAttachment])
+    }
+
+    /// Hands the queue to a chat that has just become able to take it.
+    ///
+    /// Called from the places a run ends cleanly, and from nowhere else: a path
+    /// that gave up on a run, parked a question, rolled a send back, aborted an
+    /// upload or discarded a half-made chat leaves the chat in a state where
+    /// firing a new completion would be the wrong thing, and each of those is an
+    /// early return that simply does not call this.
+    ///
+    /// Synchronous, and it has to be: the queue is emptied in the same main-actor
+    /// turn it is inspected, so two triggers landing in one turn cannot both take
+    /// the same messages. A `drainInFlight` flag is the alternative, and it is
+    /// wrong the moment two triggers do land together.
+    ///
+    /// `afterStoppingQueuedRun` is the one case the guards cannot see for
+    /// themselves: a stop means "not now", and the run that was just stopped may
+    /// itself have been the queue's.
+    private func settleQueue(afterStoppingQueuedRun: Bool = false) {
+        guard queueEnabled, phase == .ready else { return }
+
+        // "Send now" wins over the queue: the item was already taken out, and it
+        // is waiting for the run it interrupted to have actually stopped —
+        // `stop()` resolves the server POST before it gets here, which is the
+        // only reason the server cannot be handed a new completion for a chat it
+        // is still on its way to stop.
+        if let steer = steerPending {
+            steerPending = nil
+            let item = ChatMessageQueue.Item(text: steer.text, attachments: steer.files)
+            if startQueuedRun(items: [item]) { return }
+            queue.putBackFront([item])
+            return
+        }
+
+        guard !afterStoppingQueuedRun else { return }
+        guard !queue.isEmpty else { return }
+        // An item whose file has not landed — or has visibly failed — holds the
+        // whole queue. The items go out as one message, and sending the text
+        // without the picture is #22 wearing a new hat.
+        guard !queue.hasBlockedItem else {
+            // Only a file still on the wire can time out; a failed one waits for
+            // the user, which is not a timeout and must not re-arm forever.
+            if queue.hasItemAwaitingUpload { armQueueUploadDeadline() }
+            return
+        }
+        queueUploadDeadline?.cancel()
+        queueUploadDeadline = nil
+
+        let items = queue.takeAll()
+        if !startQueuedRun(items: items) {
+            // Refused — the combined message crosses the image budget, or the
+            // model selected since no longer has eyes for it. The messages go
+            // straight back: the banner says why, the strip still shows them,
+            // and Edit and Delete are the ways on. Dropping them because the app
+            // decided they would not be accepted is the bug this guards.
+            queue.putBackFront(items)
+        }
+    }
+
+    /// Starts one run carrying everything `items` holds, or refuses without
+    /// starting anything. Returns whether the run went out.
+    private func startQueuedRun(items: [ChatMessageQueue.Item]) -> Bool {
+        let text = items.map(\.text).filter { !$0.isEmpty }.joined(separator: "\n\n")
+        let files = items.flatMap(\.attachments)
+        guard !text.isEmpty || !files.isEmpty else { return false }
+        // The same two guards `send` runs at the button, against the *combined*
+        // message and the model selected *now*. What was allowed when the first
+        // of these was typed is not a promise about now: the model may have been
+        // changed, another message may have used up the image budget, and the
+        // engine's 500 is a worse way to learn that than a banner.
+        if let refusal = imageLimitMessage(outgoing: files) {
+            error = refusal
+            return false
+        }
+        if !modelSupportsVision, files.contains(where: \.isImage) {
+            error = "\(model) can't see images — remove the picture or pick a vision model."
+            return false
+        }
+        beginRun(text: text, fileSource: .taken(files))
+        return true
+    }
+
+    /// Puts a run that never reached the server back into the queue it came from.
+    ///
+    /// The queue's one promise is that it does not lose things, and a run that
+    /// was stopped or failed before its POST landed has not sent anything.
+    private func putBackInQueue(text: String, files: [PendingAttachment]) {
+        queue.enqueue(text: text, attachments: files)
+        lastQueuedRun = nil
+    }
+
+    /// The user pressed "send now" on one queued message: it interrupts the run
+    /// in flight and goes out alone, while everything else keeps waiting.
+    ///
+    /// The steered message is not sent here. It is parked in `steerPending` and
+    /// `stop()` is called, because the new completion must not reach the server
+    /// before the stop for the run it interrupts does — a completion that
+    /// arrives first is answered by a server that is on its way to stopping it,
+    /// which is the race this ordering exists to avoid. `stop()` resolves its
+    /// POST and `settleQueue` picks the message up on the other side of it.
+    public func sendNow(id: UUID) {
+        guard let item = queue.remove(id: id) else { return }
+        guard phase != .loading else {
+            queue.putBackFront([item])
+            return
+        }
+        if phase.isBusy {
+            steerPending = (item.text, item.attachments)
+            stop()
+            return
+        }
+        if !startQueuedRun(items: [item]) { queue.putBackFront([item]) }
+    }
+
+    /// Takes a queued message back out into the composer to be edited.
+    ///
+    /// The text is handed over rather than appended blindly: if something has
+    /// been typed since, both are the user's words and neither may be eaten, so
+    /// they are joined. The file goes with it, and an upload still on the wire
+    /// for this item lands in the composer now that the item is gone.
+    public func editQueued(id: UUID) {
+        guard let item = queue.remove(id: id) else { return }
+        draft = draft.isEmpty ? item.text : draft + "\n" + item.text
+        attachments.append(contentsOf: item.attachments)
+        // The message is out of the queue, so a drain must not be waiting on it
+        // any more — and if it was the last thing waiting, this is the trigger.
+        if uploadLandingTarget?.id == id { uploadLandingTarget = nil }
+        settleQueue()
+    }
+
+    /// Throws a queued message away. Silent on purpose: the user chose to drop
+    /// it, which is not an error and must not leave a banner behind.
+    public func deleteQueued(id: UUID) {
+        guard let item = queue.remove(id: id) else { return }
+        if uploadLandingTarget?.id == id { uploadLandingTarget = nil }
+        // A delete can be the thing that unblocks the queue: the message whose
+        // file failed is often the one that was holding the rest up.
+        settleQueue()
+    }
+
+    /// Gives up on a queue upload that has not answered in `uploadWaitLimit`.
+    ///
+    /// The upload itself is left running, exactly as `waitForUploads` leaves a
+    /// hung composer upload: a late success still lands and takes the failure
+    /// back. What the deadline ends is the *wait*, because the alternative is a
+    /// queue held shut by a transport that never answers.
+    private func armQueueUploadDeadline() {
+        guard queueUploadDeadline == nil else { return }
+        let limit = uploadWaitLimit
+        queueUploadDeadline = Task { [weak self] in
+            try? await Task.sleep(for: limit)
+            guard let self else { return }
+            self.queueUploadDeadline = nil
+            guard self.queue.hasItemAwaitingUpload else { return }
+            for item in self.queue.items where item.awaitingUploads {
+                item.awaitingUploads = false
+                item.uploadFailed = true
+            }
+            self.error = "Upload is taking too long — the queued message is waiting "
+                + "on a file that has not arrived. Edit it to retry, or delete it."
+            // Nothing to time out on the other side, so nothing to re-check:
+            // re-settling here would re-arm the deadline over a failure that is
+            // waiting for the user, not for the server.
+        }
+    }
 
     /// The toggles a model starts a chat with.
     ///
@@ -685,7 +947,18 @@ public final class ConversationModel {
 
     // MARK: - loading
 
+    /// Reads the chat, then gives the queue its turn.
+    ///
+    /// Opening a chat is a safe moment to drain, and the one that catches a
+    /// message queued while no model was looking at the chat — the queue lives on
+    /// the session, so a message queued before navigating away is still sitting
+    /// there when the chat is opened again.
     public func load() async {
+        await loadInner()
+        settleQueue()
+    }
+
+    private func loadInner() async {
         guard let chatID else { return }
         // A temporary chat has no history to fetch — that is the whole point —
         // and asking for one is a guaranteed 404 on an id the server never
@@ -757,7 +1030,12 @@ public final class ConversationModel {
                     await self.reconcileUntilClosed(messageID: last.id)
                     // Only hand the composer back if nothing else took it while
                     // we were watching — a send started mid-heal owns the phase.
-                    if case .streaming = phase, post == nil { phase = .ready }
+                    if case .streaming = phase, post == nil {
+                        phase = .ready
+                        // Issue #37: the heal is a run ending — the answer the
+                        // app had given up on is finished, and the chat is free.
+                        settleQueue()
+                    }
                 }
             } else if !runInFlight {
                 phase = .ready
@@ -816,8 +1094,16 @@ public final class ConversationModel {
         // meantime. Attaching into a busy chat used to sweep the late pick into
         // whatever message sent next, which is a picture filed under the wrong
         // question. Refuse it where it lands, and say so.
-        guard !phase.isBusy else {
-            error = "Wait for the current answer to finish before adding attachments."
+        //
+        // Issue #37 changed what "where it lands" is: with the queue on, the
+        // pick belongs to the message the user is queueing, and there is
+        // nothing wrong to report. Without the queue the refusal stands.
+        if phase.isBusy {
+            guard queueEnabled else {
+                error = "Wait for the current answer to finish before adding attachments."
+                return
+            }
+            attachForQueue(data: data, name: name, mimeType: mimeType)
             return
         }
         uploading = true
@@ -844,6 +1130,74 @@ public final class ConversationModel {
                 self.error = "Could not attach \(name): \(error.localizedDescription)"
             }
         })
+    }
+
+    /// Uploads a file picked while a run is in flight, for the message the user
+    /// is queueing rather than for the composer (issue #37).
+    ///
+    /// Three things this keeps apart:
+    ///
+    /// * *whose* file it is — the most recently queued message, or the composer
+    ///   if nothing is queued yet, in which case the next `send` picks it up;
+    /// * the composer's upload counters, which it deliberately does not join —
+    ///   `uploading` and `pendingUploads` drive the composer and a composer
+    ///   send's `waitForUploads`, and a queued message's file is neither;
+    /// * the fact that the item it was picked for may be gone by the time the
+    ///   upload answers — edited back to the composer, or already sent. The
+    ///   target is resolved again on landing, and a file whose message has left
+    ///   lands in the composer, where the user can still see it.
+    private func attachForQueue(data: Data, name: String, mimeType: String) {
+        let target = uploadLandingTarget ?? queue.items.last
+        target?.awaitingUploads = true
+        uploadLandingTarget = target
+        queueUploadsInFlight += 1
+        error = nil
+        Task { [weak self] in
+            guard let self else { return }
+            let uploaded: FileRecord?
+            do { uploaded = try await self.client.uploadFile(data: data, filename: name, mimeType: mimeType) }
+            catch { uploaded = nil; self.noteQueueUploadFailure(name, pickedFor: target) }
+            // Resolved *now*, and by id: the item may have been edited away or
+            // drained in the meantime, and bytes landing in a message that has
+            // gone is the misrouted-pictures bug all over again. `?? target`
+            // because the claim may have been made after this upload started —
+            // the file was picked for the message queued a moment later, and it
+            // belongs to it.
+            let landing = self.queue.item(for: (self.uploadLandingTarget ?? target)?.id ?? UUID())
+            self.queueUploadsInFlight -= 1
+            if self.queueUploadsInFlight == 0 { self.uploadLandingTarget = nil }
+            if let uploaded {
+                let attachment = PendingAttachment(
+                    id: uploaded.id, name: uploaded.filename, mimeType: mimeType, data: data)
+                if let landing {
+                    landing.attachments.append(attachment)
+                    // A late success takes back the deadline's "failed": the
+                    // file did arrive, and the message goes out with it.
+                    landing.awaitingUploads = false
+                    landing.uploadFailed = false
+                } else {
+                    self.attachments.append(attachment)
+                }
+            }
+            // The drain re-triggers on the way out, failure included: an upload
+            // that lands is the second half of an upload-gated drain, and an
+            // upload that fails is the moment the queue has to say so.
+            self.settleQueue()
+        }
+    }
+
+    /// A queue upload that failed. The item is held, not quietly trimmed: the
+    /// message goes out with its file or not at all, and the two ways on — edit
+    /// it, or delete it — are the user's to take, not the app's to choose.
+    private func noteQueueUploadFailure(_ name: String, pickedFor: ChatMessageQueue.Item?) {
+        if let item = queue.item(for: (uploadLandingTarget ?? pickedFor)?.id ?? UUID()) {
+            item.awaitingUploads = false
+            item.uploadFailed = true
+            error = "Could not attach \(name) to the queued message. "
+                + "Edit it to retry, or delete it."
+        } else {
+            error = "Could not attach \(name)."
+        }
     }
 
     /// Uploads that have been started and not finished.
@@ -978,8 +1332,19 @@ public final class ConversationModel {
         // the same reason (`canSend`); this is the same gate for every other
         // caller. Silent, because there is nothing wrong to report — the chat is
         // simply not ready yet.
-        guard !(text.isEmpty && attachments.isEmpty && !uploading), !phase.isBusy, phase != .loading
-        else { return }
+        guard !(text.isEmpty && attachments.isEmpty && !uploading) else { return }
+        // Issue #37: a chat that is busy is no longer a chat that cannot take a
+        // message. The content guard above comes first on purpose — an empty
+        // press is still nothing at all, busy or not — and everything the send
+        // would have refused for other reasons is now the queue's problem
+        // later, with the guards re-run against the model of the moment.
+        if phase.isBusy, queueEnabled {
+            enqueueWhileGenerating(text: text)
+            return
+        }
+        // ...and with the feature off, a busy chat refuses exactly as it always
+        // did: silently, with the draft left where it was.
+        guard !phase.isBusy, phase != .loading else { return }
         // Refused before anything is touched: the draft and the attachments are
         // still in the composer because nothing has been consumed, and the
         // phase never left `.ready`. Deliberately here rather than in
@@ -1000,14 +1365,61 @@ public final class ConversationModel {
             error = "\(model) can't see images — remove the picture or pick a vision model."
             return
         }
-        draft = ""
-        lastSendText = text
-        // #34: the discard-on-stop puts the chat back where the send found
-        // it. The name `ensureChat` gives a new chat is captured here (the
-        // last point it still holds its pre-send value). Attachments are NOT
-        // restored — see the accepted-cost note in `stop()`'s nil branch.
-        titleBeforeLastSend = title
-        placeholderBeforeLastSend = titleIsPlaceholder
+        beginRun(text: text, fileSource: .composer)
+    }
+
+    /// Puts a message pressed while a run is in flight into the chat's queue
+    /// (issue #37).
+    ///
+    /// What it deliberately does *not* touch is the point: no phase, no
+    /// generation, no ribbon, no `lastSendText`, no title capture. Queueing is
+    /// not a send, and the run that is still going owns every one of those.
+    private func enqueueWhileGenerating(text: String) {
+        // An upload still on the wire belongs to the message being queued now —
+        // unless an earlier queued message already claimed it, which keeps the
+        // file with the message it was picked for.
+        let claimsUpload = queueUploadsInFlight > 0 && uploadLandingTarget == nil
+        queue.enqueue(
+            text: text, attachments: attachments, awaitingUploads: claimsUpload)
+        // The composer is emptied the way a send empties it: the message is on
+        // its way, just later. The draft only goes if it still says what was
+        // queued — anything typed since wins, the same no-clobber rule every
+        // other put-back in this file follows.
+        attachments = []
+        if draft.trimmingCharacters(in: .whitespacesAndNewlines) == text { draft = "" }
+        if claimsUpload { uploadLandingTarget = queue.items.last }
+    }
+
+    /// Everything `send()` did once its guards passed: claim the composer, raise
+    /// the ribbon, and start the run.
+    ///
+    /// Factored out so the queue can start a run without pretending to be the
+    /// composer. The `.composer` path is byte-for-byte what `send` used to do —
+    /// every concurrency fix in here (#5, #8, #9, #11, #20, #22, #34) hangs on
+    /// that ordering — and the only branching is on `fileSource`, in the four
+    /// places a queued run owns state the composer does not.
+    private func beginRun(text: String, fileSource: RunFiles) {
+        let queuedFiles: [PendingAttachment]
+        switch fileSource {
+        case .composer:
+            queuedFiles = []
+            draft = ""
+            lastSendText = text
+            // #34: the discard-on-stop puts the chat back where the send found
+            // it. The name `ensureChat` gives a new chat is captured here (the
+            // last point it still holds its pre-send value). Attachments are NOT
+            // restored — see the accepted-cost note in `stop()`'s nil branch.
+            titleBeforeLastSend = title
+            placeholderBeforeLastSend = titleIsPlaceholder
+        case .taken(let files):
+            // A queued run owns none of that. The composer may already be
+            // filling with the *next* message while this one is on the wire, and
+            // `lastSendText`/the title capture describe a send the user made at
+            // the keyboard, not one the queue let go of by itself.
+            queuedFiles = files
+        }
+        let isQueuedRun: Bool
+        if case .taken = fileSource { isQueuedRun = true } else { isQueuedRun = false }
         error = nil
         // Set here rather than inside the task: the button's feedback should not
         // wait for a scheduling hop, and a caller that then awaits something
@@ -1015,6 +1427,8 @@ public final class ConversationModel {
         phase = .waiting
         runGeneration += 1
         let gen = runGeneration
+        lastRunWasQueued = isQueuedRun
+        lastQueuedRun = isQueuedRun ? (text, queuedFiles) : nil
         // Out-of-process progress. A long answer outlives the app switcher, and
         // coming back to a transcript that has not moved is indistinguishable
         // from a hung one; a ribbon that says "Writing · local-deep" settles it.
@@ -1038,7 +1452,16 @@ public final class ConversationModel {
         run = Task {
             // Taken *after* the wait, because until the upload answers there is
             // no file id to take.
-            let uploadsTimedOut = await self.waitForUploads()
+            let uploadsTimedOut: Bool
+            if case .composer = fileSource {
+                uploadsTimedOut = await self.waitForUploads()
+            } else {
+                // A queued run has no composer uploads to wait for. Its own
+                // files are gated by the queue's `awaitingUploads` flag long
+                // before a drain lets the message out, and waiting here would
+                // stall it behind a file picked for the *next* message.
+                uploadsTimedOut = false
+            }
             // A superseded run (abandoned, or replaced by a newer send while the
             // upload wait was in flight) must not touch state it no longer owns:
             // neither the abort branch below nor the `attachments` steal would
@@ -1055,8 +1478,17 @@ public final class ConversationModel {
             // failure would block every later send forever; the landed
             // attachments stay put so a retry is one more press away — with
             // the failed file now the user's decision, not the app's.
-            let sawNewFailure = uploadFailureCount > uploadFailuresAtLastSend
-            uploadFailuresAtLastSend = uploadFailureCount
+            let sawNewFailure: Bool
+            if case .composer = fileSource {
+                sawNewFailure = uploadFailureCount > uploadFailuresAtLastSend
+                uploadFailuresAtLastSend = uploadFailureCount
+            } else {
+                // The queue keeps its own upload state; the composer's sticky
+                // failure checkpoint is not its business — reading it would
+                // abort a queued message over a file that failed for the
+                // composer, and writing it would make this run block the next.
+                sawNewFailure = false
+            }
             // Issue #22: a stop pressed while this run was parked in
             // `waitForUploads`. The wait is not cancellation-cooperative and
             // `stop` never bumps the generation, so the gen guard above
@@ -1078,7 +1510,16 @@ public final class ConversationModel {
             // because the stop is the newer intent (the same priority #18
             // decided for edit's catch).
             if Task.isCancelled {
-                if draft.isEmpty { draft = text }
+                switch fileSource {
+                case .composer:
+                    if draft.isEmpty { draft = text }
+                case .taken:
+                    // Back to the queue, not to the composer: a queued message
+                    // restored into the draft would strand everything still
+                    // waiting behind it, and the composer may hold the next
+                    // message already.
+                    putBackInQueue(text: text, files: queuedFiles)
+                }
                 // Same shape as the abort branch: await the raise first, or
                 // the finish no-ops on a nil activity and the raise finally
                 // lands as an orphaned ribbon. The generation re-check after
@@ -1125,9 +1566,15 @@ public final class ConversationModel {
                 }
                 return
             }
-            let files = self.attachments
-            self.attachments = []
-            await self.exchange(text: text, regenerating: nil, files: files, gen: gen)
+            let files: [PendingAttachment]
+            if case .taken = fileSource {
+                files = queuedFiles
+            } else {
+                files = self.attachments
+                self.attachments = []
+            }
+            await self.exchange(text: text, regenerating: nil, files: files, gen: gen,
+                                queuedRun: isQueuedRun)
         }
     }
 
@@ -1372,11 +1819,22 @@ public final class ConversationModel {
             leafID = nil
             // Same rule as #22's abort: text returns only if the composer is
             // still empty — anything typed since the press wins.
-            if draft.isEmpty { draft = lastSendText }
-            // Undo `ensureChat`'s rename: a chat that never happened keeps the
-            // name it had before the send named it after the message.
-            title = titleBeforeLastSend
-            titleIsPlaceholder = placeholderBeforeLastSend
+            if lastRunWasQueued, let run = lastQueuedRun {
+                // A queued run goes back to the queue, never to the composer:
+                // the composer may hold the next message already, and the
+                // messages still waiting behind this one belong with it
+                // (issue #37).
+                lastQueuedRun = nil
+                queue.enqueue(text: run.text, attachments: run.files)
+            } else if !lastRunWasQueued {
+                if draft.isEmpty { draft = lastSendText }
+                // Undo `ensureChat`'s rename: a chat that never happened keeps the
+                // name it had before the send named it after the message. A queued
+                // run never captured that name, so it has nothing to undo — and
+                // undoing it would rename the chat after a message from before it.
+                title = titleBeforeLastSend
+                titleIsPlaceholder = placeholderBeforeLastSend
+            }
             // Accepted cost (review of #34): attachments are NOT put back. By
             // the time a stop can discard the chat, the run Task has stolen
             // the *landed* files into `exchange` and cleared `attachments`;
@@ -1385,6 +1843,13 @@ public final class ConversationModel {
             // the rare loss (a brand-new chat, stopped mid-first-send, that
             // had a file attached). The text — the thing the issue is about —
             // always comes back.
+            //
+            // Issue #37: and now the queue gets its turn. Last, after every
+            // mutation above, because a drain that ran before the discard was
+            // undone would send into a chat that has just been thrown away.
+            // `afterStoppingQueuedRun` is why the stopped run's own message is
+            // not fired straight back out: a stop means "not now".
+            settleQueue(afterStoppingQueuedRun: lastRunWasQueued)
             return
         }
         phase = .stopping
@@ -1406,6 +1871,10 @@ public final class ConversationModel {
             // nothing was happening. A Stop button that stops is what was asked
             // for. Whatever arrived stays on screen.
             finishLocally(chatID: chatID, gen: gen)
+            // Issue #37, and the reason steering waits for this point: the stop
+            // POST has resolved, so the chat is free and a steered message can
+            // go out without racing the server's own stop.
+            settleQueue(afterStoppingQueuedRun: lastRunWasQueued)
         }
     }
 
@@ -1680,7 +2149,10 @@ public final class ConversationModel {
             .map { fileRow(id: $0.id, name: $0.name, mimeType: $0.mimeType) }
     }
 
-    private func exchange(text: String, regenerating: String?, files: [PendingAttachment], gen: Int) async {
+    private func exchange(
+        text: String, regenerating: String?, files: [PendingAttachment], gen: Int,
+        queuedRun: Bool = false
+    ) async {
         // G1: superseded during the caller's pre-exchange await (send's upload
         // wait, edit's updateMessage). Nothing below is ours to write — not
         // even the model guard's error: that banner belongs to the run that
@@ -1936,16 +2408,27 @@ public final class ConversationModel {
             // would be a lie the rollback has no way to make true.
             var restoredDraft = false
             var restoredAttachments = false
-            if draft.isEmpty { draft = text; restoredDraft = true }
-            // `!files.isEmpty`: a text-only send has nothing to put back —
-            // claiming "Attachments are back" for an empty list would be the
-            // same lie the separate flags exist to prevent.
-            if attachments.isEmpty, !files.isEmpty { attachments = files; restoredAttachments = true }
+            var restoredToQueue = false
+            if queuedRun {
+                // A queued run puts a failed send back where it came from. The
+                // composer is somebody else's business by now — it may already
+                // hold the message the user is typing next — and the messages
+                // still waiting in the queue are the only other copy of this one.
+                putBackInQueue(text: text, files: files)
+                restoredToQueue = true
+            } else {
+                if draft.isEmpty { draft = text; restoredDraft = true }
+                // `!files.isEmpty`: a text-only send has nothing to put back —
+                // claiming "Attachments are back" for an empty list would be the
+                // same lie the separate flags exist to prevent.
+                if attachments.isEmpty, !files.isEmpty { attachments = files; restoredAttachments = true }
+            }
             // "Could not send — Signed out." reads wrong; the 401 already
             // has its own plain sentence, so it stands alone.
             var banner = message == "Signed out." ? message : "Could not send — \(message)."
             if restoredDraft { banner += " It's back in the composer." }
             else if restoredAttachments { banner += " Attachments are back; re-type and send again." }
+            else if restoredToQueue { banner += " It's back in the queue." }
             error = banner
             if chatID == nil {
                 // A new chat that never learned an id never existed; put the
@@ -2113,6 +2596,12 @@ public final class ConversationModel {
             turns[index].streaming = false
         }
         phase = .ready
+        // Issue #37: the clean end of a run, which is exactly when the queue is
+        // owed its turn. Every other way out of `exchange` — the parked
+        // question, the #9 rollback, the #34 discard, each generation-guarded
+        // return — is an early return that does not get here, and none of them
+        // is a chat that has become able to take a new message.
+        settleQueue()
     }
 
     /// Wait for the server's generated title, up to a few seconds.
@@ -2709,6 +3198,11 @@ public final class ConversationModel {
             }
             if let failure = outcome.failure { self.error = failure }
             self.phase = .ready
+            // Issue #37: answering a tool call is a run ending — the same turn
+            // the exchange epilogue gets. The parked branch above returns early
+            // and does not: a chat waiting on a question is not a chat that has
+            // become free.
+            self.settleQueue()
         }
     }
 
@@ -3135,6 +3629,11 @@ public final class ConversationModel {
         // empty transcript. Only a busy model still owns a run to adopt for.
         guard phase.isBusy else { return }
         self.chatID = chatID
+        // Issue #37: the chat now has a name, so its queue moves onto it. Until
+        // this moment a new chat's queued messages live under a stand-in key of
+        // this model's own; leaving them there would mean they belong to no chat
+        // anybody can open.
+        rekeyQueue()
         // Issue #20: a brand-new chat raised its ribbon with no owner (there
         // was no id yet), and an unclaimed ribbon matches *any* finish — any
         // other chat's run ending could close it. The moment this chat has a

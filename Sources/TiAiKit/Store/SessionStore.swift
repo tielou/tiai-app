@@ -82,6 +82,26 @@ public final class SessionStore {
     @ObservationIgnored private var prefs: RunPreferences?
     @ObservationIgnored private var prefsServer: URL?
 
+    /// The per-chat send-while-generating queues (issue #37), one store per
+    /// instance.
+    ///
+    /// Same shape and same reasoning as `runPreferences()`: the queue has to
+    /// outlive the model that showed it, because leaving a chat and coming back
+    /// builds a fresh model and a queue that dies with the screen eats messages.
+    /// Keyed on the base URL rather than the whole `Server` — a token refresh
+    /// keeps what is waiting, a server switch must not carry one instance's
+    /// half-sent messages into another.
+    public func messageQueues() -> MessageQueueStore {
+        if let queues, queuesServer == server.baseURL { return queues }
+        let queues = MessageQueueStore()
+        self.queues = queues
+        queuesServer = server.baseURL
+        return queues
+    }
+
+    @ObservationIgnored private var queues: MessageQueueStore?
+    @ObservationIgnored private var queuesServer: URL?
+
     // MARK: - connecting
 
     public func setURL(_ text: String) {
@@ -144,5 +164,9 @@ public final class SessionStore {
         credentials.clearAll()
         server = Server(baseURL: server.baseURL)
         user = nil
+        // Messages waiting to be sent belong to a chat on the instance being
+        // left. Signed out, they are nobody's; keeping them means the next
+        // sign-in opens to a strip of text addressed to a server it is not on.
+        queues = nil
     }
 }

@@ -22,6 +22,13 @@ public struct AppDefaults: Codable, Equatable, Sendable {
     /// a hung one. The permission prompt is deferred to the first send rather
     /// than launch, so it arrives at a moment where the request makes sense.
     public var notifyWhenFinished: Bool
+    /// Send a message pressed while the assistant is still generating to the
+    /// chat's queue instead of dropping it (issue #37). On by default: the
+    /// behaviour it replaces is a silent no-op — the button was a Stop control,
+    /// so a follow-up typed in a hurry vanished and the user had no way to know.
+    /// A queue the user can see and take back is honest in a way that nothing
+    /// happening at all is not.
+    public var queueWhileGenerating: Bool
     /// Voice for read-aloud. nil means "whatever the instance configured", which
     /// matters because voice names are not portable across engines — `alloy`
     /// means something to OpenAI and nothing to Edge.
@@ -29,12 +36,13 @@ public struct AppDefaults: Codable, Equatable, Sendable {
 
     public init(
         systemPrompt: String = "", temperature: Double? = nil, notifyWhenFinished: Bool = true,
-        readAloudVoice: String? = nil
+        readAloudVoice: String? = nil, queueWhileGenerating: Bool = true
     ) {
         self.systemPrompt = systemPrompt
         self.temperature = temperature
         self.notifyWhenFinished = notifyWhenFinished
         self.readAloudVoice = readAloudVoice
+        self.queueWhileGenerating = queueWhileGenerating
     }
 
     /// "Nothing here that the user chose." Compared against a fresh default
@@ -44,6 +52,32 @@ public struct AppDefaults: Codable, Equatable, Sendable {
         systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && temperature == nil && readAloudVoice == nil
             && notifyWhenFinished == AppDefaults().notifyWhenFinished
+            && queueWhileGenerating == AppDefaults().queueWhileGenerating
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case systemPrompt, temperature, notifyWhenFinished, readAloudVoice, queueWhileGenerating
+    }
+
+    /// Hand-written decode, and only because of what is already on phones.
+    ///
+    /// The stored blob predates `queueWhileGenerating`, and the synthesised
+    /// decoder asks for every key: a missing one throws, `load` falls back to a
+    /// fresh `AppDefaults`, and an app update silently resets the user's system
+    /// prompt and temperature. `decodeIfPresent` with the current default is the
+    /// whole fix, and it is the last new key that needs it — from now on the
+    /// blob always has every key this struct has.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        systemPrompt = try container.decodeIfPresent(String.self, forKey: .systemPrompt) ?? ""
+        temperature = try container.decodeIfPresent(Double.self, forKey: .temperature)
+        notifyWhenFinished =
+            try container.decodeIfPresent(Bool.self, forKey: .notifyWhenFinished)
+            ?? AppDefaults().notifyWhenFinished
+        readAloudVoice = try container.decodeIfPresent(String.self, forKey: .readAloudVoice)
+        queueWhileGenerating =
+            try container.decodeIfPresent(Bool.self, forKey: .queueWhileGenerating)
+            ?? AppDefaults().queueWhileGenerating
     }
 }
 

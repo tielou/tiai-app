@@ -73,6 +73,7 @@ struct ComposerView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if !conversation.queue.items.isEmpty { queueStrip }
             if !conversation.attachments.isEmpty { attachmentStrip }
 
             TextField("Message", text: $conversation.draft, axis: .vertical)
@@ -458,6 +459,51 @@ struct ComposerView: View {
     /// Which capabilities are on for this message, in the chip's secondary slot.
     private var featuresOn: [ChatFeature] {
         ChatFeature.allCases.filter { conversation.features[$0.rawValue] ?? false }
+    }
+
+    /// The messages queued behind the answer that is still being written
+    /// (issue #37).
+    ///
+    /// Visible because the whole bug being fixed was a message that vanished on
+    /// a tap: what is waiting has to be readable, and each row has to offer the
+    /// three things the user might want — send it now, take it back, throw it
+    /// away. A row whose file has not landed says so rather than looking idle.
+    private var queueStrip: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(conversation.queue.items) { item in
+                HStack(spacing: 8) {
+                    Image(systemName: item.uploadFailed
+                          ? "exclamationmark.arrow.triangle.2.circlepath"
+                          : (item.awaitingUploads ? "hourglass" : "clock"))
+                        .font(.system(size: 11))
+                        .foregroundStyle(item.uploadFailed ? .red : .secondary)
+                    Text(item.text.isEmpty ? "(attachment)" : item.text)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 4)
+                    Button("Send now") { conversation.sendNow(id: item.id) }
+                        .font(.footnote)
+                        .buttonStyle(.borderless)
+                        .accessibilityIdentifier("queueSendNow")
+                    Button("Edit") { conversation.editQueued(id: item.id) }
+                        .font(.footnote)
+                        .buttonStyle(.borderless)
+                        .accessibilityIdentifier("queueEdit")
+                    Button("Delete") { conversation.deleteQueued(id: item.id) }
+                        .font(.footnote)
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.red)
+                        .accessibilityIdentifier("queueDelete")
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 12))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("queuedMessages")
     }
 
     private var attachmentStrip: some View {

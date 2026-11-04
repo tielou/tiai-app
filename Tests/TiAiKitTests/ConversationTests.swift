@@ -461,6 +461,9 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
 
     /// Makes the *next* POST …/stop wait until `releaseStopGate()`.
     func gateNextStop() { stopGate.arm() }
+    /// True while a stop request is parked at the gate (issue #37: a steered
+    /// send has to land *after* the stop POST resolves).
+    var isStopGateParked: Bool { stopGate.isParked }
     /// Resumes the parked stop request (and disarms an unused gate).
     func releaseStopGate() { stopGate.release() }
 
@@ -1129,6 +1132,11 @@ extension ChatModel {
         models: [ChatModel.stub("local-personal", caps: ["vision": true])],
         client: OWUIClient(server: server, transport: transport),
         hub: ChatEventHub(server: server))
+    // Issue #37 put a queue behind this refusal — with the queue on, a late
+    // pick is kept for the next message instead of being refused. This test is
+    // about the refusal, so it pins the feature off. The ON behaviour has its
+    // own test (`aLatePickWhileTheRunIsLiveGoesToTheQueueNotTheComposer`).
+    conversation.queueWhileGeneratingOverride = false
     conversation.draft = "go"
     conversation.send()
     try await transport.awaitCompletion()
@@ -1771,6 +1779,10 @@ enum AskUserFixture {
         models: [ChatModel.stub("local-personal")],
         client: OWUIClient(server: server, transport: transport),
         hub: hub)
+    // Issue #37: with the queue on, a send in this window is queued instead of
+    // refused — which is its own test (`aSendDuringAnInFlightEditIsQueuedAnd
+    // DrainsAfterTheEdit`). This one pins the refusal, so the queue is off.
+    conversation.queueWhileGeneratingOverride = false
     // Same fixture as `editingAMessageStoresItAndReRunsFromIt`: the edited
     // message has to exist, so the conversation is loaded from a fixture.
     transport.chatDetailOverride = Data(
@@ -2416,6 +2428,10 @@ enum AskUserFixture {
     let conversation = ConversationModel(
         chatID: "temporary:midrun-26", models: [ChatModel.stub("local-personal")],
         client: OWUIClient(server: server, transport: transport), hub: hub)
+    // Issue #37: with the queue on, the send below is queued rather than
+    // refused. The point of this test is that the mid-run load leaves the
+    // *phase* alone, so the queue is pinned off.
+    conversation.queueWhileGeneratingOverride = false
 
     conversation.draft = "first"
     conversation.send()

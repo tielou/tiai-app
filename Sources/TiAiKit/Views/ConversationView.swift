@@ -170,7 +170,12 @@ public struct ConversationView: View {
             models: models,
             client: session.client,
             hub: session.eventHub(),
-            prefs: session.runPreferences())
+            prefs: session.runPreferences(),
+            // Issue #37: the queue is the session's, not this screen's. A
+            // message queued and then left behind by navigating away is still
+            // there when the chat is opened again, in whichever model instance
+            // happens to be showing it.
+            queues: session.messageQueues())
         // Something shared from another app arrives as a composed prompt. It
         // lands in the composer rather than being sent: "share to my assistant"
         // is a request to be shown, not a licence to post.

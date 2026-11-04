@@ -19,6 +19,7 @@ public struct SettingsView: View {
     @State private var voices: [OWUIClient.Voice] = []
     @State private var confirmSignOut = false
     @State private var notify = false
+    @State private var queueWhileGenerating = true
 
     public init(session: SessionStore, onSignOut: @escaping () -> Void) {
         self.session = session
@@ -153,6 +154,11 @@ public struct SettingsView: View {
                         if !granted { notify = false }
                     }
                 }
+            Toggle("Send while the assistant is typing", isOn: $queueWhileGenerating)
+                .onChange(of: queueWhileGenerating) { _, on in
+                    store.defaults.queueWhileGenerating = on
+                }
+                .accessibilityIdentifier("queueWhileGeneratingToggle")
             // Only offered when the instance actually has something to speak
             // with. A picker of voices that all fail is worse than no picker, and
             // the list is the server's because voice names are not portable.
@@ -170,7 +176,7 @@ public struct SettingsView: View {
         } header: {
             Text("Defaults for new chats")
         } footer: {
-            Text("Notifications arrive when the app is not on screen — a long answer finishing while you are somewhere else. Stored on this device, per server; the web UI's own settings are left alone.")
+            Text("Notifications arrive when the app is not on screen — a long answer finishing while you are somewhere else. A message sent while an answer is still being written waits in a list above the composer and goes out when the answer ends; switch that off and such a send does nothing at all. Stored on this device, per server; the web UI's own settings are left alone.")
         }
     }
 
@@ -208,6 +214,7 @@ public struct SettingsView: View {
         useTemperature = store.defaults.temperature != nil
         temperature = store.defaults.temperature ?? 0.7
         notify = store.defaults.notifyWhenFinished
+        queueWhileGenerating = store.defaults.queueWhileGenerating
         voice = store.defaults.readAloudVoice
         if voices.isEmpty {
             Task {
