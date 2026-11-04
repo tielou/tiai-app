@@ -450,9 +450,15 @@ public final class ConversationModel {
         }
     }
 
+    /// Test seam for the incognito chat id. `ensureChat` builds it from the
+    /// live socket's session id, which a scripted test has none of; setting
+    /// this lets an incognito send reach the fork the way a real one does —
+    /// with a `temporary:` id in `chatID`.
+    var incognitoSessionIDOverride: String?
+
     /// The chat id a temporary run uses, or nil until the socket has one.
     private var temporaryChatID: String? {
-        hub.sessionID.map { "temporary:\($0)" }
+        (incognitoSessionIDOverride ?? hub.sessionID).map { "temporary:\($0)" }
     }
 
     /// The Live Activity ribbon. Defaults to the process singleton — one
@@ -525,6 +531,67 @@ public final class ConversationModel {
     /// same bound, armed when a drain actually finds itself waiting.
     private var queueUploadDeadline: Task<Void, Never>?
 
+    // MARK: - the offline outbox (issue #38)
+
+    /// Where a send that could not reach the server is kept until it can.
+    ///
+    /// Nil means "this model has no outbox", which is the whole behaviour of
+    /// every model built before issue #38 and every model built without one:
+    /// a failed send takes the issue #9 rollback. The view injects the
+    /// session's store; tests inject one to exercise the other half.
+    private let outbox: OutboxStore?
+
+    /// Test seam, mirroring `queueWhileGeneratingOverride`: read live, so the
+    /// setting applies to the chat you are looking at, and a test can pin
+    /// either behaviour without touching the shared defaults store.
+    var outboxOverride: Bool?
+
+    /// Read at the fork, not captured: the setting is meant to be live.
+    private var outboxEnabled: Bool {
+        guard outbox != nil else { return false }
+        return outboxOverride ?? SettingsStore.shared.defaults.outboxWhileOffline
+    }
+
+    /// How many times a replay may fail for a reason the server actually gave
+    /// before the message is handed back to the composer.
+    ///
+    /// Three is "the server was asked and said no, or blinked, three times":
+    /// enough that a transient 500 on a restarting box is retried past, short
+    /// enough that a message the server will never accept does not sit in a
+    /// strip forever. Failures while still offline are not counted at all —
+    /// see `OutboxStore.revertToPending`.
+    static let outboxAttemptCap = 3
+
+    /// Whether the POST failure that armed the #9 rollback was one worth
+    /// trying again — unreachable, a 5xx, a 429 — as opposed to a 401 or a
+    /// 400, which the app would only fail again.
+    ///
+    /// Set in `recordPostError` in lockstep with `postFailureMessage` and
+    /// cleared wherever that is cleared, because a flag that outlives its
+    /// failure would capture the *next* run's non-transient error into the
+    /// outbox and hold a message the server has already refused.
+    private var postFailureIsTransient = false
+
+    /// The outbox entry the current run is carrying, and the generation that
+    /// run owns.
+    ///
+    /// The generation is the reason this is not just a UUID: a replay that gets
+    /// superseded mid-flight must not have its marker read by the successor's
+    /// fork, or a send the user typed by hand would be filed under the
+    /// replay's entry and vanish into the outbox.
+    ///
+    /// `gen == nil` means claimed but not started — the window while the dedup
+    /// refetch is in flight. It matches no run, which is exactly right: a
+    /// claimed-but-unstarted entry belongs to no fork yet.
+    private var outboxReplayContext: (entryID: UUID, gen: Int?, burnsAttempt: Bool)?
+
+    /// The outbox entries waiting on this chat, oldest first — what the strip
+    /// in `ConversationView` draws.
+    public var pendingOutbox: [OutboxEntry] {
+        guard let chatID, let outbox else { return [] }
+        return outbox.entries(for: chatID)
+    }
+
     public init(
         chatID: String?,
         title: String = "New Chat",
@@ -534,7 +601,8 @@ public final class ConversationModel {
         hub: ChatEventHub,
         activity: GenerationActivity = .shared,
         prefs: RunPreferences = RunPreferences(),
-        queues: MessageQueueStore = MessageQueueStore()
+        queues: MessageQueueStore = MessageQueueStore(),
+        outbox: OutboxStore? = nil
     ) {
         self.incognito = incognito
         // A chat the server has not named yet cannot own a queue by id, so it
@@ -542,6 +610,7 @@ public final class ConversationModel {
         // would let two half-written chats read each other's queued messages.
         let freshKey = "new:\(UUID().uuidString)"
         self.queues = queues
+        self.outbox = outbox
         self.freshQueueKey = freshKey
         self.queueKey = chatID ?? freshKey
         self.queue = queues.queue(for: chatID ?? freshKey)
@@ -755,6 +824,278 @@ public final class ConversationModel {
         }
     }
 
+    // MARK: - replaying the outbox (issue #38)
+
+    /// What the outbox does with a POST that died before its first frame.
+    private enum OutboxFate {
+        /// A send made with no connection, parked for the first time.
+        case park
+        /// A replay that failed again, back to pending. `burnsAttempt` is false
+        /// when the failure was "still offline" rather than an answer: the
+        /// attempt cap counts times the server was asked, not times a trigger
+        /// fired into a dead network.
+        case repark(entryID: UUID, burnsAttempt: Bool)
+        /// A replay that has run out of attempts: the entry is deleted and the
+        /// message takes the issue #9 route home.
+        case gaveUp(entryID: UUID)
+        /// The entry this run was carrying is gone — the user cancelled it (or
+        /// the chat was deleted, or the account signed out) while the replay's
+        /// POST was in flight. The run belongs to no queue any more: the
+        /// message is thrown away quietly, the way `cancelOutbox` throws away
+        /// a pending one.
+        case discarded
+    }
+
+    /// The user-message id a replay must reuse, if this run is one.
+    ///
+    /// This is what makes the dedup able to recognise its own retry. A replay
+    /// that minted a fresh UUID would be a *different* message as far as the
+    /// server is concerned, so an attempt that landed and was not seen would be
+    /// sent again under a new id and the chat would carry the question twice —
+    /// which is precisely the failure the dedup exists to prevent, reintroduced
+    /// by the thing that was supposed to fix it.
+    ///
+    /// Generation-matched for the same reason the rest of the fork is: a
+    /// superseded run must not stamp a successor's message with its
+    /// predecessor's id.
+    private func replayedUserMessageID(for gen: Int) -> String? {
+        guard let context = outboxReplayContext, context.gen == gen,
+              let entry = outbox?.entry(id: context.entryID)
+        else { return nil }
+        return entry.userMessageID
+    }
+
+    /// The outbox's claim on a failed send, or nil when the #9 rollback owns it.
+    ///
+    /// Decided in one place before the fork because the answer needs three
+    /// things the fork does not carry together: the replay marker, the entry's
+    /// attempt count, and whether this failure was the server's answer or the
+    /// same dead network seen again.
+    private func outboxFate(
+        files: [PendingAttachment], queuedRun: Bool, gen: Int
+    ) -> OutboxFate? {
+        guard let outbox else { return nil }
+        if let context = outboxReplayContext, context.gen == gen {
+            // A replay that failed again belongs to the outbox and nowhere
+            // else. This is what the marker exists for: a replay goes out
+            // through `beginRun(.taken)`, which means `queuedRun` is true, and
+            // without the marker its failure would land in `putBackInQueue` —
+            // the in-memory queue, which loses the message on the next force
+            // quit and draws a strip for a chat that is not generating.
+            //
+            // A gone entry means the claim was cancelled mid-flight. Routing
+            // that to `nil` would drop the failure into the #9 arm, whose
+            // `queuedRun` branch hands the just-cancelled message to the
+            // queue — resurrecting exactly what the user threw away.
+            guard let entry = outbox.entry(id: context.entryID) else { return .discarded }
+            if context.burnsAttempt, entry.attempts + 1 >= Self.outboxAttemptCap {
+                return .gaveUp(entryID: entry.id)
+            }
+            return .repark(entryID: entry.id, burnsAttempt: context.burnsAttempt)
+        }
+        // A fresh send. `chatID != nil` is the existing-chat gate: a brand-new
+        // chat has no id to key an entry under, and its offline failure happens
+        // earlier still, in `ensureChat` — a different hook and a follow-up.
+        // `!incognito` is the promise gate: incognito sends get a derived
+        // `temporary:<sid>` id, so the nil-check alone would let an offline
+        // incognito send park its text in UserDefaults — durable storage is
+        // precisely what incognito promises not to write. (The replay branch
+        // above is unaffected: a replay only exists for an entry that was
+        // legitimately captured.)
+        // `files.isEmpty` is the text-only gate: an attachment has no file id
+        // until its upload answers, and offline that never happens.
+        guard outboxEnabled, !queuedRun, postFailureIsTransient,
+              chatID != nil, !incognito, files.isEmpty
+        else { return nil }
+        return .park
+    }
+
+    /// Sends anything this chat is holding, if the chat is free to send.
+    ///
+    /// Idempotent and cheap, which is what lets three different moments call it
+    /// — a connectivity transition, a foreground, and the chat opening — without
+    /// any of them having to know about the others.
+    ///
+    /// The phase gate and the claim are one synchronous main-actor region on
+    /// purpose. `beginRun` has no phase guard of its own — it assumes the caller
+    /// checked — so a replay that claimed an entry, awaited something, and then
+    /// called `beginRun` would bump the generation out from under a run the user
+    /// started in the meantime and supersede it. Claiming in the same turn as
+    /// the check is the mutex; `beginRun` is called after the dedup refetch
+    /// only behind a re-check of the same condition.
+    public func replayOutboxIfNeeded() {
+        guard outboxEnabled, phase == .ready, let chat = chatID else { return }
+        // A marker left by a run that has since ended or been superseded is
+        // nobody's; clearing it here is what keeps an entry retryable instead
+        // of wedged behind one bad interleaving. A claim that has not started a
+        // run yet (nil generation) is by definition current — clearing it here
+        // would undo the mutex that makes two triggers in one turn safe.
+        clearStaleReplayMarker()
+        guard outboxReplayContext == nil else { return }
+        guard let entry = outbox?.claimNext(for: chat) else { return }
+        beginClaim(entry)
+    }
+
+    /// Drops a replay marker whose run has since ended or been superseded,
+    /// and lets the store's in-process claim go with it.
+    ///
+    /// Shared by `replayOutboxIfNeeded` and `sendOutboxNow`: both refuse to
+    /// start over a marker, so both owe the caller the same cleanup — a
+    /// trigger (or a "Send now") that refused against a stale marker and
+    /// left it in place is a dead button until some later cue happens to
+    /// fire. A claim that has not started a run yet (nil generation) is by
+    /// definition current and is left alone.
+    private func clearStaleReplayMarker() {
+        if let context = outboxReplayContext, let gen = context.gen,
+           gen != runGeneration {
+            outboxReplayContext = nil
+            // The run that owned the claim is gone, so the claim is nobody's —
+            // and the store's in-process claim set must let go too, or the
+            // entry is wedged out of `claimNext` for the rest of the process.
+            outbox?.revertToPending(id: context.entryID, burnsAttempt: false)
+        }
+    }
+
+    /// "Send now" on the pending strip: the user is asserting the network is
+    /// back, which is exactly the information the monitor may not have yet.
+    ///
+    /// Deliberately *not* gated on `outboxEnabled`: the press is the override
+    /// case the flag is an opinion about. With the toggle off and entries
+    /// already on disk, the strip still shows them (they are real), and a
+    /// "Send now" that silently did nothing would make the strip a liar and
+    /// the button a dead end. Capture, by contrast, stays gated — the flag
+    /// still refuses to take on *new* entries.
+    public func sendOutboxNow(id: UUID) {
+        // Same refusal-and-cleanup contract as the automatic trigger: a stale
+        // marker must not dead-button the user's explicit "send it now".
+        clearStaleReplayMarker()
+        // Self-defending against a cross-chat id: the strip only ever passes an
+        // id from this chat's `pendingOutbox`, but `sendOutboxNow` is public, and
+        // replaying another chat's text into the open chat would be a wrong send
+        // the type system can't catch. Peek before claiming so a foreign id never
+        // becomes a claim.
+        guard phase == .ready, outboxReplayContext == nil,
+              outbox?.entry(id: id)?.chatID == chatID,
+              let entry = outbox?.claim(id: id)
+        else { return }
+        beginClaim(entry)
+    }
+
+    /// Throws a pending message away. The user has decided it does not matter,
+    /// which is not an error and must not leave a banner behind — the same
+    /// contract `deleteQueued` keeps.
+    public func cancelOutbox(id: UUID) {
+        // A claim that has not started a run yet (nil generation) belongs to no
+        // fork, so clearing the marker here is what keeps a cancelled claim
+        // from wedging the next trigger. A claim that *owns a live run* must
+        // keep its marker: the run's fork needs it to recognise itself when its
+        // POST fails, and a marker dropped here would send a cancelled
+        // replay's failure into the #9 arm, which hands the just-cancelled
+        // message back to the queue — resurrecting what the user deleted.
+        if outboxReplayContext?.entryID == id, outboxReplayContext?.gen == nil {
+            outboxReplayContext = nil
+        }
+        outbox?.remove(id: id)
+    }
+
+    private func beginClaim(_ entry: OutboxEntry) {
+        // Claimed but not started: a generation of nil matches no run, so no
+        // fork can read it, and a second trigger landing in this same turn sees
+        // a claim and stands down instead of taking the entry too.
+        outboxReplayContext = (entry.id, nil, true)
+        Task { await replay(entry) }
+    }
+
+    /// Replays one claimed entry: check it has not already landed, then send it.
+    ///
+    /// The check is the reason a replay may be a retry at all. A message can be
+    /// in the server's transcript and unknown to the app — the answer arrived
+    /// and the app was killed, or the POST landed and the socket died before any
+    /// frame came back. Sending it again would put the same question to the
+    /// model twice, and the model would answer twice, and both answers would be
+    /// in the chat forever.
+    private func replay(_ entry: OutboxEntry) async {
+        // Whether a failure of this attempt should count against the cap, set
+        // below by whether the refetch reached the server at all.
+        var burnsAttempt = true
+        // The generation at claim time. The dedup guard below needs more than
+        // `phase == .ready`: a run can start *and finish* inside the refetch
+        // window (slow GET, fast answer), leaving the phase back at `.ready`
+        // while the transcript the refetch returns is a snapshot from before
+        // that run — applying it would rewind the leaf and drop the exchange
+        // that just completed, the #19/#26 class wearing a `.ready` mask.
+        // Generation can only move forward, so equality is the whole check.
+        let startGen = runGeneration
+        do {
+            let detail = try await client.chat(id: entry.chatID)
+            if detail.messages[entry.userMessageID] != nil {
+                // The server already has this exact message — the id is the
+                // app's own UUID, so "a message with this id" is "this send",
+                // not a message that happens to read the same. It landed; only
+                // the answer was lost. Show the transcript and send nothing.
+                //
+                // But the refetch was a real await: a run may have started
+                // under it, and `apply` replaces the transcript, rewinds the
+                // leaf and can swap the model — superseding a live run is the
+                // #19/#26 class of bug, and the same rule as the guard below
+                // applies before the apply, not just before a `beginRun`. An
+                // entry that was cancelled while the refetch was in flight is
+                // gone too: there is nothing left to dedup or replay.
+                guard phase == .ready, runGeneration == startGen,
+                      outbox?.entry(id: entry.id) != nil else {
+                    outbox?.revertToPending(id: entry.id, burnsAttempt: false)
+                    clearReplayMarker(ifFor: entry.id)
+                    return
+                }
+                outbox?.remove(id: entry.id)
+                clearReplayMarker(ifFor: entry.id)
+                apply(detail)
+                // And take the next one now: an entry that deduped was never
+                // really the attempt, and making the message behind it wait
+                // for another reconnect cue is a message that sits there for
+                // no reason. Bounded, because every pass removes an entry.
+                replayOutboxIfNeeded()
+                return
+            }
+        } catch {
+            // Still offline, most likely. Proceed: the send fails the way it
+            // failed before and re-parks — but a failure to reach the server
+            // for the *check* is not the server refusing the *message*, so it
+            // does not spend an attempt. Without this, three foregrounds on a
+            // long flight would empty the outbox into the composer.
+            burnsAttempt = false
+        }
+        // The refetch was a real await: a run may have started while it was in
+        // flight, and superseding it is not this code's to do. And the entry
+        // may have been cancelled while it was: a cancelled message must not
+        // come back to life as a run behind the refetch that was checking it.
+        // `phase == .ready` alone is enough here, unlike the dedup guard: a
+        // free chat means `beginRun` supersedes nothing, whatever the
+        // generation has meanwhile done.
+        guard phase == .ready, outbox?.entry(id: entry.id) != nil else {
+            outbox?.revertToPending(id: entry.id, burnsAttempt: false)
+            clearReplayMarker(ifFor: entry.id)
+            return
+        }
+        beginRun(text: entry.text, fileSource: .taken([]))
+        // Stamped after `beginRun` because that is where the generation is
+        // bumped, and `beginRun`'s own task cannot start before this
+        // synchronous region ends — so no fork can observe the gap.
+        outboxReplayContext = (entry.id, runGeneration, burnsAttempt)
+    }
+
+    /// Clears the replay marker only if it still names this entry.
+    ///
+    /// The marker is a single slot and a bail-out here is a verdict about
+    /// *this* entry, not about whoever holds the slot by the time the await
+    /// resolves: claim A, cancel A, a trigger claims B, and A's replay
+    /// resuming would otherwise nil *B's* claim — B's fork then cannot
+    /// recognise itself and its failure lands in the #9 queue put-back with
+    /// a duplicate of a message the durable store is still holding.
+    private func clearReplayMarker(ifFor entryID: UUID) {
+        if outboxReplayContext?.entryID == entryID { outboxReplayContext = nil }
+    }
+
     /// The toggles a model starts a chat with.
     ///
     /// The server's own defaults first, so a model configured for web search
@@ -953,9 +1294,15 @@ public final class ConversationModel {
     /// message queued while no model was looking at the chat — the queue lives on
     /// the session, so a message queued before navigating away is still sitting
     /// there when the chat is opened again.
+    ///
+    /// The outbox gets the same moment for the same reason (issue #38): a
+    /// message that failed to leave while this chat was closed has nowhere else
+    /// to be noticed, and a chat that has just been opened is a chat somebody
+    /// is looking at while it sends.
     public func load() async {
         await loadInner()
         settleQueue()
+        replayOutboxIfNeeded()
     }
 
     private func loadInner() async {
@@ -2190,7 +2537,7 @@ public final class ConversationModel {
         // covers the `postFailureMessage` clear and the `post = Task` slot write.
         guard isCurrent(gen) else { return }
 
-        let userMessageID = regenerating ?? UUID().uuidString
+        let userMessageID = regenerating ?? replayedUserMessageID(for: gen) ?? UUID().uuidString
         let assistantID = UUID().uuidString
         let parentID = regenerating ?? leafID
 
@@ -2311,6 +2658,9 @@ public final class ConversationModel {
         // A failure recorded by an earlier run must never be mistaken for
         // this one's (issue #9).
         postFailureMessage = nil
+        // #38: cleared with it, for the same reason — a transient failure that
+        // leaked into the next run would capture a 401 into the outbox.
+        postFailureIsTransient = false
         // #25: reclaim a POST still held by a superseded run. The occupant at
         // this point is provably nil or a strictly older run's task: the G3
         // guard above and this write are one main-actor synchronous region,
@@ -2352,6 +2702,20 @@ public final class ConversationModel {
         post?.cancel()
         post = nil
 
+        // #38: any frame carrying this message is proof the server has the
+        // exchange, so a replay that got this far has sent its message and the
+        // entry is spent.
+        //
+        // Here rather than in the epilogue at the end of the run, because two
+        // of the ways out of this function — the parked question below and the
+        // #34 stop-discard — return before the epilogue, and a replay that
+        // parked on a tool question would otherwise keep its entry and send
+        // the message a second time on the next trigger.
+        if let context = outboxReplayContext, context.gen == gen, outcome.sawAnyFrame {
+            outboxReplayContext = nil
+            outbox?.remove(id: context.entryID)
+        }
+
         if outcome.parked {
             // The run is parked on a question, not finished. `leafID` stays where
             // it was: the answer this turn is still owed, and resending would
@@ -2391,9 +2755,77 @@ public final class ConversationModel {
         // - `!outcome.sawAnyFrame` — once any frame for this message arrived
         //   the server knows about the exchange, and rolling back would lie
         //   about what was sent.
+        // Issue #38: the outbox arm, and it has to be the first arm — a send
+        // that is going to be retried must not also be handed back to the
+        // composer or the queue, because then it would go out twice: once by
+        // whoever picks up the copy, once by the replay.
+        //
+        // The gate is the #9 gate plus one of two claims:
+        // - this run is a replay (the marker, generation-matched), whose
+        //   failure belongs to the outbox and nowhere else; or
+        // - it is a fresh composer send, on a chat that already exists, that
+        //   failed for a reason worth trying again, with nothing attached that
+        //   could not survive the wait.
+        if let message = postFailureMessage, regenerating == nil,
+           phase == .waiting, !outcome.sawAnyFrame,
+           let fate = outboxFate(files: files, queuedRun: queuedRun, gen: gen) {
+            postFailureMessage = nil
+            postFailureIsTransient = false
+            turns.removeAll { $0.id == userMessageID || $0.id == assistantID }
+            // `recordPostError` stamped a red banner before this fork ran, and
+            // the strip is not a banner: a pending message is not an error, and
+            // showing both says "failed" and "waiting" about the same message.
+            error = nil
+            switch fate {
+            case .park:
+                outbox?.add(chatID: chat, userMessageID: userMessageID, text: text)
+            case .repark(let entryID, let burnsAttempt):
+                // A replay owns the queued-run put-back bookkeeping it has no
+                // business in: `lastQueuedRun` is what a later `stop()` uses to
+                // hand a message to the in-memory #37 queue, and this one's
+                // queue is the durable one.
+                lastQueuedRun = nil
+                outbox?.revertToPending(id: entryID, burnsAttempt: burnsAttempt)
+            case .gaveUp(let entryID):
+                // Out of attempts. The entry goes and the message becomes what
+                // the #9 rollback would have made it: the user's problem again,
+                // in the composer, under the banner that says so.
+                //
+                // Spelled out rather than falling through to the arm below,
+                // because that arm's `queuedRun` branch hands the message to
+                // the in-memory queue — and a message whose durable entry has
+                // just been deleted has nothing left to fall back on but the
+                // composer.
+                lastQueuedRun = nil
+                outbox?.remove(id: entryID)
+                var restoredDraft = false
+                if draft.isEmpty { draft = text; restoredDraft = true }
+                var banner = message == "Signed out." ? message : "Could not send — \(message)."
+                if restoredDraft { banner += " It's back in the composer." }
+                error = banner
+            case .discarded:
+                // The entry was cancelled (or deleted under us) while this
+                // replay's POST was in flight. Nothing to park, nothing to
+                // give back — the phantom turns are already rolled back above
+                // and the banner is already cleared. `lastQueuedRun` is
+                // cleared for the same reason `.repark` clears it: a replay
+                // owns the queued-run put-back bookkeeping, and a discarded
+                // run must not leave a cancelled message in a later `stop()`'s
+                // hands.
+                lastQueuedRun = nil
+            }
+            outboxReplayContext = nil
+            phase = .ready
+            await activity.finish(.stopped, characters: 0, chatID: chatID)
+            return
+        }
         if let message = postFailureMessage, regenerating == nil,
            phase == .waiting, !outcome.sawAnyFrame {
             postFailureMessage = nil
+            // Cleared in lockstep with the message, same as everywhere else it
+            // is cleared: a flag that outlives its failure would capture the
+            // *next* run's non-transient error into the outbox arm above.
+            postFailureIsTransient = false
             // By id, not index: nothing else should have moved the array, but
             // id-matching cannot eat the wrong turn if something did.
             turns.removeAll { $0.id == userMessageID || $0.id == assistantID }
@@ -2594,6 +3026,21 @@ public final class ConversationModel {
     // reported: still "working" long after the answer had landed.
         if let index = turns.firstIndex(where: { $0.id == assistantID }) {
             turns[index].streaming = false
+        }
+        // #38: reaching here at all means the POST did not fail — it answered,
+        // or it was cancelled while the run ended some other way — and the #9
+        // fork above is the only other reader of the marker. So the server has
+        // the message and the entry is spent. A run the *user* stopped is the
+        // exception: no frame and no answer means nobody knows whether the
+        // message got there, and an entry that is retried is a message that is
+        // not lost, while an entry deleted on a guess is the opposite.
+        if let context = outboxReplayContext, context.gen == gen {
+            outboxReplayContext = nil
+            if userStopped {
+                outbox?.revertToPending(id: context.entryID, burnsAttempt: false)
+            } else {
+                outbox?.remove(id: context.entryID)
+            }
         }
         phase = .ready
         // Issue #37: the clean end of a run, which is exactly when the queue is
@@ -3483,6 +3930,11 @@ public final class ConversationModel {
         // own guess — so it can roll the send back.
         if phase == .waiting {
             postFailureMessage = message
+            // #38: set in the same breath as the message and under the same
+            // gate, because the outbox arm of the #9 fork asks this flag and
+            // only ever asks it alongside the message. Anywhere they could be
+            // set apart is a place a non-transient failure gets captured.
+            postFailureIsTransient = (error as? APIError)?.isTransient ?? true
             // Unblock the drain: nothing will ever arrive on this run's
             // listener now. An existing chat's listener is keyed by id, and
             // `expire(chatID:)` reaches it. A new chat's listener is the

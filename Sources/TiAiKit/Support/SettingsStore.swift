@@ -29,6 +29,13 @@ public struct AppDefaults: Codable, Equatable, Sendable {
     /// A queue the user can see and take back is honest in a way that nothing
     /// happening at all is not.
     public var queueWhileGenerating: Bool
+    /// Keep a send made with no connectivity in the durable outbox and replay it
+    /// when the network returns (issue #38). On by default: the behaviour it
+    /// replaces is the issue #9 rollback, which is honest but asks someone who
+    /// just typed a paragraph on a train to retype it once they land. A message
+    /// that says "pending, will send when you're back" is the same truth told in
+    /// the direction the user can act on.
+    public var outboxWhileOffline: Bool
     /// Voice for read-aloud. nil means "whatever the instance configured", which
     /// matters because voice names are not portable across engines — `alloy`
     /// means something to OpenAI and nothing to Edge.
@@ -36,13 +43,15 @@ public struct AppDefaults: Codable, Equatable, Sendable {
 
     public init(
         systemPrompt: String = "", temperature: Double? = nil, notifyWhenFinished: Bool = true,
-        readAloudVoice: String? = nil, queueWhileGenerating: Bool = true
+        readAloudVoice: String? = nil, queueWhileGenerating: Bool = true,
+        outboxWhileOffline: Bool = true
     ) {
         self.systemPrompt = systemPrompt
         self.temperature = temperature
         self.notifyWhenFinished = notifyWhenFinished
         self.readAloudVoice = readAloudVoice
         self.queueWhileGenerating = queueWhileGenerating
+        self.outboxWhileOffline = outboxWhileOffline
     }
 
     /// "Nothing here that the user chose." Compared against a fresh default
@@ -53,10 +62,12 @@ public struct AppDefaults: Codable, Equatable, Sendable {
             && temperature == nil && readAloudVoice == nil
             && notifyWhenFinished == AppDefaults().notifyWhenFinished
             && queueWhileGenerating == AppDefaults().queueWhileGenerating
+            && outboxWhileOffline == AppDefaults().outboxWhileOffline
     }
 
     private enum CodingKeys: String, CodingKey {
-        case systemPrompt, temperature, notifyWhenFinished, readAloudVoice, queueWhileGenerating
+        case systemPrompt, temperature, notifyWhenFinished, readAloudVoice,
+             queueWhileGenerating, outboxWhileOffline
     }
 
     /// Hand-written decode, and only because of what is already on phones.
@@ -78,6 +89,12 @@ public struct AppDefaults: Codable, Equatable, Sendable {
         queueWhileGenerating =
             try container.decodeIfPresent(Bool.self, forKey: .queueWhileGenerating)
             ?? AppDefaults().queueWhileGenerating
+        // Same `decodeIfPresent` reason as above: this key is newer than the
+        // blobs already on phones, and the synthesised decoder would throw on
+        // its absence and reset the user's prompt along with it.
+        outboxWhileOffline =
+            try container.decodeIfPresent(Bool.self, forKey: .outboxWhileOffline)
+            ?? AppDefaults().outboxWhileOffline
     }
 }
 

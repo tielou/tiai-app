@@ -102,6 +102,45 @@ public final class SessionStore {
     @ObservationIgnored private var queues: MessageQueueStore?
     @ObservationIgnored private var queuesServer: URL?
 
+    /// The per-chat offline outbox (issue #38), one store per instance.
+    ///
+    /// Same shape and same reasoning as `messageQueues()`, with one difference
+    /// that matters: this one is durable. A queued message that dies with the
+    /// app is an inconvenience; an offline send that dies with the app is a
+    /// lost message, which is the whole thing the outbox exists to prevent.
+    /// Keyed on the base URL for the same reason — messages typed against one
+    /// instance do not belong to another — and stored in the session's own
+    /// defaults rather than the shared ones, so a test on a private suite is
+    /// hermetic and a second signed-in profile cannot read the first's drafts.
+    public func outbox() -> OutboxStore {
+        if let stored = outboxStore, outboxServer == server.baseURL { return stored }
+        let box = OutboxStore(defaults: defaults, host: server.baseURL.host ?? "local")
+        self.outboxStore = box
+        outboxServer = server.baseURL
+        return box
+    }
+
+    @ObservationIgnored private var outboxStore: OutboxStore?
+    @ObservationIgnored private var outboxServer: URL?
+
+    /// Whether the phone can reach anything, shared by every screen.
+    ///
+    /// One monitor for the app rather than one per chat: it is a system-wide
+    /// question, and a monitor is a live resource. The outbox uses the
+    /// satisfied transition as the cue to try again — the case nothing else
+    /// catches is the network returning while the app sits open on the chat.
+    /// The cue is acted on by whichever chat is on screen (see
+    /// `ConversationView`); a pending message in a chat nobody has opened waits
+    /// for the moment it is opened, which is when anybody could see it go out.
+    public var reachability: Reachability {
+        if let monitor = reachabilityMonitor { return monitor }
+        let monitor = Reachability()
+        self.reachabilityMonitor = monitor
+        return monitor
+    }
+
+    @ObservationIgnored private var reachabilityMonitor: Reachability?
+
     // MARK: - connecting
 
     public func setURL(_ text: String) {
@@ -145,7 +184,9 @@ public final class SessionStore {
             serverVersion = try? await client.version().version
             lastError = nil
         } catch let error as APIError where error.isUnauthorized {
-            signOut()
+            // The token expired; the person using the app did not choose to
+            // leave. Anything they typed and could not send stays.
+            signOut(preserveOutbox: true)
         } catch {
             lastError = error.localizedDescription
         }
@@ -160,7 +201,17 @@ public final class SessionStore {
         return isSignedIn
     }
 
-    public func signOut() {
+    /// Ends the session.
+    ///
+    /// Two callers end it for two different reasons, and the outbox has to
+    /// tell them apart (issue #38). An explicit sign-out means leaving the
+    /// instance, and messages addressed to a server you have left are nobody's
+    /// — clearing them is honest. A 401 is not that: the token expired, the
+    /// app signed itself out to say so, and the message someone typed thirty
+    /// seconds ago is still a message they meant to send. Vaporising it on a
+    /// token expiry is a worse bug than keeping it for a server they never
+    /// return to, so the automatic path preserves the outbox.
+    public func signOut(preserveOutbox: Bool = false) {
         credentials.clearAll()
         server = Server(baseURL: server.baseURL)
         user = nil
@@ -168,5 +219,8 @@ public final class SessionStore {
         // left. Signed out, they are nobody's; keeping them means the next
         // sign-in opens to a strip of text addressed to a server it is not on.
         queues = nil
+        if preserveOutbox { return }
+        outboxStore?.removeAll()
+        outboxStore = nil
     }
 }

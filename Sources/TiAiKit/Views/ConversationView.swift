@@ -175,7 +175,12 @@ public struct ConversationView: View {
             // message queued and then left behind by navigating away is still
             // there when the chat is opened again, in whichever model instance
             // happens to be showing it.
-            queues: session.messageQueues())
+            queues: session.messageQueues(),
+            // Issue #38: same reasoning one step on. A message that could not
+            // leave the phone outlives this screen, this app launch, and
+            // possibly the network it was addressed to, so it lives on the
+            // session and is durable; the strip that shows it is this screen's.
+            outbox: session.outbox())
         // Something shared from another app arrives as a composed prompt. It
         // lands in the composer rather than being sent: "share to my assistant"
         // is a request to be shown, not a licence to post.
@@ -189,6 +194,37 @@ public struct ConversationView: View {
             // outlined card, and a hairline across the top of the transcript just
             // cut the screen in two for no reason.
             transcript
+            // Issue #38: the pending strip. Neutral on purpose — a clock, not a
+            // warning triangle, and no red. The message is not broken and there
+            // is nothing to fix; saying "will send when you're back" is the
+            // whole news, and a red banner about it would teach the reader that
+            // this banner means trouble when it means the opposite.
+            if let pending = conversation.pendingOutbox.first {
+                HStack(spacing: 10) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .foregroundStyle(.secondary)
+                    Text(conversation.pendingOutbox.count > 1
+                         ? "\(pending.text) — and \(conversation.pendingOutbox.count - 1) more, "
+                            + "queued to send when you're back"
+                         : "\(pending.text) — will send when you're back")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                    Spacer(minLength: 8)
+                    Button("Send now") { conversation.sendOutboxNow(id: pending.id) }
+                        .font(.footnote)
+                        .accessibilityIdentifier("outboxSendNow")
+                    Button("Cancel") { conversation.cancelOutbox(id: pending.id) }
+                        .font(.footnote)
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.red)
+                        .accessibilityIdentifier("outboxCancel")
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 6)
+                .background(.quaternary.opacity(0.5))
+                .accessibilityIdentifier("outboxPending")
+            }
             if let error = conversation.error {
                 HStack(spacing: 10) {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
@@ -414,6 +450,11 @@ public struct ConversationView: View {
                 // making the chat wait for it — or banner about it — is worse
                 // than connecting a second later.
                 conversation.resumeAfterBackground()
+                // #38: coming back to the app is the second most likely moment
+                // the network came back, and the only one for a phone that has
+                // been sitting offline in a pocket. Idempotent, so it costs a
+                // look at an empty outbox in the normal case.
+                conversation.replayOutboxIfNeeded()
                 // Coming back from a browser sign-in is the normal way this
                 // changes: the tool said "not signed in", you signed in, and
                 // the row should know that without a relaunch.
@@ -422,6 +463,14 @@ public struct ConversationView: View {
                     DiskCache.save(tools, key: DiskCache.key("tools", host: host))
                 }
             }
+        }
+        // #38: the network came back while the app was sitting right here, which
+        // is the one reconnect no foreground change and no chat-open will ever
+        // see. Only the way to satisfied counts; losing the network is not a
+        // reason to touch anything that is already running.
+        .onChange(of: session.reachability.isConnected) { _, connected in
+            guard connected else { return }
+            conversation.replayOutboxIfNeeded()
         }
     }
 

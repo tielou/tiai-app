@@ -209,6 +209,10 @@ public struct ChatListView: View {
         Task {
             do {
                 try await session.client.deleteChat(id: chat.id)
+                // #38: anything still waiting to be sent to that chat has nowhere
+                // to go now — the strip that shows it is in the chat, and the
+                // server no longer has the id to send it to.
+                session.outbox().removeAll(for: chat.id)
                 // Refetch rather than splice: the list is the server's, and a
                 // locally removed row that the server still has reappears on the
                 // next refresh looking like a bug.
