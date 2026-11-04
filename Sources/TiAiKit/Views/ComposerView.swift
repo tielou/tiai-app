@@ -408,24 +408,45 @@ struct ComposerView: View {
     #endif
 
     private var sendButton: some View {
-        Button {
-            if conversation.phase.isBusy { conversation.stop() } else { send() }
+        // The button does double duty while an answer is being written
+        // (issue #37). With nothing typed it stops the run — that is the
+        // original control and what an empty composer during a run means.
+        // With something typed it queues it: `send()` already routes a busy
+        // send into the queue, so the only thing missing was a button that
+        // offered the press instead of always stopping. The content test
+        // mirrors `send()`'s own guard so the button never offers a press
+        // that `send()` would refuse, and Stop stays one backspace away for
+        // anyone who typed a thing and changed their mind about the answer.
+        let busy = conversation.phase.isBusy
+        let hasOutgoing = !conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !conversation.attachments.isEmpty || conversation.uploading
+        // Stop is what an empty composer during a run means; it is also the
+        // fallback when queueing is switched off, so the button never offers a
+        // send that `send()` would silently refuse.
+        let isStop = busy && (!hasOutgoing || !conversation.queueEnabled)
+        // Active (filled) when the press will do something: always for Stop,
+        // for the queue-send while busy, and for a normal send when idle.
+        let active = isStop || (busy ? hasOutgoing : conversation.canSend)
+        return Button {
+            if isStop { conversation.stop() } else { send() }
         } label: {
-            Image(systemName: conversation.phase.isBusy ? "stop.fill" : "arrow.up")
+            Image(systemName: isStop ? "stop.fill" : "arrow.up")
                 .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(conversation.phase.isBusy || conversation.canSend ? .white : .secondary)
+                .foregroundStyle(active ? .white : .secondary)
                 .frame(width: 34, height: 34)
                 .background(
-                    conversation.phase.isBusy ? AnyShapeStyle(.red)
-                        : conversation.canSend ? AnyShapeStyle(.tint) : AnyShapeStyle(.quaternary),
+                    isStop ? AnyShapeStyle(.red)
+                        : active ? AnyShapeStyle(.tint) : AnyShapeStyle(.quaternary),
                     in: .circle)
         }
         .buttonStyle(.plain)
-        .disabled(!conversation.phase.isBusy && !conversation.canSend)
-        .accessibilityLabel(conversation.phase.isBusy ? "Stop" : "Send")
+        .disabled(!active)
+        .accessibilityLabel(isStop ? "Stop" : "Send")
         // The label alone is ambiguous once a chat is running: the stop control
         // carries the same word, and a UI test asking for "Send" gets two.
-        .accessibilityIdentifier(conversation.phase.isBusy ? "stopGeneration" : "sendButton")
+        // "Stop" only while the composer is empty; the moment there is text the
+        // control is a send again, so it carries the send identifier.
+        .accessibilityIdentifier(isStop ? "stopGeneration" : "sendButton")
     }
 
     /// The model, always visible, and the way into the model sheet.

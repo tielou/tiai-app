@@ -490,7 +490,11 @@ public final class ConversationModel {
     var queueWhileGeneratingOverride: Bool?
 
     /// Read at the fork, not captured: the setting is meant to be live.
-    private var queueEnabled: Bool {
+    ///
+    /// Public because the composer's send/stop button needs the same answer:
+    /// while a run is in flight it offers a queue-send only if queueing is
+    /// actually on, and falls back to Stop when it is not (issue #37).
+    public var queueEnabled: Bool {
         queueWhileGeneratingOverride ?? SettingsStore.shared.defaults.queueWhileGenerating
     }
 
