@@ -455,6 +455,10 @@ public struct ConversationView: View {
                 // been sitting offline in a pocket. Idempotent, so it costs a
                 // look at an empty outbox in the normal case.
                 conversation.replayOutboxIfNeeded()
+                // #46: same cue, the in-memory queue's turn — a follow-up that
+                // queued behind an answer and then failed offline is waiting
+                // here, not in the durable outbox, and nothing else drains it.
+                conversation.resumeQueueIfNeeded()
                 // Coming back from a browser sign-in is the normal way this
                 // changes: the tool said "not signed in", you signed in, and
                 // the row should know that without a relaunch.
@@ -471,6 +475,7 @@ public struct ConversationView: View {
         .onChange(of: session.reachability.isConnected) { _, connected in
             guard connected else { return }
             conversation.replayOutboxIfNeeded()
+            conversation.resumeQueueIfNeeded()  // #46, same reasoning
         }
     }
 

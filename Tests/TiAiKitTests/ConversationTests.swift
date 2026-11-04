@@ -4227,6 +4227,41 @@ private func makePostFailureFixture(chatID: String?) -> (
     #expect(conversation.error == error)
 }
 
+// #43: the one new-chat path that dies in the `ensureChat` catch rather than at
+// the completion POST. An incognito chat has no server chat to create — its id
+// is derived from the open socket's session id — so offline (no session) it
+// throws "Waiting for the connection to open" before any turn is appended and
+// before the POST. `beginRun` has already cleared the draft, and this catch is
+// earlier than the #9 fork, so without restoring here the first message of the
+// chat simply vanishes. (A non-incognito new chat never reaches this catch:
+// `ensureChat` makes no call for it, so its offline send fails at the POST and
+// the #9 rollback above covers it.)
+@Test @MainActor func incognitoOfflineSendRestoresTheDraft() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)   // never connected: sessionID is nil
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: nil,
+        models: [ChatModel.stub("local-personal")],
+        incognito: true,
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub)
+    #expect(hub.sessionID == nil, "precondition: no session, so ensureChat throws")
+
+    conversation.draft = "first message"
+    conversation.send()
+    try await waitUntil { conversation.phase == .ready }
+
+    #expect(conversation.draft == "first message",
+            "the failed message goes back in the composer, not into the void")
+    #expect(conversation.chatID == nil, "no phantom chat is created")
+    #expect(conversation.turns.isEmpty, "no phantom user turn")
+    #expect(transport.completionBodies.isEmpty, "nothing was posted")
+    let error = try #require(conversation.error)
+    #expect(error.contains("Could not send"), "\(error)")
+    #expect(error.contains("back in the composer"), "\(error)")
+}
+
 @Test @MainActor func rollbackFiresOnExistingChatPostFailure() async throws {
     let (conversation, transport, _) = makePostFailureFixture(chatID: "chat-1")
     transport.completionFailure = APIError.http(status: 503, message: "server is restarting")

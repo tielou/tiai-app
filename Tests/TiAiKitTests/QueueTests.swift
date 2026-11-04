@@ -532,3 +532,42 @@ private func finishRun(chat: String, message: String, hub: ChatEventHub, answer:
     let body = String(decoding: try #require(transport.completionBodies.last), as: UTF8.self)
     #expect(body.contains("queued"))
 }
+
+// MARK: - #46: the reconnect cue drains an idle in-memory queue
+
+// A queued message whose run failed while offline is put back in the in-memory
+// queue (the #9 fork's putBackInQueue), and the only thing that normally drains
+// that queue is a run ending. So a follow-up that queued behind an answer, then
+// lost the network, is left sitting in the queue with the chat idle — and on a
+// phone that comes back with the app already open, nothing ends a run to send
+// it. `resumeQueueIfNeeded` is the reconnect cue for the in-memory queue, the
+// counterpart of the durable outbox's replay.
+@Test @MainActor func resumeQueueDrainsAnIdleQueueOnReconnect() async throws {
+    let hub = ChatEventHub(server: testServer)
+    let transport = ScriptedTransport()
+    let conversation = makeQueueConversation(chatID: "chat-1", transport: transport, hub: hub)
+
+    // The state a failed-offline drain leaves behind: an item waiting in the
+    // queue while the chat is idle.
+    conversation.queue.enqueue(text: "queued while offline", attachments: [])
+    #expect(conversation.phase == .ready)
+    #expect(transport.completionBodies.isEmpty, "an idle queue does not send itself")
+
+    conversation.resumeQueueIfNeeded()
+    try await waitUntilQueue { transport.completionBodies.count == 1 }
+    #expect(conversation.queue.isEmpty, "the reconnect drain sent it")
+    let body = String(decoding: try #require(transport.completionBodies.first), as: UTF8.self)
+    #expect(body.contains("queued while offline"))
+}
+
+// The cue fires on every foreground/reconnect, so it must be inert when there is
+// nothing to do — no run, no banner, no phantom completion.
+@Test @MainActor func resumeQueueIsInertWhenNothingIsWaiting() async throws {
+    let hub = ChatEventHub(server: testServer)
+    let transport = ScriptedTransport()
+    let conversation = makeQueueConversation(chatID: "chat-1", transport: transport, hub: hub)
+    conversation.resumeQueueIfNeeded()
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(transport.completionBodies.isEmpty, "nothing waiting, nothing sent")
+    #expect(conversation.phase == .ready)
+}

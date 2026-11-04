@@ -664,6 +664,27 @@ public final class ConversationModel {
         case taken([PendingAttachment])
     }
 
+    /// #46: wake the in-memory queue when the connection or the app comes back.
+    ///
+    /// A queued message whose run failed while offline goes back to the
+    /// in-memory queue (the #9 fork's `putBackInQueue`), and the only thing
+    /// that drains that queue is a run ending — so a phone that queued a
+    /// follow-up, lost the network, and came back with the app already open
+    /// would just sit on the message until the next run. The durable outbox
+    /// gets woken by the same triggers (see `replayOutboxIfNeeded`); this is
+    /// its in-memory counterpart. `settleQueue` is a no-op unless the chat is
+    /// idle, queueing is on, and something is actually waiting, so firing it
+    /// on every reconnect/foreground is cheap and cannot double-send.
+    ///
+    /// Ordering: on a reconnect cue the queue drains before the durable outbox
+    /// replays (the view fires this first, and a queue `beginRun` is synchronous
+    /// while a replay refetches first). If both hold items the queue's may go out
+    /// ahead of an older outbox entry, which reverts to pending and waits for the
+    /// next cue. Ordering only — nothing is lost or duplicated.
+    public func resumeQueueIfNeeded() {
+        settleQueue()
+    }
+
     /// Hands the queue to a chat that has just become able to take it.
     ///
     /// Called from the places a run ends cleanly, and from nowhere else: a path
@@ -2531,7 +2552,30 @@ public final class ConversationModel {
             // `.ready` that flips the *new* run back to idle are both writes we
             // no longer own.
             guard isCurrent(gen) else { return }
-            self.error = error.localizedDescription
+            // #43: `beginRun` already cleared the draft, and this catch is a new
+            // chat's only exit when `ensureChat` itself fails — incognito with
+            // no open socket, the one case that dies here rather than at the
+            // completion POST (a non-incognito new chat makes no call here and
+            // so fails later, where the #9 rollback restores it). Put the send
+            // back the way that rollback does — no-clobber on text typed since —
+            // and say so, instead of letting the first message of a chat vanish
+            // behind a banner. No phantom chat: `ensureChat` threw, so nothing
+            // was named; the pre-send title comes back with it.
+            title = titleBeforeSend
+            titleIsPlaceholder = placeholderBeforeSend
+            var restoredDraft = false
+            var restoredAttachments = false
+            if draft.isEmpty { draft = text; restoredDraft = true }
+            if attachments.isEmpty, !files.isEmpty { attachments = files; restoredAttachments = true }
+            let message = error.localizedDescription
+            var banner = message == "Signed out." ? message : "Could not send — \(message)."
+            if restoredDraft { banner += " It's back in the composer." }
+            // Same wording as the #9 fork: if the text was *not* restored (the
+            // user re-typed during the upload await) but the files were, saying
+            // "back in the composer" would be a lie — the text is gone and only
+            // the attachments came back.
+            else if restoredAttachments { banner += " Attachments are back; re-type and send again." }
+            self.error = banner
             phase = .ready
             return
         }
