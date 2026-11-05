@@ -133,6 +133,10 @@ public struct ChatListView: View {
 
     /// When set, a "Chats" row in the list opens the whole thing full screen.
     var onExpand: (() -> Void)? = nil
+    /// #42-adjacent UI: whether the drawer is currently expanded to full
+    /// width. Only the "Chats" row's own label needs it — the row toggles,
+    /// so it must say which direction it goes.
+    var chatsExpanded: Bool = false
     /// Opens the account and defaults screen. Nil in the full-screen list, where
     /// the row would be a way to open the thing you are already looking at.
     var onOpenSettings: (() -> Void)? = nil
@@ -229,6 +233,7 @@ public struct ChatListView: View {
         session: SessionStore,
         onOpenNotes: (() -> Void)? = nil,
         onExpand: (() -> Void)? = nil,
+        chatsExpanded: Bool = false,
         onOpenSettings: (() -> Void)? = nil,
         refreshBadge: Int = 0,
         showsLibrary: Bool = true,
@@ -238,6 +243,7 @@ public struct ChatListView: View {
         self.session = session
         self.onOpenNotes = onOpenNotes
         self.onExpand = onExpand
+        self.chatsExpanded = chatsExpanded
         self.onOpenSettings = onOpenSettings
         self.refreshBadge = refreshBadge
         self.showsLibrary = showsLibrary
@@ -286,8 +292,11 @@ public struct ChatListView: View {
                             // already on.
                             if let onExpand {
                                 Button(action: onExpand) {
-                                    Label("Chats", systemImage: "bubble.left.and.bubble.right")
+                                    Label(chatsExpanded ? "Collapse" : "Chats",
+                                          systemImage: chatsExpanded
+                                            ? "sidebar.left" : "bubble.left.and.bubble.right")
                                 }
+                                .accessibilityIdentifier("chatsExpandRow")
                             }
                             if let onOpenNotes {
                                 Button(action: onOpenNotes) {
@@ -498,10 +507,18 @@ public struct ChatHomeView: View {
     /// kept showing the conversation you were already looking at.
     @State private var draft = 0
     @State private var showingChats = false
-    /// Something shown over the whole screen rather than inside the drawer: the
-    /// full chat list, or Notes. Both are things you read, and a document in a
-    /// 330-point strip is the wrong shape.
-    enum Fullscreen: String, Identifiable { case chats, notes, settings; var id: String { rawValue } }
+    /// #42-adjacent UI: the drawer's "Chats" row expands the drawer ITSELF to
+    /// full width, in place, instead of presenting a full-screen cover that
+    /// arrives from the bottom — a list that slid in from the left had no
+    /// business sliding up from below when it grew. The panel frame simply
+    /// animates from `panelWidth` to the screen width; the same list, the
+    /// same position, the same direction.
+    @State private var chatsExpanded = false
+    /// Something shown over the whole screen rather than inside the drawer:
+    /// Notes, Settings. Both are things you read, and a document in a
+    /// 330-point strip is the wrong shape. (The full chat list used to live
+    /// here too, as a bottom cover — it now expands the drawer in place.)
+    enum Fullscreen: String, Identifiable { case notes, settings; var id: String { rawValue } }
     @State private var fullscreen: Fullscreen?
     /// Bumped every time the drawer opens, so the list asks the server again.
     /// A chat started on this phone did not exist the last time it looked.
@@ -527,6 +544,9 @@ public struct ChatHomeView: View {
     private func closeChats() {
         drag = 0
         showingChats = false
+        // The expansion is a property of the open drawer, not of the app:
+        // the next open always starts as a drawer again.
+        chatsExpanded = false
     }
 
     /// Opening the drawer is the moment to re-ask: it is what you do when you
@@ -623,7 +643,13 @@ public struct ChatHomeView: View {
                     ChatListView(
                         session: session,
                         onOpenNotes: { fullscreen = .notes },
-                        onExpand: { fullscreen = .chats },
+                        // #42-adjacent UI: expand the drawer in place. The
+                        // bottom cover this used to open arrived from a
+                        // direction the drawer had never come from; now the
+                        // panel just grows to the full screen width, and the
+                        // row toggles it back down.
+                        onExpand: { chatsExpanded.toggle() },
+                        chatsExpanded: chatsExpanded,
                         onOpenSettings: { fullscreen = .settings },
                         refreshBadge: refreshBadge,
                         onDeleted: { chatWasDeleted($0) }
@@ -639,17 +665,27 @@ public struct ChatHomeView: View {
                 // that was meant to close it.
                 .opaqueBackground()
                 .shadow(color: .black.opacity(0.35), radius: 16, x: 6)
-                .frame(width: panelWidth)
+                // The expansion is a width change on the SAME panel: the list
+                // grows from the drawer's left edge to the full screen, in the
+                // direction it already lives in.
+                .frame(width: chatsExpanded ? proxy.size.width : panelWidth)
                 .offset(x: x)
                 .allowsHitTesting(showingChats)
                 // Drags shut under the finger, the way a real drawer does, and
-                // snaps back if you let go early.
+                // snaps back if you let go early. While expanded, a left drag
+                // collapses to drawer width first — closing the whole drawer
+                // from full screen in one swipe would skip the step the user
+                // just asked for by expanding.
                 .gesture(
                     DragGesture()
                         .onChanged { drag = min($0.translation.width, 0) }
                         .onEnded { value in
                             let travel = min(value.translation.width, 0)
                             drag = 0
+                            if chatsExpanded, travel < -120 {
+                                chatsExpanded = false
+                                return
+                            }
                             if travel < -panelWidth * 0.3
                                 || value.predictedEndTranslation.width < -panelWidth * 0.7 {
                                 closeChats()
@@ -663,6 +699,7 @@ public struct ChatHomeView: View {
                 #endif
             }
             .animation(.spring(response: 0.3, dampingFraction: 0.9), value: showingChats)
+            .animation(.spring(response: 0.32, dampingFraction: 0.92), value: chatsExpanded)
             .animation(.interactiveSpring(response: 0.2, dampingFraction: 0.9), value: drag)
             // Both of these are things you read, so they get the whole screen and
             // the drawer steps aside behind them.
@@ -670,19 +707,6 @@ public struct ChatHomeView: View {
                 NavigationStack {
                     Group {
                         switch which {
-                        case .chats:
-                            ChatListView(
-                                session: session,
-                                onOpenNotes: { fullscreen = .notes },
-                                refreshBadge: refreshBadge,
-                                showsLibrary: false,
-                                onDeleted: { chatWasDeleted($0) }
-                            ) { picked in
-                                chatID = picked
-                                if picked == nil { startNewChat() }
-                                fullscreen = nil
-                                closeChats()
-                            }
                         case .notes:
                             NotesView(client: session.client)
                         case .settings:

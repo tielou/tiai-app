@@ -55,6 +55,50 @@ final class ConversationUITests: XCTestCase {
         XCTAssertFalse(app.buttons["Memory"].isHittable, "drawer is still under the reader")
     }
 
+    /// The sidebar redesign: the "Chats" row expands the drawer IN PLACE to
+    /// full width (it used to open a full-screen cover that slid up from the
+    /// bottom — a direction the drawer had never come from). The row toggles,
+    /// the panel grows from its own left edge, and everything else about the
+    /// drawer still works.
+    func testDrawerChatsRowExpandsInPlace() {
+        tap("drawerToggle")
+        settle()
+        let expand = app.buttons["chatsExpandRow"]
+        XCTAssertTrue(expand.waitForExistence(timeout: 5), "drawer did not show the Chats row")
+        XCTAssertEqual(expand.label, "Chats")
+        let drawerListWidth = app.staticTexts["Recents"].frame.width
+        screenshot("drawer-panel")
+
+        expand.tap()
+        settle()
+        XCTAssertTrue(expand.waitForExistence(timeout: 5),
+                      "the Chats row must toggle in place — no bottom sheet")
+        XCTAssertEqual(expand.label, "Collapse",
+                       "the row toggles; a bottom cover arriving from below is the UI we replaced")
+        screenshot("drawer-expanded")
+        let expandedListWidth = app.staticTexts["Recents"].frame.width
+        XCTAssertTrue(expandedListWidth > app.frame.width * 0.95,
+                      "expanded panel should span the screen: \(expandedListWidth) of \(app.frame.width)")
+        XCTAssertTrue(drawerListWidth < expandedListWidth,
+                      "the drawer was \(drawerListWidth) wide before expanding")
+
+        expand.tap()
+        settle()
+        XCTAssertEqual(app.buttons["chatsExpandRow"].label, "Chats", "Collapse must toggle back")
+
+        // And the drawer still closes normally afterwards.
+        tap("drawerToggle")
+        settle()
+        XCTAssertFalse(app.buttons["Memory"].isHittable, "drawer is still under the reader")
+    }
+
+    private func screenshot(_ name: String) {
+        // NSTemporaryDirectory, not /tmp: the app sandbox has its own tmp and
+        // the device's is not writable from inside the app (sim-test lesson).
+        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("\(name).png")
+        try? XCUIScreen.main.screenshot().pngRepresentation.write(to: url)
+    }
+
     func testModelSheetOpensAndDismisses() {
         tap("modelChip")
         XCTAssertTrue(app.navigationBars["Select model"].waitForExistence(timeout: 5))
