@@ -39,12 +39,33 @@ final class FindModel {
 
     private var lastTurns: [Turn] = []
     private var recomputeTask: Task<Void, Never>?
+    /// Wall-clock time of the last actual pass, for the max-wait below.
+    private var lastRecompute = Date.distantPast
+    /// The debounce alone starves during fast streaming: deltas faster than
+    /// the debounce each cancel the pending task, so the count only refreshes
+    /// at a pause. Past this age the next call fires immediately instead of
+    /// scheduling — a leading-edge throttle, so the count is never more than
+    /// this stale while tokens are pouring in.
+    private static let maxRecomputeWait = TimeInterval(0.25)
+    /// Turn IDs that hold at least one hit. `mark(for:)` is called per row per
+    /// body pass; scanning `occurrences` there would be O(rows x hits) per
+    /// streaming delta, so the set is rebuilt once per recompute instead.
+    private var turnIDsWithHits: Set<String> = []
 
     /// Recompute is debounced: every keystroke reparses nothing on its own, and
     /// a streaming delta re-fires it at the delta rate otherwise.
     func recompute(turns: [Turn]) {
+        // With find closed there is nothing to count, and without this guard
+        // every streaming delta would spawn a Task and retain a transcript
+        // copy for a bar nobody is looking at. The `onAppear` seed in `FindBar`
+        // covers activation: the bar only exists while active.
+        guard isActive else { return }
         lastTurns = turns
         recomputeTask?.cancel()
+        if Date().timeIntervalSince(lastRecompute) >= Self.maxRecomputeWait {
+            performRecompute()
+            return
+        }
         recomputeTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(120))
             guard !Task.isCancelled else { return }
@@ -64,8 +85,9 @@ final class FindModel {
     /// turn has a hit. Read from `MessageRow`'s construction site, which makes
     /// the row observe `occurrences`/`current` through the screen's body.
     func mark(for turn: Turn) -> FindMark? {
-        guard isActive, !occurrences.isEmpty,
-              occurrences.contains(where: { $0.turnID == turn.id }) else { return nil }
+        // One set lookup per row, not a scan of every hit; the set is rebuilt
+        // once per recompute.
+        guard isActive, turnIDsWithHits.contains(turn.id) else { return nil }
         let hit = current.flatMap { index -> FindInChat.Occurrence? in
             guard occurrences.indices.contains(index), occurrences[index].turnID == turn.id
             else { return nil }
@@ -99,8 +121,10 @@ final class FindModel {
     /// yank the view. `current` is clamped so it cannot dangle past the end of
     /// a shrunk list, and goes nil only when there is nothing left to point at.
     private func performRecompute() {
+        lastRecompute = Date()
         foldedNeedle = FindInChat.fold(query)
         occurrences = FindInChat.find(query: query, turns: lastTurns)
+        turnIDsWithHits = Set(occurrences.map(\.turnID))
         if let index = current {
             current = occurrences.isEmpty ? nil : min(index, occurrences.count - 1)
         }
@@ -110,6 +134,7 @@ final class FindModel {
         recomputeTask?.cancel()
         query = ""
         occurrences = []
+        turnIDsWithHits = []
         current = nil
         scrollTarget = nil
         foldedNeedle = ""

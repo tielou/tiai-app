@@ -116,13 +116,20 @@ enum FindInChat {
     ///   which have no way to paint a highlight, so counting a hit the reader
     ///   cannot be shown would make the count lie.
     ///
-    /// Prose is folded down to what the reader actually sees by stripping
-    /// inline markdown with the SAME engine the renderer uses —
-    /// `MarkdownInline.parse(...).string`, the parser behind
-    /// `AnswerText.line(_:font:color:)` in SelectableAnswer.swift and the
-    /// blocks built in AnswerRender/CodeBlockView (see the cross-references
-    /// there). Consequence: "bold" finds `**bold**`, but "**bold**" itself
-    /// does not, because the asterisks never reach the screen.
+    /// Prose is reduced to what the reader actually sees through
+    /// `AnswerPlainText.plainText` — the SAME pipeline `AnswerText.attributed`
+    /// renders with (TextSanitizer.clean -> `Markdown.blocks` -> per-block
+    /// displayed string with the RENDERED markers "•  ", "1.  ", "☑  " ->
+    /// joined by one newline). This is deliberate, not a mirror: the segment
+    /// SOURCE joins blocks with "\n\n" and keeps source markers ("## ", "- "),
+    /// so searching the source would make `Occurrence.offset` address a
+    /// different string than the one `applyFindHighlight` paints, and the
+    /// current-hit marker would drift or land on the wrong hit after any
+    /// heading, list or paragraph break. With one pipeline, the occurrence
+    /// offsets and the highlight target are the same string BY CONSTRUCTION
+    /// (issue #50 review; pinned by FindInChatTests). Consequence of the
+    /// inline strip: "bold" finds `**bold**`, but "**bold**" itself does not,
+    /// because the asterisks never reach the screen.
     ///
     /// Non-prose segments map to the empty string rather than being dropped, so
     /// `segment` indexes the same `AnswerSegment` array the row's `ForEach`
@@ -136,15 +143,7 @@ enum FindInChat {
         if turn.isUser { return [turn.text] }
         return AnswerRender.parse(turn.text, cacheable: !turn.streaming).segments.map { segment in
             guard case .prose(let text) = segment else { return "" }
-            // Best effort, like the highlight itself: AnswerText re-splits
-            // the prose into blocks and joins them with one newline where
-            // the segment joins with two, so a needle spanning a paragraph
-            // break can count differently between bar and text. A needle
-            // that spans a paragraph break is not a find anyone types.
-            // `String(...characters)` rather than `.string`: the CLT SDK this
-            // package builds against will not resolve `AttributedString.string`
-            // — the same reason FlankingRepair spells it out.
-            return String(MarkdownInline.parse(text).characters)
+            return AnswerPlainText.plainText(text)
         }
     }
 

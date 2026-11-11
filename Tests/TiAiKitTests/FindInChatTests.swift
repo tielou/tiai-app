@@ -132,6 +132,69 @@ private func hitCount(_ query: String, in text: String) -> Int {
     #expect(FindInChat.find(query: "**bold**", turns: [turn]).isEmpty)
 }
 
+@Test @MainActor func displayTextIsTheRenderedTextForMultiBlockSegments() {
+    // Regression fence for the issue #50 review finding: the segment SOURCE
+    // (MarkdownBlockView.source joined with "\n\n") keeps the markers
+    // ("## ", "- ", "1. ", "- [x] ") and double newlines, while the renderer
+    // draws blocks WITHOUT source markers, with DIFFERENT markers ("•  ",
+    // "1.  ", "☑  ") joined by ONE newline. Searching the source made the
+    // current-hit offsets drift after any heading or list. displayText must
+    // therefore be the output of the shared `AnswerPlainText` pipeline — the
+    // string `AnswerText.attributed` draws — and occurrence offsets must
+    // address THAT string.
+    let markdown = """
+    ## Heading one
+
+    First paragraph with needle.
+
+    - bullet one
+    - needle bullet
+
+    1. first
+    2. second with needle
+
+    - [x] done item
+    - [ ] open needle item
+
+    Last paragraph with needle.
+    """
+    let turn = makeTurn("a", "assistant", markdown)
+    let segments = FindInChat.displayText(turn: turn)
+    #expect(segments.count == 1)  // one prose run, no code/table break
+    let text = segments[0]
+
+    // Pipeline identity: what find searches IS what the plain-text pipeline
+    // (and through it `AnswerText.attributed`) renders.
+    #expect(text == AnswerPlainText.plainText(markdown))
+
+    // And what that rendered text actually is: no source markers, the
+    // RENDERED markers, one newline between blocks (paragraph spacing is a
+    // paragraph style, not blank lines).
+    #expect(text == """
+    Heading one
+    First paragraph with needle.
+    •  bullet one
+    •  needle bullet
+    1.  first
+    2.  second with needle
+    ☑  done item
+    ☐  open needle item
+    Last paragraph with needle.
+    """)
+
+    // The consequence that mattered: every hit's offset addresses the
+    // rendered string, so the orange current marker lands on a real "needle"
+    // rather than drifting after the heading/list.
+    let found = FindInChat.find(query: "needle", turns: [turn])
+    #expect(found.count == 5)
+    for occurrence in found {
+        let slice = (text as NSString).substring(
+            with: NSRange(location: occurrence.offset, length: "needle".utf16.count))
+        #expect(slice.lowercased() == "needle",
+                "offset \(occurrence.offset) does not address a 'needle' in the rendered text")
+    }
+}
+
 @Test @MainActor func streamingGrowthIsCountedLive() {
     // The prefix that has not reached the word yet counts zero, the completed
     // word counts one — the bar's count tracks the answer as it arrives.

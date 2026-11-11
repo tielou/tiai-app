@@ -658,8 +658,12 @@ public struct ConversationView: View {
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(BottomAnchor.id, anchor: .bottom) }
             }
             .onChange(of: conversation.turns.count) { _, _ in
-                guard !interacting, !find.isActive else { return }
+                // A new turn always lands at the bottom, so the transcript is
+                // at the bottom again — find open or not. Only the SCROLL is
+                // suppressed while find is active; gating the flag too would
+                // leave auto-follow dead for streaming after find closes.
                 atBottom = true
+                guard !interacting, !find.isActive else { return }
                 proxy.scrollTo(BottomAnchor.id, anchor: .bottom)
             }
             .onChange(of: conversation.phase.isBusy) { _, busy in
@@ -771,11 +775,11 @@ public struct ConversationView: View {
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
-            // Only once there is something to export: on an empty chat the button
-            // would produce a file with a heading and nothing in it.
+            // Only once there is something to act on: on an empty chat export
+            // would produce a file with a heading and nothing in it, and
+            // searching an empty transcript is searching nothing.
             if !conversation.turns.isEmpty {
-                // Issue #50: find. Same emptiness rule as export — searching an
-                // empty transcript is searching nothing.
+                // Issue #50: find.
                 Button {
                     if find.isActive {
                         find.close()
@@ -786,8 +790,7 @@ public struct ConversationView: View {
                     Label(find.isActive ? "Close find" : "Find in chat", systemImage: "magnifyingglass")
                 }
                 .accessibilityIdentifier("findToggle")
-            }
-            if !conversation.turns.isEmpty {
+
                 Button(action: exportTranscript) {
                     Label("Export as Markdown", systemImage: "square.and.arrow.up")
                 }

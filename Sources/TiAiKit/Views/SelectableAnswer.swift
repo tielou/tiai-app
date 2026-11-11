@@ -76,8 +76,18 @@ struct SelectableAnswer: UIViewRepresentable {
         context.coordinator.lastFindQuery = findQuery
         context.coordinator.lastFindCurrent = findCurrent
         let attr = NSMutableAttributedString(attributedString: AnswerText.attributed(markdown))
+        // Undo only the backgrounds a previous pass added, never a global
+        // removeAttribute(.backgroundColor) — that would silently strip any
+        // background the renderer itself adds (inline code, future styles).
+        for range in context.coordinator.findHighlightRanges
+        where NSMaxRange(range) <= attr.length {
+            attr.removeAttribute(.backgroundColor, range: range)
+        }
         if !findQuery.isEmpty {
-            SelectableAnswer.applyFindHighlight(attr, query: findQuery, current: findCurrent)
+            context.coordinator.findHighlightRanges =
+                SelectableAnswer.applyFindHighlight(attr, query: findQuery, current: findCurrent)
+        } else {
+            context.coordinator.findHighlightRanges = []
         }
         view.attributedText = attr
         context.coordinator.invalidateIntrinsic()
@@ -85,22 +95,27 @@ struct SelectableAnswer: UIViewRepresentable {
 
     /// Paint the hits. Same `FindInChat.occurrences` the count uses, run over
     /// the attributed string's own text, so the offsets address what is drawn.
-    /// Best effort on `current`: its offset was computed on the segment's
-    /// display text, which can drift a newline apart from this string on
-    /// multi-block segments — a current that fails to match falls back to
-    /// the plain yellow, which is a colour difference, not a wrong location.
+    /// The `current` offset was computed on the segment's display text, which
+    /// is the SAME string as `attr.string` by construction — both go through
+    /// `AnswerPlainText` (issue #50 review), so the current hit matches here
+    /// rather than "best effort". Returns the ranges it painted so the caller
+    /// can undo exactly those on the next pass.
+    @discardableResult
     static func applyFindHighlight(
         _ attr: NSMutableAttributedString, query: String, current: Int?
-    ) {
-        attr.removeAttribute(.backgroundColor, range: NSRange(location: 0, length: attr.length))
+    ) -> [NSRange] {
+        var painted: [NSRange] = []
         for hit in FindInChat.occurrences(ofFolded: query, in: attr.string) {
             let isCurrent = current != nil && hit.location == current
+            let range = NSRange(location: hit.location, length: hit.length)
             attr.addAttribute(
                 .backgroundColor,
                 value: isCurrent ? UIColor.systemOrange
                                  : UIColor.systemYellow.withAlphaComponent(0.35),
-                range: NSRange(location: hit.location, length: hit.length))
+                range: range)
+            painted.append(range)
         }
+        return painted
     }
 
     func sizeThatFits(
@@ -117,6 +132,10 @@ struct SelectableAnswer: UIViewRepresentable {
         var lastMarkdown: String?
         var lastFindQuery: String?
         var lastFindCurrent: Int?
+        /// The background ranges the last find pass painted, so the next pass
+        /// undoes exactly those instead of wiping every background in the
+        /// string.
+        var findHighlightRanges: [NSRange] = []
         private weak var view: UITextView?
 
         init(onLink: ((URL) -> Void)?) { self.onLink = onLink }
@@ -209,9 +228,10 @@ final class AnswerTextView: UITextView {
 /// Markdown to one `NSAttributedString`, with the block structure expressed as
 /// fonts, indents and spacing instead of as view nesting.
 ///
-/// Cross-reference: `FindInChat.displayText` mirrors this pipeline (same
-/// `Markdown.blocks` + `MarkdownInline` chain) so the find count matches what
-/// is drawn here; change one, check the other (issue #50).
+/// The VISIBLE TEXT of every block comes from `AnswerPlainText` — the same
+/// pipeline `FindInChat.displayText` searches, so the find count and the
+/// highlight offsets address exactly what is drawn here (issue #50). This
+/// type only decides styling.
 enum AnswerText {
     static func attributed(_ markdown: String) -> NSAttributedString {
         let blocks = Markdown.blocks(TextSanitizer.clean(markdown))
@@ -224,43 +244,39 @@ enum AnswerText {
     }
 
     private static func render(_ block: MarkdownBlock) -> NSAttributedString {
+        // Styling only; the text itself is `AnswerPlainText`'s decision.
         switch block {
-        case let .prose(text):
-            return line(text, font: .body, color: .label)
-        case let .heading(level, text):
+        case .prose:
+            return line(block, font: .body, color: .label)
+        case let .heading(level, _):
             let font: UIFont
             switch level {
             case 1: font = UIFont.preferredFont(forTextStyle: .title2).bolded
             case 2: font = UIFont.preferredFont(forTextStyle: .title3).bolded
             default: font = UIFont.preferredFont(forTextStyle: .headline)
             }
-            let result = line(text, font: font, color: .label)
+            let result = line(block, font: font, color: .label)
             // A heading with no air above it reads as a very loud sentence.
             result.addAttribute(.paragraphStyle, value: paragraph(spacingBefore: 10), range: whole(result))
             return result
-        case .bullet(let text):
-            return marker("•  ", text, color: .secondaryLabel)
-        case let .numbered(index, text):
-            return marker("\(index).  ", text, color: .secondaryLabel)
-        case .quote(let text):
+        case .bullet:
+            return marked(block, color: .secondaryLabel)
+        case .numbered:
+            return marked(block, color: .secondaryLabel)
+        case .quote:
             // A quote rule is not available on a text view's paragraph style, so
             // the indent does the work and the dimmer colour says the rest.
-            let result = line(text, font: .body, color: .secondaryLabel)
+            let result = line(block, font: .body, color: .secondaryLabel)
             result.addAttribute(
                 .paragraphStyle, value: paragraph(indent: 14, firstLineIndent: -14),
                 range: whole(result))
             return result
         case .rule:
-            return line("―――――――", font: .body, color: .tertiaryLabel)
-        case let .task(done, text):
-            return marker(done ? "☑  " : "☐  ", text, color: .label)
-        case let .table(headers, rows):
-            // A text view has no grid, so the table keeps its shape as aligned
-            // columns rather than collapsing into a sentence with pipes in it.
-            var lines: [String] = []
-            if !headers.isEmpty { lines.append(headers.joined(separator: "  ·  ")) }
-            for row in rows { lines.append(row.joined(separator: "  ·  ")) }
-            let result = line(lines.joined(separator: "\n"), font: .body, color: .label)
+            return line(block, font: .body, color: .tertiaryLabel)
+        case .task:
+            return marked(block, color: .label)
+        case .table:
+            let result = line(block, font: .body, color: .label)
             result.addAttribute(
                 .paragraphStyle, value: paragraph(indent: 10, firstLineIndent: 0), range: whole(result))
             return result
@@ -278,13 +294,21 @@ enum AnswerText {
     }
 
     /// A bullet or number hanging in the left margin, with the text wrapping back
-    /// to the marker rather than under it.
-    private static func marker(_ mark: String, _ text: String, color: UIColor) -> NSAttributedString {
+    /// to the marker rather than under it. The marker string itself comes from
+    /// `AnswerPlainText`, so find searches exactly what is painted.
+    private static func marked(_ block: MarkdownBlock, color: UIColor) -> NSAttributedString {
         let out = NSMutableAttributedString(
-            string: mark, attributes: [.font: UIFont.preferredFont(forTextStyle: .body), .foregroundColor: color])
-        out.append(line(text, font: .body, color: .label))
+            string: AnswerPlainText.marker(for: block),
+            attributes: [.font: UIFont.preferredFont(forTextStyle: .body), .foregroundColor: color])
+        out.append(line(block, font: .body, color: .label))
         out.addAttribute(.paragraphStyle, value: paragraph(indent: 18, firstLineIndent: -18), range: whole(out))
         return out
+    }
+
+    /// One block's rendered text, inline layer applied — the block's
+    /// `AnswerPlainText` inline source, never its markdown source.
+    private static func line(_ block: MarkdownBlock, font: UIFont, color: UIColor) -> NSMutableAttributedString {
+        line(AnswerPlainText.inlineSource(for: block) ?? "", font: font, color: color)
     }
 
     /// One block's text, with inline markdown (`**bold**`, `_italic_`, links)
