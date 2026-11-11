@@ -21,6 +21,14 @@ public struct ConversationView: View {
     /// second answer while the first is speaking should take the voice, not talk
     /// over it, and the audio session belongs to the app rather than a row.
     @State private var speech: SpeechPlayer
+    #if os(iOS)
+    /// Hands-free mode (issue #49). The recorder is shared with the composer's
+    /// dictation — one microphone means one `AVAudioRecorder` — and the
+    /// controller owns the loop for this screen, so leaving the screen stops
+    /// the loop rather than leaving the mic lit behind the navigation stack.
+    @State private var voiceRecorder = VoiceRecorder()
+    @State private var voiceMode: VoiceModeController?
+    #endif
     /// How far past the end of the content the reader has dragged, as a negative
     /// number. Zero whenever there is still content below the fold.
     @State private var overscroll: CGFloat = 0
@@ -190,6 +198,17 @@ public struct ConversationView: View {
         // is a request to be shown, not a licence to post.
         model.draft = initialDraft
         _conversation = State(initialValue: model)
+        #if os(iOS)
+        // One mic for both dictation and hands-free: the composer gets the
+        // very recorder the loop drives, and the loop gets the very player the
+        // read-aloud button uses — one voice setting, one audio queue.
+        let recorder = VoiceRecorder()
+        _voiceRecorder = State(initialValue: recorder)
+        _voiceMode = State(initialValue: VoiceModeController(
+            conversation: model,
+            recorder: VoiceRecorderCapture(recorder: recorder),
+            speaker: SpeechPlayerSpeaker(player: player)))
+        #endif
     }
 
     public var body: some View {
@@ -300,13 +319,26 @@ public struct ConversationView: View {
                 .background(.red.opacity(0.08))
             }
             SpeechErrorBanner(speech: speech)
+            #if os(iOS)
+            if let voiceMode {
+                VoiceModeBar(controller: voiceMode)
+            }
+            #endif
+            #if os(iOS)
             ComposerView(
                 conversation: conversation, models: models,
                 chatTools: chatTools, chatToolsError: chatToolsError,
-                onAuthorize: { url, done in
-                    authFinished = done
-                    authorizing = AuthorizeRequest(url: url)
-                })
+                onAuthorize: authorize,
+                voice: voiceRecorder,
+                // Voice mode owns the mic while it runs; the dictation button
+                // hides so no second recorder races the loop (issue #49).
+                voiceModeActive: voiceMode?.phase != nil && voiceMode?.phase != .off)
+            #else
+            ComposerView(
+                conversation: conversation, models: models,
+                chatTools: chatTools, chatToolsError: chatToolsError,
+                onAuthorize: authorize)
+            #endif
         }
         // A chat that is not being saved has to say so where you are looking,
         // not only in a sheet you set once at the start and never opened again.
@@ -338,6 +370,12 @@ public struct ConversationView: View {
         }
         #endif
         .toolbar { toolbar }
+        #if os(iOS)
+        // Navigating away mid-answer must not leave the loop recording into a
+        // dead screen — the mic would stay lit with nothing on screen to stop
+        // it (issue #49).
+        .onDisappear { voiceMode?.stop() }
+        #endif
         .task {
             #if DEBUG
             // Diagnostics: `TIAI_DUMP_CHAT=<id>` reads one chat record into the
@@ -725,6 +763,11 @@ public struct ConversationView: View {
         }
     }
 
+    private func authorize(_ url: URL, _ done: @escaping (Bool) -> Void) {
+        authFinished = done
+        authorizing = AuthorizeRequest(url: url)
+    }
+
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
@@ -750,6 +793,20 @@ public struct ConversationView: View {
                 }
                 .accessibilityIdentifier("exportChat")
             }
+            #if os(iOS)
+            if let voiceMode {
+                // Hands-free (issue #49): one tap starts the loop, and the
+                // same tap while it runs ends it — the bar carries the finer
+                // controls once it is on screen.
+                Button { voiceMode.toggle() } label: {
+                    Label(
+                        voiceMode.phase == .off ? "Voice mode" : "Exit voice mode",
+                        systemImage: voiceMode.phase == .off
+                            ? "mic.circle.fill" : "mic.off.circle.fill")
+                }
+                .accessibilityIdentifier("voiceModeToggle")
+            }
+            #endif
             if let onNewChat {
                 Button(action: onNewChat) {
                     Label("New chat", systemImage: "square.and.pencil")

@@ -39,7 +39,15 @@ struct ComposerView: View {
     @State private var showingFiles = false
     @State private var cameraRequest = false
     #if os(iOS)
-    @State private var voice = VoiceRecorder()
+    /// The mic. Injected from `ConversationView` so hands-free mode and
+    /// dictation share ONE `VoiceRecorder` (issue #49) — two recorders cannot
+    /// hold the microphone at once, and a private `@State` here meant voice
+    /// mode was always racing a second one. The default keeps the memberwise
+    /// init call sites (and macOS) compiling unchanged.
+    var voice = VoiceRecorder()
+    /// True while the voice-mode loop owns the microphone; the dictation mic
+    /// hides so no second recording path can race it.
+    var voiceModeActive = false
     @State private var pressStart: Date? = nil
     @State private var startedByPress = false
     #endif
@@ -104,7 +112,10 @@ struct ComposerView: View {
                 Spacer(minLength: 4)
                 if conversation.uploading { ProgressView().controlSize(.small) }
                 #if os(iOS)
-                micControls
+                // Voice mode owns the mic while it runs; a dictation button
+                // next to it would be a second recorder pressing on the same
+                // hardware (and a second way to start what is already started).
+                if !voiceModeActive { micControls }
                 #endif
                 sendButton
             }

@@ -1693,7 +1693,14 @@ public final class ConversationModel {
         #endif
     }
 
-    public func send() {
+    /// Sends the composer. Returns whether the message was accepted; false
+    /// means a refusal (loud refusals also set `error`). The value exists for
+    /// issue #49 — a voice loop that auto-sends needs to tell "queued" and
+    /// "running" from "refused" without reading the phase back — and
+    /// `@discardableResult` keeps every existing fire-and-forget caller
+    /// compiling untouched.
+    @discardableResult
+    public func send() -> Bool {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         // `uploading` counts as content. A picture that is still on the wire is
         // not an absent picture, and refusing to send until it lands is better
@@ -1704,7 +1711,7 @@ public final class ConversationModel {
         // the same reason (`canSend`); this is the same gate for every other
         // caller. Silent, because there is nothing wrong to report — the chat is
         // simply not ready yet.
-        guard !(text.isEmpty && attachments.isEmpty && !uploading) else { return }
+        guard !(text.isEmpty && attachments.isEmpty && !uploading) else { return false }
         // Issue #37: a chat that is busy is no longer a chat that cannot take a
         // message. The content guard above comes first on purpose — an empty
         // press is still nothing at all, busy or not — and everything the send
@@ -1712,18 +1719,18 @@ public final class ConversationModel {
         // later, with the guards re-run against the model of the moment.
         if phase.isBusy, queueEnabled {
             enqueueWhileGenerating(text: text)
-            return
+            return true
         }
         // ...and with the feature off, a busy chat refuses exactly as it always
         // did: silently, with the draft left where it was.
-        guard !phase.isBusy, phase != .loading else { return }
+        guard !phase.isBusy, phase != .loading else { return false }
         // Refused before anything is touched: the draft and the attachments are
         // still in the composer because nothing has been consumed, and the
         // phase never left `.ready`. Deliberately here rather than in
         // `exchange`, which runs after the draft is cleared.
         if let refusal = imageLimitMessage(outgoing: attachments) {
             error = refusal
-            return
+            return false
         }
         // A model that has *said* — capabilities present and `vision: false` —
         // that it cannot see images must not be handed a picture to drop.
@@ -1735,9 +1742,10 @@ public final class ConversationModel {
         if !modelSupportsVision,
            attachments.contains(where: \.isImage) || uploadsInFlightImages > 0 {
             error = "\(model) can't see images — remove the picture or pick a vision model."
-            return
+            return false
         }
         beginRun(text: text, fileSource: .composer)
+        return true
     }
 
     /// Puts a message pressed while a run is in flight into the chat's queue
