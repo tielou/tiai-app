@@ -41,6 +41,10 @@ public struct ConversationView: View {
 
     /// Sandbox files: which one is downloading, which failed, and the one handed
     /// to the share sheet.
+    /// Find in chat (issue #50). Its own observable rather than part of the
+    /// conversation model: nothing about a find is persisted or server-side.
+    @State private var find = FindModel()
+
     @State private var busyFile: String?
     @State private var failedFile: String?
     @State private var shareFile: SharedFile?
@@ -194,6 +198,12 @@ public struct ConversationView: View {
             // outlined card, and a hairline across the top of the transcript just
             // cut the screen in two for no reason.
             transcript
+            // Issue #50: find lives under the transcript, where the banner strip
+            // already lives, and above it in z-order of attention: you are
+            // looking for something in what is on screen.
+            if find.isActive {
+                FindBar(find: find, turns: conversation.turns)
+            }
             // Issue #38: the pending strip. Neutral on purpose — a clock, not a
             // warning triangle, and no red. The message is not broken and there
             // is nothing to fix; saying "will send when you're back" is the
@@ -535,7 +545,8 @@ public struct ConversationView: View {
                             onOpenFile: openTerminalFile,
                             onOpenLink: openFileLink,
                             fileBusy: busyFile,
-                            fileFailed: failedFile
+                            fileFailed: failedFile,
+                            findMark: find.mark(for: turn)
                         )
                             .equatable()
                             .id(turn.id)
@@ -596,13 +607,20 @@ public struct ConversationView: View {
                     proxy.scrollTo(BottomAnchor.id, anchor: .bottom)
                 }
             }
+            // Issue #50: while find is active the reader is looking at a match,
+            // not at the end of the chat, so every auto-scroll below is gated on
+            // !find.isActive — streaming must not yank them off their match.
+            // (The overlay scroll-to-bottom button has no such guard because
+            // pressing it IS the reader deciding to go to the bottom; the find
+            // scroll below deliberately bypasses atBottom/interacting for the
+            // same reason: it is an explicit request.)
             .onChange(of: conversation.turns.last?.text) { _, _ in
-                guard atBottom, !interacting else { return }
+                guard atBottom, !interacting, !find.isActive else { return }
                 // After layout, not during it — see defaultScrollAnchor above.
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(BottomAnchor.id, anchor: .bottom) }
             }
             .onChange(of: conversation.turns.count) { _, _ in
-                guard !interacting else { return }
+                guard !interacting, !find.isActive else { return }
                 atBottom = true
                 proxy.scrollTo(BottomAnchor.id, anchor: .bottom)
             }
@@ -612,11 +630,26 @@ public struct ConversationView: View {
                 // When the run ends, settle once more after layout has finished.
                 // (Observed as a Bool: `onChange(of: conversation.phase)` inside
                 // a ScrollView resolves to a scroll-phase overload and fails.)
-                guard !busy, atBottom else { return }
+                guard !busy, atBottom, !find.isActive else { return }
                 Task { @MainActor in
                     try? await Task.sleep(for: .milliseconds(150))
                     proxy.scrollTo(BottomAnchor.id, anchor: .bottom)
                 }
+            }
+            .onChange(of: find.scrollTarget?.nonce) { _, _ in
+                // Jumping to a match is an explicit request: unlike the
+                // streaming follows above, this ignores atBottom and
+                // interacting on purpose — same as the overlay button.
+                guard let target = find.scrollTarget else { return }
+                withAnimation(.easeOut(duration: 0.2)) {
+                    proxy.scrollTo(target.turnID, anchor: .center)
+                }
+            }
+            .onChange(of: conversation.turns) { _, turns in
+                // Live count: a streaming answer re-counts (debounced) as it
+                // grows, which is also what keeps code fences restructured
+                // mid-stream instead of half-searched.
+                find.recompute(turns: turns)
             }
             .overlay(alignment: .bottom) {
                 // Scrolled up to re-read something, there is no obvious way back:
@@ -697,6 +730,20 @@ public struct ConversationView: View {
         ToolbarItemGroup(placement: .primaryAction) {
             // Only once there is something to export: on an empty chat the button
             // would produce a file with a heading and nothing in it.
+            if !conversation.turns.isEmpty {
+                // Issue #50: find. Same emptiness rule as export — searching an
+                // empty transcript is searching nothing.
+                Button {
+                    if find.isActive {
+                        find.close()
+                    } else {
+                        find.isActive = true
+                    }
+                } label: {
+                    Label(find.isActive ? "Close find" : "Find in chat", systemImage: "magnifyingglass")
+                }
+                .accessibilityIdentifier("findToggle")
+            }
             if !conversation.turns.isEmpty {
                 Button(action: exportTranscript) {
                     Label("Export as Markdown", systemImage: "square.and.arrow.up")

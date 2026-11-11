@@ -25,6 +25,11 @@ enum AnswerSegment: Identifiable {
 
     /// Consecutive prose blocks stay in one run so selection still crosses from a
     /// paragraph into a list; only code and tables break the run.
+    ///
+    /// Cross-reference: `FindInChat.displayText` maps these segments 1:1 (same
+    /// indices) to searchable text — code and tables become empty strings there,
+    /// never dropped, because MessageRow matches `Occurrence.segment` against
+    /// this array's index (issue #50).
     static func segments(_ blocks: [MarkdownBlock]) -> [AnswerSegment] {
         var out: [AnswerSegment] = []
         var prose: [String] = []

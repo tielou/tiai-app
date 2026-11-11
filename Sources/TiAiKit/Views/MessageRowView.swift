@@ -97,6 +97,17 @@ struct MessageRow: View {
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 9)
                                 .background(.tint.opacity(0.18), in: .rect(cornerRadius: 14))
+                                // Issue #50: user rows are a plain `Text`, not
+                                // a SelectableAnswer, so there is no attributed
+                                // string to paint inside — the mark is the
+                                // row-level stroke instead. Documented v1
+                                // trade: you still land on the right bubble.
+                                .overlay {
+                                    if findMark?.isCurrentTurn == true {
+                                        RoundedRectangle(cornerRadius: 14)
+                                            .stroke(Color.yellow.opacity(0.7), lineWidth: 1.5)
+                                    }
+                                }
                         }
                     }
                 }
@@ -131,10 +142,19 @@ struct MessageRow: View {
                 // tables are pulled out and given horizontal scroll: an ASCII
                 // diagram is layout, and wrapping it at the edge of the screen
                 // turns the box drawing into confetti.
-                ForEach(segments) { segment in
+                //
+                // Enumerated because find (issue #50) addresses hits by segment
+                // index, and `FindInChat.displayText` keeps the non-searchable
+                // segments in its array so these indices agree.
+                ForEach(Array(segments.enumerated()), id: \.element.id) { idx, segment in
                     switch segment {
                     case .prose(let text):
-                        SelectableAnswer(markdown: text)
+                        SelectableAnswer(
+                            markdown: text,
+                            findQuery: findMark?.query ?? "",
+                            findCurrent: findMark.flatMap {
+                                $0.currentSegment == idx ? $0.currentOffset : nil
+                            })
                             .accessibilityIdentifier("answerText")
                     case let .code(language, code):
                         ScrollableCodeBlock(code: code, language: language) {
@@ -151,8 +171,17 @@ struct MessageRow: View {
                     }
                 }
                 #else
+                // macOS has no SelectableAnswer, so find (issue #50) is
+                // row-level only here: the stroke below marks the turn that
+                // holds the current hit, without an in-text highlight.
                 ForEach(Array(Markdown.blocks(TextSanitizer.clean(renderedText)).enumerated()), id: \.offset) { _, block in
                     MarkdownBlockView(block: block, streaming: turn.streaming)
+                }
+                .overlay {
+                    if findMark?.isCurrentTurn == true {
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.yellow.opacity(0.7), lineWidth: 1.5)
+                    }
                 }
                 .accessibilityIdentifier("answerText")
                 #endif
@@ -183,6 +212,12 @@ struct MessageRow: View {
                 footer
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            // Issue #50: the in-text highlight is the primary mark for an
+            // answer; this wash is the "this is the one" cue around it, kept
+            // subtle on purpose — a full stroke around a whole answer is loud.
+            .background(
+                findMark?.isCurrentTurn == true ? Color.yellow.opacity(0.08) : .clear,
+                in: RoundedRectangle(cornerRadius: 8))
         }
     }
 
@@ -221,6 +256,10 @@ struct MessageRow: View {
     /// because the screen is the one doing the fetching.
     var fileBusy: String? = nil
     var fileFailed: String? = nil
+    /// Find-in-chat highlight for this row (issue #50). Nil unless find is
+    /// active and this turn has a hit; computed by the screen via
+    /// `FindModel.mark(for:)`.
+    var findMark: FindMark? = nil
 
     /// Thinking is collapsed by default and clearly marked as not-the-answer.
     /// It is also the only sign that a slow model is working rather than stuck.
@@ -430,5 +469,10 @@ extension MessageRow: @MainActor Equatable {
             && lhs.fileFailed == rhs.fileFailed
             && lhs.sibling?.index == rhs.sibling?.index
             && lhs.sibling?.total == rhs.sibling?.total
+            // Find (issue #50): the highlight is a value on the row, so a find
+            // move that changes only the mark must not be swallowed by
+            // `.equatable()` — without this line the highlight silently never
+            // reaches the body.
+            && lhs.findMark == rhs.findMark
     }
 }

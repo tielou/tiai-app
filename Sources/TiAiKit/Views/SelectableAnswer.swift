@@ -20,6 +20,12 @@ import UIKit
 struct SelectableAnswer: UIViewRepresentable {
     let markdown: String
     var onLink: ((URL) -> Void)?
+    /// Find-in-chat (issue #50): the FOLDED needle (folded by `FindInChat.fold`
+    /// upstream, so the highlight and the bar's count provably share one fold
+    /// engine), and the UTF-16 offset of the current hit within this segment's
+    /// rendered text, if the current hit is in this segment.
+    var findQuery: String = ""
+    var findCurrent: Int? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(onLink: onLink) }
 
@@ -56,10 +62,45 @@ struct SelectableAnswer: UIViewRepresentable {
         // the whole answer again — comparing the *input* is free by comparison, and
         // writing `attributedText` restarts layout and drops any selection the
         // reader has in flight.
-        guard context.coordinator.lastMarkdown != markdown else { return }
+        //
+        // The find fields are in the guard because stepping next/previous changes
+        // ONLY them: without this the highlight would never move. Rewriting
+        // `attributedText` for a highlight-only change drops an in-flight
+        // selection — accepted: while find is active, the find is what the
+        // reader is doing, not selecting.
+        guard context.coordinator.lastMarkdown != markdown
+            || context.coordinator.lastFindQuery != findQuery
+            || context.coordinator.lastFindCurrent != findCurrent
+        else { return }
         context.coordinator.lastMarkdown = markdown
-        view.attributedText = AnswerText.attributed(markdown)
+        context.coordinator.lastFindQuery = findQuery
+        context.coordinator.lastFindCurrent = findCurrent
+        let attr = NSMutableAttributedString(attributedString: AnswerText.attributed(markdown))
+        if !findQuery.isEmpty {
+            SelectableAnswer.applyFindHighlight(attr, query: findQuery, current: findCurrent)
+        }
+        view.attributedText = attr
         context.coordinator.invalidateIntrinsic()
+    }
+
+    /// Paint the hits. Same `FindInChat.occurrences` the count uses, run over
+    /// the attributed string's own text, so the offsets address what is drawn.
+    /// Best effort on `current`: its offset was computed on the segment's
+    /// display text, which can drift a newline apart from this string on
+    /// multi-block segments — a current that fails to match falls back to
+    /// the plain yellow, which is a colour difference, not a wrong location.
+    static func applyFindHighlight(
+        _ attr: NSMutableAttributedString, query: String, current: Int?
+    ) {
+        attr.removeAttribute(.backgroundColor, range: NSRange(location: 0, length: attr.length))
+        for hit in FindInChat.occurrences(ofFolded: query, in: attr.string) {
+            let isCurrent = current != nil && hit.location == current
+            attr.addAttribute(
+                .backgroundColor,
+                value: isCurrent ? UIColor.systemOrange
+                                 : UIColor.systemYellow.withAlphaComponent(0.35),
+                range: NSRange(location: hit.location, length: hit.length))
+        }
     }
 
     func sizeThatFits(
@@ -74,6 +115,8 @@ struct SelectableAnswer: UIViewRepresentable {
     final class Coordinator: NSObject, UITextViewDelegate {
         var onLink: ((URL) -> Void)?
         var lastMarkdown: String?
+        var lastFindQuery: String?
+        var lastFindCurrent: Int?
         private weak var view: UITextView?
 
         init(onLink: ((URL) -> Void)?) { self.onLink = onLink }
@@ -165,6 +208,10 @@ final class AnswerTextView: UITextView {
 
 /// Markdown to one `NSAttributedString`, with the block structure expressed as
 /// fonts, indents and spacing instead of as view nesting.
+///
+/// Cross-reference: `FindInChat.displayText` mirrors this pipeline (same
+/// `Markdown.blocks` + `MarkdownInline` chain) so the find count matches what
+/// is drawn here; change one, check the other (issue #50).
 enum AnswerText {
     static func attributed(_ markdown: String) -> NSAttributedString {
         let blocks = Markdown.blocks(TextSanitizer.clean(markdown))
