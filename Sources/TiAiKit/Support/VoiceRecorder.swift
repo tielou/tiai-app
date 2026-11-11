@@ -65,13 +65,23 @@ public final class VoiceRecorder {
         switch phase {
         case .recording: await stop(client: client, onText: onText)
         case .transcribing, .starting: break
-        default: await start()
+        default: _ = await start()
         }
     }
 
     /// Start, for a caller that also wants to stop on its own schedule — the
     /// composer holds the mic, so a press starts and a release may end it.
-    public func start() async { await begin() }
+    /// Returns the generation of the recording that started, or nil when the
+    /// start was refused (already recording, permission denied). A caller that
+    /// owns a recording must key on the returned generation, never on
+    /// `recordingGeneration` after the await — an external start (voice mode
+    /// taking the mic) can have bumped it in the meantime, and adopting "the
+    /// current generation" would hand the caller a recording that is not its
+    /// business to stop.
+    public func start() async -> Int? {
+        await begin()
+        return phase == .recording ? recordingGeneration : nil
+    }
 
     /// Stop and transcribe.
     public func stop(client: OWUIClient, onText: @escaping (String) -> Void) async {

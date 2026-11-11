@@ -203,6 +203,13 @@ private final class StubSpeaker: VoiceModeSpeaker {
 
     controller.start()
     try await waitUntil { controller.phase == .thinking }
+    // Don't stop a run that hasn't reached the wire: under main-actor load the
+    // stop can otherwise land while the completion POST is still being built,
+    // so no assistant id exists yet and the #34 stop-discard removes the
+    // phantom turns — a different scenario than the one this test pins.
+    // Waiting for the stream to open makes 'stop during thinking' mean
+    // 'stop a streaming run' deterministically.
+    try await waitUntil { transport.assistantMessageID != nil }
 
     controller.stop()
     #expect(controller.phase == .off)

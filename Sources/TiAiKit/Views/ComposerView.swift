@@ -396,11 +396,18 @@ struct ComposerView: View {
                 if startedByPress {
                     haptic(.light)
                     Task {
-                        await voice.start()
-                        // The start opened a new session; from here on the
-                        // recording this gesture owns is the one that start
-                        // made, whatever generation it landed on.
-                        pressGeneration = voice.recordingGeneration
+                        // Only adopt the generation the START created, and only
+                        // if the start actually opened a recording. Re-reading
+                        // `recordingGeneration` unconditionally after the await
+                        // could adopt a foreign session: a toggle tap racing
+                        // this press bumps the generation with voice mode's own
+                        // recording, and a long-press lift would then stop and
+                        // transcribe THAT into the draft. A refused start
+                        // returns nil; the press-time generation then fails the
+                        // onEnded guard, as it should.
+                        if let generation = await voice.start() {
+                            pressGeneration = generation
+                        }
                     }
                 }
             }
@@ -426,6 +433,11 @@ struct ComposerView: View {
                 guard voice.recordingGeneration == pressGeneration else { return }
                 haptic(.medium)
                 Task {
+                    // Same guard one beat later: a toggle tap between this
+                    // onEnded and the task's first run changes the recording
+                    // this lift owns, and `stop` would transcribe the wrong
+                    // session's audio.
+                    guard voice.recordingGeneration == pressGeneration else { return }
                     await voice.stop(client: conversation.client) { text in
                         let existing = conversation.draft.trimmingCharacters(in: .whitespaces)
                         conversation.draft = existing.isEmpty ? text : existing + " " + text

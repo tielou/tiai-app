@@ -276,9 +276,13 @@ final class VoiceModeController {
                 // Residual accepted edge: if the user has ALSO queued a
                 // message, that one drains first and its assistant turn is
                 // claimed here — voice mode may then stop a run that is not
-                // its own. The fully correct claim needs the assistant
-                // message id of the loop's own send, which is not knowable
-                // at queue time.
+                // its own. The same false claim happens when the user's
+                // in-flight run is stop-discarded (#34) while the voice send
+                // is queued: turns.last reverts to an older assistant turn
+                // with id != before. Both usually self-correct when the queue
+                // drains the voice message moments later. The fully correct
+                // claim needs the assistant message id of the loop's own send,
+                // which is not knowable at queue time.
                 if let last = conversation.turns.last, last.id != before,
                    last.isAssistant {
                     loopOwnsCurrentRun = true
@@ -446,7 +450,9 @@ final class VoiceRecorderCapture: VoiceModeRecorder {
         // cancelled, the same call the composer's own cancel path makes. A
         // dictation that was never finished had no text to lose.
         if recorder.isRecording { recorder.cancel() }
-        await recorder.start()
+        // The generation is the composer's concern; the capture stops the
+        // recording through its own single call site, so it needs none.
+        _ = await recorder.start()
         switch recorder.phase {
         case .recording: break
         case .failed(let message):
@@ -496,8 +502,11 @@ final class VoiceRecorderCapture: VoiceModeRecorder {
             // now added in `.common` run-loop modes, which fixes the
             // starvation itself; this gate is the belt.) A ticker that
             // really died leaves `elapsed` frozen for a full second of wall
-            // time — a scroll, a busy main thread, or a slow poll loop does
-            // not.
+            // time — a scroll or a slow poll loop does not. Residual: a main-
+            // thread hang over a second can still trip this on recovery if the
+            // poll continuation runs before the coalesced ticker fire; the
+            // consequence is benign (the recording is finished and transcribed,
+            // not lost), so it is accepted rather than raced around.
             if ContinuousClock.now - lastAdvance > .seconds(1) {
                 finishRequested = true
                 break
