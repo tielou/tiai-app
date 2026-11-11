@@ -72,6 +72,13 @@ public final class VoiceRecorder {
     // MARK: - recording
 
     private func begin() async {
+        // Already recording: a second start would overwrite `recorder` and
+        // orphan the running `AVAudioRecorder` — the mic stays lit with
+        // nothing transcribing it. The composer's own toggle routes
+        // "recording" to `stop`, so this only ever trips for an external
+        // `start()` (voice mode's capture, which cancels first); it is the
+        // belt to that braces.
+        guard phase != .recording else { return }
         // Said out loud while the permission prompt is up. Without it the button
         // sat inert for the second or two the system dialog takes, which reads as
         // a tap that did nothing.

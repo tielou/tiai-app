@@ -111,6 +111,23 @@ final class VoiceModeController {
     /// The same beat between a recorder failure and the re-arm, so a mic that
     /// cannot open does not spin the loop against a wall.
     private static let failureBackoff: Duration = .milliseconds(500)
+    /// Three strikes. A mic that cannot open fails identically every time
+    /// (another app holds it, the session will not activate), and a loop that
+    /// retries it every backoff beat forever is a fan spinning against a
+    /// wall — the bar says "Listening" while nothing can ever be heard. The
+    /// third consecutive failure exits the way a denied permission does,
+    /// with the reason on screen. A recording that worked clears the count.
+    private static let maxConsecutiveFailures = 3
+    private var consecutiveFailures = 0
+    /// True when the busy run — if there is one — is one this loop started
+    /// (or queued), not one the user started by hand. A send that went into
+    /// the #37 queue does not own the run still in flight; it owns nothing
+    /// until its own assistant turn shows up.
+    private var loopOwnsCurrentRun = false
+    /// How the last completed run ended. Internal and read-only so the tests
+    /// can pin which branch a parked run actually took instead of inferring
+    /// it from timing.
+    private(set) var lastOutcome: Outcome = .answer
 
     init(
         conversation: ConversationModel,
@@ -146,13 +163,17 @@ final class VoiceModeController {
     /// when the loop is not in their phase — cheap no-ops, and it means one
     /// press cannot leave the mic lit or the voice talking. The conversation
     /// is stopped only when the run in flight is the one this loop sent: a
-    /// message the user typed by hand is none of voice mode's business.
+    /// message the user typed by hand is none of voice mode's business —
+    /// and neither is the user's run that a *queued* voice send is still
+    /// waiting behind, which is why `loopOwnsCurrentRun` has to say so.
     func stop() {
         task?.cancel()
         task = nil
         recorder.cancel()
         speaker.stop()
-        if phase == .thinking, conversation.phase.isBusy { conversation.stop() }
+        if phase == .thinking, conversation.phase.isBusy, loopOwnsCurrentRun {
+            conversation.stop()
+        }
         phase = .off
     }
 
@@ -177,6 +198,14 @@ final class VoiceModeController {
                     phase = .off
                     return
                 }
+                // A mic that fails the same way three times in a row is not
+                // having a moment; take the permission exit rather than
+                // backoff-and-retry against a wall forever.
+                consecutiveFailures += 1
+                if consecutiveFailures >= Self.maxConsecutiveFailures {
+                    phase = .off
+                    return
+                }
                 // Everything else (a transcription that failed, a mic busy for
                 // one reason) is worth another try: say so, wait a beat, re-arm.
                 try? await Task.sleep(for: Self.failureBackoff)
@@ -184,6 +213,8 @@ final class VoiceModeController {
                 continue
             }
             if Task.isCancelled { break }
+            // A recording that worked is a fresh start for the failure count.
+            consecutiveFailures = 0
             // Nothing heard is not a failure — silence really does transcribe
             // to nothing. Re-arm in silence.
             guard let text,
@@ -195,12 +226,17 @@ final class VoiceModeController {
             phase = .transcribing
             let before = conversation.turns.last?.id
             let outboxBefore = conversation.pendingOutbox.count
+            // A send into a busy chat goes through the #37 queue, and until
+            // this message's own turn exists the busy run is the user's —
+            // `stop()` must not put the phone down on someone else's run.
+            let queuedSend = conversation.phase.isBusy
             conversation.draft = text
             guard conversation.send() else {
                 error = conversation.error ?? "The message could not be sent."
                 phase = .off
                 return
             }
+            loopOwnsCurrentRun = !queuedSend
             phase = .thinking
 
             // 3. Wait for the answer to settle — or for one of the ways a send
@@ -214,8 +250,14 @@ final class VoiceModeController {
                 if Task.isCancelled { break cycle }
                 if settled(before: before) { break }
                 if conversation.phase == .ready {
+                    let freshAssistant = conversation.turns.last
+                        .map { $0.id != before && $0.isAssistant } ?? false
+                    if freshAssistant { loopOwnsCurrentRun = true }
                     // A parked question: the run is waiting for a voice answer,
-                    // and the question is the thing worth hearing.
+                    // and the question is the thing worth hearing. `settled`
+                    // deliberately refuses parked turns so that this branch —
+                    // with the settle beat the question's refetch needs — is
+                    // the one that reads them.
                     if let last = conversation.turns.last, last.id != before,
                        last.isAssistant, last.awaitingCall != nil || last.awaitsTool {
                         outcome = .question
@@ -228,13 +270,34 @@ final class VoiceModeController {
                         error = last.error
                         continue cycle
                     }
+                    // The send evaporated: #34's stop-discard (a composer Stop
+                    // pressed on this very run) removes both turns and sets no
+                    // error, and without this arm the loop would sit in
+                    // `.thinking` until the run timeout. Only a send that went
+                    // out directly can evaporate this way — a queued send has
+                    // not produced its turns yet, and the chat sitting
+                    // `.ready` between the user's run and the queue drain
+                    // looks exactly like this.
+                    if !queuedSend, conversation.turns.last?.id == before,
+                       conversation.error == nil,
+                       conversation.pendingOutbox.count == outboxBefore {
+                        error = "The answer was stopped."
+                        phase = .off
+                        return
+                    }
                     // The send was parked (outbox) or rolled back (#9): the
                     // user's words never left the phone. Re-arm rather than
                     // stop — connectivity may come back before the next
-                    // sentence is spoken.
+                    // sentence is spoken. `conversation.error` counts here
+                    // only when the loop's own send produced no fresh
+                    // assistant turn: unrelated failures (a failed rating
+                    // POST, an upload watchdog, "Live streaming is
+                    // unavailable", a failed stop POST) stamp it during a
+                    // perfectly healthy run, and a thumb-tap on an older
+                    // reply must not kill the read-aloud.
                     if conversation.turns.last?.isUser == true
                         || conversation.pendingOutbox.count > outboxBefore
-                        || conversation.error != nil {
+                        || (conversation.error != nil && !freshAssistant) {
                         error = conversation.error ?? "The message could not be sent."
                         continue cycle
                     }
@@ -247,6 +310,7 @@ final class VoiceModeController {
                 phase = .off
                 return
             }
+            lastOutcome = outcome
 
             // 4. Read it. A parked question gets its settle beat first so the
             // refetch has landed the full question text.
@@ -261,9 +325,12 @@ final class VoiceModeController {
                 speakText = [speakText, question].filter { !$0.isEmpty }
                     .joined(separator: " ")
             }
-            // An answer with nothing to read (code-only, or empty) re-arms in
-            // silence rather than hearing the TTS engine complain.
-            if !speakText.isEmpty {
+            // An answer with nothing speakable re-arms in silence rather than
+            // hearing the TTS engine complain. The chunk check rather than
+            // `speakText.isEmpty` is the point: a code-only answer is not
+            // empty, but everything in it is stripped before speaking, and
+            // `SpeechPlayer.read` would answer "nothing to read" every cycle.
+            if !SpeechText.chunks(speakText).isEmpty {
                 phase = .speaking
                 do {
                     try await speaker.speak(speakText)
@@ -279,18 +346,26 @@ final class VoiceModeController {
         }
     }
 
-    private enum Outcome { case answer, question }
+    enum Outcome { case answer, question }
 
     /// The answer is in. The turn has to be a *new* non-streaming assistant
     /// turn with nothing wrong about it — a user turn still last means the
     /// send is parked or rolled back (handled as a terminal elsewhere, but
     /// never as "settled"), and a streaming one means the deltas are still
-    /// arriving.
+    /// arriving. A turn parked on an `ask_user` question is not a settled
+    /// answer either: it has its own branch in the wait loop, with the settle
+    /// beat the question's refetch needs — settling here would read the
+    /// question before its full text has landed. `conversation.error` is
+    /// deliberately *not* consulted: unrelated failures (a failed rating
+    /// POST, an upload watchdog, a failed stop POST) stamp it during a
+    /// healthy run, and the run's own failure is carried by the turn's
+    /// `error`.
     func settled(before: String?) -> Bool {
         guard conversation.phase == .ready else { return false }
         guard let last = conversation.turns.last, last.id != before else { return false }
         if last.isUser { return false }
-        return !last.streaming && last.error == nil && conversation.error == nil
+        return !last.streaming && last.error == nil
+            && last.awaitingCall == nil && !last.awaitsTool
     }
 }
 
@@ -313,6 +388,15 @@ final class VoiceRecorderCapture: VoiceModeRecorder {
 
     func recordUntilStopped(client: OWUIClient) async throws -> String? {
         finishRequested = false
+        // Dictation may still be holding this very recorder: a short tap on
+        // the composer's mic starts a hands-free recording that nobody has
+        // stopped yet, and the voice-mode toggle stays live next to the bar.
+        // Starting a second recording would orphan the first
+        // `AVAudioRecorder` — the mic stays lit with nothing transcribing
+        // it — so voice mode takes the mic: the dictation in progress is
+        // cancelled, the same call the composer's own cancel path makes. A
+        // dictation that was never finished had no text to lose.
+        if recorder.isRecording { recorder.cancel() }
         await recorder.start()
         switch recorder.phase {
         case .recording: break
@@ -333,9 +417,31 @@ final class VoiceRecorderCapture: VoiceModeRecorder {
         // sleep is what makes `stop()` land mid-hold. If the phase leaves
         // `.recording` on its own there is nothing left to transcribe, so the
         // honest answer is nil: silent re-arm, no error.
+        //
+        // The recorder's own 120 s cap needs its own watch: the ticker's
+        // limit stop tears the hardware down but leaves the phase at
+        // `.recording`, so the phase escape never fires and the bar would
+        // say "Listening" over a dead mic forever. `elapsed` is the truth —
+        // at the limit, or frozen (the mic died under us and the ticker
+        // stopped advancing it), finish the recording so the audio that does
+        // exist is transcribed now instead of sitting there unfetched.
+        var lastElapsed = recorder.elapsed
+        var frozenPolls = 0
         while !finishRequested {
             try await Task.sleep(for: .milliseconds(50))
             if recorder.phase != .recording { return nil }
+            if recorder.elapsed > lastElapsed {
+                lastElapsed = recorder.elapsed
+                frozenPolls = 0
+            } else {
+                frozenPolls += 1
+            }
+            // The ticker ticks every 250 ms; twelve silent 50 ms polls mean
+            // it stopped ticking.
+            if recorder.elapsed >= VoiceRecorder.limit || frozenPolls >= 12 {
+                finishRequested = true
+                break
+            }
         }
 
         var text: String?

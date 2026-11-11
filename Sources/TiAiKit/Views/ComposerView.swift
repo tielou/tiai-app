@@ -353,16 +353,22 @@ struct ComposerView: View {
     /// fits. It used to be a red capsule floating over the text field, which
     /// truncated "No speech recognised" to "No speech…" and made an ordinary
     /// empty result look like a crash.
+    ///
+    /// Suppressed while voice mode runs: the dictation button is hidden then
+    /// (one mic, one owner), so a note about a recorder the user cannot reach
+    /// popping up under the voice bar is noise, not information.
     @ViewBuilder private var voiceNote: some View {
-        switch voice.phase {
-        case .empty:
-            Label("No speech heard", systemImage: "waveform.slash")
-                .modifier(VoiceNoteStyle(tint: .secondary))
-        case .failed(let message):
-            Label(message, systemImage: "exclamationmark.triangle.fill")
-                .modifier(VoiceNoteStyle(tint: .red))
-        default:
-            EmptyView()
+        if !voiceModeActive {
+            switch voice.phase {
+            case .empty:
+                Label("No speech heard", systemImage: "waveform.slash")
+                    .modifier(VoiceNoteStyle(tint: .secondary))
+            case .failed(let message):
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .modifier(VoiceNoteStyle(tint: .red))
+            default:
+                EmptyView()
+            }
         }
     }
 

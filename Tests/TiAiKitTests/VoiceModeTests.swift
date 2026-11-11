@@ -61,6 +61,10 @@ private final class StubRecorder: VoiceModeRecorder {
     private(set) var finishCount = 0
     private(set) var cancelCount = 0
     private var script: [StubReply]
+    /// Models the transcription round trip of the real capture: a
+    /// `.textOnFinish` reply returns this long *after* the tap, so a test can
+    /// act while the loop is mid-transcription.
+    var postFinishDelay: Duration = .zero
 
     init(_ script: [StubReply]) { self.script = script }
 
@@ -81,6 +85,7 @@ private final class StubRecorder: VoiceModeRecorder {
             while finishCount < startCount {
                 try await Task.sleep(for: .milliseconds(2))
             }
+            try await Task.sleep(for: postFinishDelay)
             return text
         }
     }
@@ -95,10 +100,18 @@ private final class StubSpeaker: VoiceModeSpeaker {
     private(set) var stopCount = 0
     /// The first reading hangs until `stop()` — the mid-speech interrupt.
     var hangsFirst = false
+    /// When set, the first reading throws this instead of speaking — the TTS
+    /// round trip died. The loop must show it and re-arm, not wedge.
+    var failFirstWith: String?
     private var released = false
+    private var failed = false
 
     func speak(_ text: String) async throws {
         spoken.append(text)
+        if let failure = failFirstWith, !failed {
+            failed = true
+            throw VoiceModeFailure.message(failure)
+        }
         guard hangsFirst && !released else { return }
         while !released { try await Task.sleep(for: .milliseconds(2)) }
     }
@@ -328,5 +341,100 @@ private final class StubSpeaker: VoiceModeSpeaker {
     }
     try await waitUntil { controller.phase == .listening }
     #expect(controller.error == nil)
+    // Pin the branch: a parked turn must go through the `.question` path —
+    // with its settle beat for the refetch — and never through `settled()`,
+    // which would read the question before its full text has landed.
+    #expect(controller.lastOutcome == .question,
+            "the parked run took the question branch, not the answer path")
     controller.stop()
+}
+
+@Test @MainActor func aSpeakerFailureShowsUpAndReArmsTheMic() async throws {
+    let (conversation, transport, hub) = makeVoiceFixture()
+    let recorder = StubRecorder([.text("hello"), .hang])
+    let speaker = StubSpeaker()
+    speaker.failFirstWith = "Could not produce audio."
+    let controller = VoiceModeController(
+        conversation: conversation, recorder: recorder, speaker: speaker,
+        poll: .milliseconds(2), runTimeout: .seconds(10))
+
+    controller.start()
+    try await transport.awaitCompletion()
+    let assistantID = try #require(transport.assistantMessageID)
+    for frame in Frames.run(chat: "chat-1", message: assistantID, answer: "MAGIC") {
+        hub.receive(frame)
+    }
+    // A dead voice is a failure the user should see — but the mic is the
+    // point of hands-free mode, so the loop re-arms rather than quitting.
+    try await waitUntil { controller.error != nil }
+    #expect(controller.error?.contains("Could not produce audio") == true)
+    try await waitUntil { controller.phase == .listening }
+    #expect(recorder.startCount >= 2, "the mic re-armed despite the dead voice")
+    controller.stop()
+    #expect(controller.phase == .off)
+}
+
+@Test @MainActor func stopFromListeningAndMidTranscriptionLeavesOffCleanly() async throws {
+    // From `.listening`: the mic is open, nothing else has started.
+    let (conversation, transport, _) = makeVoiceFixture()
+    let recorder = StubRecorder([.hang])
+    let speaker = StubSpeaker()
+    let controller = VoiceModeController(
+        conversation: conversation, recorder: recorder, speaker: speaker,
+        poll: .milliseconds(2), runTimeout: .seconds(10))
+    controller.start()
+    try await waitUntil { controller.phase == .listening }
+    controller.stop()
+    #expect(controller.phase == .off)
+    #expect(recorder.cancelCount >= 1, "the mic was released")
+    #expect(controller.error == nil, "a stop is never an error")
+    #expect(conversation.turns.isEmpty)
+
+    // Mid-transcription: the tap has stopped the mic and the words are still
+    // on their way back (the round trip lives inside the recorder, which is
+    // what `.transcribing` exists to describe). Stopping there must leave a
+    // clean `.off` and must not send the half-made message.
+    let recorder2 = StubRecorder([.textOnFinish("hello")])
+    recorder2.postFinishDelay = .milliseconds(200)
+    let (conversation2, transport2, _) = makeVoiceFixture()
+    let speaker2 = StubSpeaker()
+    let controller2 = VoiceModeController(
+        conversation: conversation2, recorder: recorder2, speaker: speaker2,
+        poll: .milliseconds(2), runTimeout: .seconds(10))
+    controller2.start()
+    try await waitUntil { recorder2.startCount == 1 && controller2.phase == .listening }
+    controller2.toggle()  // the tap that ends the recording
+    try await waitUntil { recorder2.finishCount == 1 }
+    controller2.stop()
+    #expect(controller2.phase == .off)
+    #expect(controller2.error == nil)
+    // Give the stub's fake round trip longer than it needs; the cancelled
+    // loop must not come back and send anything.
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(!transport2.paths.contains("/api/v1/chat/completions"),
+            "the transcription in flight was dropped, not sent")
+    #expect(conversation2.turns.isEmpty)
+}
+
+@Test @MainActor func repeatedRecorderFailuresTakeTheLoopOutOfTheGame() async throws {
+    let (conversation, transport, _) = makeVoiceFixture()
+    // A persistent non-permission failure — the mic held by another app.
+    // One failure is worth a retry; three identical ones are a wall, and a
+    // loop that re-arms against it every backoff beat forever is worse than
+    // one that quits with the reason on screen.
+    let message = "The microphone is in use by another app."
+    let recorder = StubRecorder([.failure(message), .failure(message), .failure(message), .hang])
+    let speaker = StubSpeaker()
+    let controller = VoiceModeController(
+        conversation: conversation, recorder: recorder, speaker: speaker,
+        poll: .milliseconds(2), runTimeout: .seconds(10))
+
+    controller.start()
+    // `startCount >= 3` first: `.off` is also the phase before the loop ever
+    // ran, and `waitUntil` checks immediately.
+    try await waitUntil { recorder.startCount >= 3 && controller.phase == .off }
+    #expect(controller.error?.contains("microphone") == true)
+    #expect(!transport.paths.contains("/api/v1/chat/completions"))
+    // And the state is genuinely re-startable, not a corpse.
+    #expect(conversation.turns.isEmpty)
 }
