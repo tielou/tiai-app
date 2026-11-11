@@ -75,19 +75,15 @@ struct SelectableAnswer: UIViewRepresentable {
         context.coordinator.lastMarkdown = markdown
         context.coordinator.lastFindQuery = findQuery
         context.coordinator.lastFindCurrent = findCurrent
+        // Built from scratch every pass, so there is nothing to undo: the only
+        // way to see a stale highlight is to edit the SAME attributed string in
+        // place, and this never does. (An undo pass here used to remove the
+        // previous pass's background ranges — with streaming shifting the
+        // offsets, that punched holes in a code block's background, because the
+        // stale ranges addressed the OLD string.)
         let attr = NSMutableAttributedString(attributedString: AnswerText.attributed(markdown))
-        // Undo only the backgrounds a previous pass added, never a global
-        // removeAttribute(.backgroundColor) — that would silently strip any
-        // background the renderer itself adds (inline code, future styles).
-        for range in context.coordinator.findHighlightRanges
-        where NSMaxRange(range) <= attr.length {
-            attr.removeAttribute(.backgroundColor, range: range)
-        }
         if !findQuery.isEmpty {
-            context.coordinator.findHighlightRanges =
-                SelectableAnswer.applyFindHighlight(attr, query: findQuery, current: findCurrent)
-        } else {
-            context.coordinator.findHighlightRanges = []
+            SelectableAnswer.applyFindHighlight(attr, query: findQuery, current: findCurrent)
         }
         view.attributedText = attr
         context.coordinator.invalidateIntrinsic()
@@ -98,13 +94,10 @@ struct SelectableAnswer: UIViewRepresentable {
     /// The `current` offset was computed on the segment's display text, which
     /// is the SAME string as `attr.string` by construction — both go through
     /// `AnswerPlainText` (issue #50 review), so the current hit matches here
-    /// rather than "best effort". Returns the ranges it painted so the caller
-    /// can undo exactly those on the next pass.
-    @discardableResult
+    /// rather than "best effort".
     static func applyFindHighlight(
         _ attr: NSMutableAttributedString, query: String, current: Int?
-    ) -> [NSRange] {
-        var painted: [NSRange] = []
+    ) {
         for hit in FindInChat.occurrences(ofFolded: query, in: attr.string) {
             let isCurrent = current != nil && hit.location == current
             let range = NSRange(location: hit.location, length: hit.length)
@@ -113,9 +106,7 @@ struct SelectableAnswer: UIViewRepresentable {
                 value: isCurrent ? UIColor.systemOrange
                                  : UIColor.systemYellow.withAlphaComponent(0.35),
                 range: range)
-            painted.append(range)
         }
-        return painted
     }
 
     func sizeThatFits(
@@ -132,10 +123,6 @@ struct SelectableAnswer: UIViewRepresentable {
         var lastMarkdown: String?
         var lastFindQuery: String?
         var lastFindCurrent: Int?
-        /// The background ranges the last find pass painted, so the next pass
-        /// undoes exactly those instead of wiping every background in the
-        /// string.
-        var findHighlightRanges: [NSRange] = []
         private weak var view: UITextView?
 
         init(onLink: ((URL) -> Void)?) { self.onLink = onLink }
@@ -243,8 +230,24 @@ enum AnswerText {
         return out
     }
 
+    /// Styling only; the text itself is `AnswerPlainText`'s decision.
+    ///
+    /// Identity, by construction, in two tiers:
+    ///
+    /// * Blocks with no inline layer (rule, code) consume
+    ///   `AnswerPlainText.string(for:)` as their literal text — one path,
+    ///   nothing to diverge.
+    /// * The remaining blocks need per-run structure that `string(for:)`
+    ///   flattens: emphasis is carried as `inlinePresentationIntent` runs and
+    ///   links as `.link` attributes, both of which come from parsing the
+    ///   block's inline source. Those paths therefore build from
+    ///   `marker(for:)` + `MarkdownInline.parse(inlineSource(for:))`. That is
+    ///   still not a second string decision: `AnswerPlainText.inline` is
+    ///   DEFINED as the characters of that same parse, and both sides compose
+    ///   the same two shared primitives (`marker` prefix + inline-stripped
+    ///   source), so the rendered text equals `string(for:)` by construction.
+    ///   What the parse contributes here is runs, never characters.
     private static func render(_ block: MarkdownBlock) -> NSAttributedString {
-        // Styling only; the text itself is `AnswerPlainText`'s decision.
         switch block {
         case .prose:
             return line(block, font: .body, color: .label)
@@ -272,7 +275,13 @@ enum AnswerText {
                 range: whole(result))
             return result
         case .rule:
-            return line(block, font: .body, color: .tertiaryLabel)
+            // No inline semantics in a glyph row: consume the shared string
+            // directly, so the text is `AnswerPlainText`'s by construction.
+            let result = NSMutableAttributedString(
+                string: AnswerPlainText.string(for: block),
+                attributes: [.font: UIFont.body, .foregroundColor: UIColor.tertiaryLabel,
+                             .paragraphStyle: paragraph()])
+            return result
         case .task:
             return marked(block, color: .label)
         case .table:
@@ -280,9 +289,11 @@ enum AnswerText {
             result.addAttribute(
                 .paragraphStyle, value: paragraph(indent: 10, firstLineIndent: 0), range: whole(result))
             return result
-        case let .code(_, code):
+        case .code:
+            // The code body is verbatim in both pipelines; take it from the
+            // shared source so the text is `AnswerPlainText`'s by construction.
             let result = NSMutableAttributedString(
-                string: code,
+                string: AnswerPlainText.string(for: block),
                 attributes: [
                     .font: UIFont.monospacedSystemFont(ofSize: 13, weight: .regular),
                     .foregroundColor: UIColor.label,

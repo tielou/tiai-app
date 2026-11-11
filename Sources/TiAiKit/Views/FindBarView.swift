@@ -37,10 +37,13 @@ final class FindModel {
     /// render and so the highlight and the count provably use one fold.
     private(set) var foldedNeedle = ""
 
-    private var lastTurns: [Turn] = []
+    /// Never read by any view — they are scheduling bookkeeping, so observing
+    /// them would only add invalidation churn at streaming delta rates.
+    @ObservationIgnored private var lastTurns: [Turn] = []
     private var recomputeTask: Task<Void, Never>?
     /// Wall-clock time of the last actual pass, for the max-wait below.
-    private var lastRecompute = Date.distantPast
+    /// Also never observed — see `lastTurns`.
+    @ObservationIgnored private var lastRecompute = Date.distantPast
     /// The debounce alone starves during fast streaming: deltas faster than
     /// the debounce each cancel the pending task, so the count only refreshes
     /// at a pause. Past this age the next call fires immediately instead of
@@ -63,7 +66,17 @@ final class FindModel {
         lastTurns = turns
         recomputeTask?.cancel()
         if Date().timeIntervalSince(lastRecompute) >= Self.maxRecomputeWait {
-            performRecompute()
+            // Claim the slot before hopping, so a second call inside the same
+            // update pass takes the debounce path instead of double-firing.
+            lastRecompute = Date()
+            // The streaming path calls this from `onChange(of: turns)`, i.e.
+            // during a SwiftUI update pass, and `performRecompute` publishes
+            // @Observable state. One hop to the next main-actor turn gets the
+            // writes out of the pass; the leading-edge freshness promise
+            // ("never more than maxRecomputeWait stale") survives it, and
+            // navigation stays synchronous in `step` because a button press
+            // is not an update pass.
+            Task { @MainActor [weak self] in self?.performRecompute() }
             return
         }
         recomputeTask = Task { [weak self] in
@@ -132,6 +145,10 @@ final class FindModel {
 
     private func reset() {
         recomputeTask?.cancel()
+        // A reopen within the max-wait window must count immediately: the
+        // `onAppear` seed should take the leading edge, not schedule 120ms
+        // behind a timer left running by the previous find.
+        lastRecompute = .distantPast
         query = ""
         occurrences = []
         turnIDsWithHits = []

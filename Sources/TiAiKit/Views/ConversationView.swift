@@ -658,12 +658,16 @@ public struct ConversationView: View {
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(BottomAnchor.id, anchor: .bottom) }
             }
             .onChange(of: conversation.turns.count) { _, _ in
-                // A new turn always lands at the bottom, so the transcript is
-                // at the bottom again — find open or not. Only the SCROLL is
-                // suppressed while find is active; gating the flag too would
-                // leave auto-follow dead for streaming after find closes.
-                atBottom = true
+                // The whole body — the flag included — is gated on find being
+                // closed. Setting `atBottom = true` unconditionally while the
+                // scroll is suppressed would be a lie about where the reader
+                // is, and it races the geometry writer below. The stale-flag
+                // scenario that motivated the unconditional write self-heals:
+                // `onScrollGeometryChange` recomputes `atBottom` from content
+                // growth unconditionally, so the moment find closes and
+                // content moves again, the flag is true on its own.
                 guard !interacting, !find.isActive else { return }
+                atBottom = true
                 proxy.scrollTo(BottomAnchor.id, anchor: .bottom)
             }
             .onChange(of: conversation.phase.isBusy) { _, busy in
