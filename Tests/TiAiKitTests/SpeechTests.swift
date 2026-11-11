@@ -62,3 +62,38 @@ func nothingToRead() {
     #expect(SpeechText.chunks("   \n\n  ").isEmpty)
     #expect(SpeechText.chunks("```\nonly code\n```").isEmpty)
 }
+
+@Test("a failed read-aloud reports itself instead of going silent")
+@MainActor func failureIsReported() async throws {
+    // Issue #47: the speaker button used to flip its icon back with no
+    // explanation. The failure has to land in `error` for the banner to show.
+    final class FailingTransport: APITransport, @unchecked Sendable {
+        func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
+            let http = HTTPURLResponse(
+                url: request.url!, statusCode: 503, httpVersion: "HTTP/1.1", headerFields: nil)!
+            return (Data(), http)
+        }
+        func bytes(_ request: URLRequest) async throws -> (ByteStream, HTTPURLResponse) {
+            let http = HTTPURLResponse(
+                url: request.url!, statusCode: 503, httpVersion: "HTTP/1.1", headerFields: nil)!
+            return (ByteStream { AsyncThrowingStream { $0.finish() } }, http)
+        }
+    }
+    let client = OWUIClient(
+        server: Server(baseURL: URL(string: "https://chat.example.co")!, token: "tok"),
+        transport: FailingTransport())
+    let player = SpeechPlayer(client: client)
+
+    player.read("Hello there.")
+    // `read` runs the request in a task; wait for it to settle.
+    for _ in 0..<200 where player.isPlaying { try await Task.sleep(for: .milliseconds(20)) }
+
+    #expect(!player.isPlaying)
+    let message = try #require(player.error)
+    #expect(message.contains("text-to-speech"), "got: \(message)")
+
+    // The banner's dismiss button goes through this; a stale error must not
+    // survive it.
+    player.dismissError()
+    #expect(player.error == nil)
+}

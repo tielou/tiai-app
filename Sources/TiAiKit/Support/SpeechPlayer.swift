@@ -108,6 +108,11 @@ public final class SpeechPlayer: ObservableObject {
 
     public func setVoice(_ voice: String?) { self.voice = voice }
 
+    /// Clears a reported failure. The banner that shows `error` has a dismiss
+    /// button; a banner with no way to dismiss it is a permanent smear of red
+    /// (the lesson from issue #9).
+    public func dismissError() { error = nil }
+
     public func read(_ markdown: String) {
         stop()
         let chunks = SpeechText.chunks(markdown)

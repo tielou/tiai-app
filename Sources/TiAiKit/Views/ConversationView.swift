@@ -289,6 +289,7 @@ public struct ConversationView: View {
                 .padding(.vertical, 6)
                 .background(.red.opacity(0.08))
             }
+            SpeechErrorBanner(speech: speech)
             ComposerView(
                 conversation: conversation, models: models,
                 chatTools: chatTools, chatToolsError: chatToolsError,
@@ -784,6 +785,40 @@ private struct EmptyTranscript: View {
         .frame(maxWidth: .infinity)
         .padding(.top, 140)
         .padding(.bottom, 60)
+    }
+}
+
+/// A read-aloud failure has to be seen, not logged (issue #47).
+///
+/// Its own view because `ConversationView` holds the player in `@State`, which
+/// does not subscribe the way `@ObservedObject` does — `ReadAloudButton` learned
+/// this the hard way. The conditional lives inside so the parent body never has
+/// to observe `speech.error` to show or hide it.
+private struct SpeechErrorBanner: View {
+    @ObservedObject var speech: SpeechPlayer
+
+    var body: some View {
+        if let failure = speech.error {
+            HStack(spacing: 10) {
+                Label(failure, systemImage: "exclamationmark.triangle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                Spacer(minLength: 8)
+                // Same rule as the transcript banner: a banner the user has
+                // read has served its purpose (issue #9).
+                Button {
+                    speech.dismissError()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityLabel("Dismiss read-aloud error")
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+            .background(.red.opacity(0.08))
+            .accessibilityIdentifier("speechError")
+        }
     }
 }
 
