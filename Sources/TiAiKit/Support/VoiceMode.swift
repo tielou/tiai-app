@@ -122,8 +122,10 @@ final class VoiceModeController {
     /// True when the busy run — if there is one — is one this loop started
     /// (or queued), not one the user started by hand. A send that went into
     /// the #37 queue does not own the run still in flight; it owns nothing
-    /// until its own assistant turn shows up.
-    private var loopOwnsCurrentRun = false
+    /// until its own assistant turn shows up. Read-only and internal for
+    /// the same reason `lastOutcome` is: the queued-run test must wait for
+    /// the flip to land rather than race it.
+    private(set) var loopOwnsCurrentRun = false
     /// How the last completed run ended. Internal and read-only so the tests
     /// can pin which branch a parked run actually took instead of inferring
     /// it from timing.
@@ -156,6 +158,11 @@ final class VoiceModeController {
 
     func start() {
         guard phase == .off else { return }
+        // A fresh session gets a fresh strike count. Without this the manual
+        // restart after a three-strike exit exits on the FIRST failure — the
+        // restart is the user saying "try again", and the old session's
+        // strikes are no evidence about the new one.
+        consecutiveFailures = 0
         task = Task { [weak self] in await self?.runLoop() }
     }
 
@@ -238,6 +245,14 @@ final class VoiceModeController {
             }
             loopOwnsCurrentRun = !queuedSend
             phase = .thinking
+            // A new run starts with a fresh outcome: anything reading this
+            // (the tests, to pin which branch a parked run took) reads the
+            // branch of THIS run, never a stale one from the last cycle.
+            // It resets at send time rather than at the top of the cycle
+            // because a cycle that records but never sends has no outcome
+            // to invalidate — clearing it there would erase the very value
+            // the parked-question test pins after the mic re-arms.
+            lastOutcome = .answer
 
             // 3. Wait for the answer to settle — or for one of the ways a send
             // ends without an answer to appear. Every branch here either
@@ -245,14 +260,33 @@ final class VoiceModeController {
             // can hang, because the poll is bounded by `runTimeout`.
             let deadline = ContinuousClock.now + runTimeout
             var outcome: Outcome = .answer
+            var questionTurnID: String?
             var timedOut = false
             wait: while true {
                 if Task.isCancelled { break cycle }
+                // The ownership detection sits at the TOP of each iteration,
+                // outside the `.ready` gate below: when a queued send drains
+                // into its own run, the conversation is busy the whole time
+                // the loop's own assistant turn streams, so a flip gated on
+                // `.ready` would never fire — `settled()` breaks out first
+                // and `stop()` would then skip `conversation.stop()` on the
+                // loop's own run, leaving voice mode dark over an answer
+                // that keeps streaming.
+                //
+                // Residual accepted edge: if the user has ALSO queued a
+                // message, that one drains first and its assistant turn is
+                // claimed here — voice mode may then stop a run that is not
+                // its own. The fully correct claim needs the assistant
+                // message id of the loop's own send, which is not knowable
+                // at queue time.
+                if let last = conversation.turns.last, last.id != before,
+                   last.isAssistant {
+                    loopOwnsCurrentRun = true
+                }
                 if settled(before: before) { break }
                 if conversation.phase == .ready {
                     let freshAssistant = conversation.turns.last
                         .map { $0.id != before && $0.isAssistant } ?? false
-                    if freshAssistant { loopOwnsCurrentRun = true }
                     // A parked question: the run is waiting for a voice answer,
                     // and the question is the thing worth hearing. `settled`
                     // deliberately refuses parked turns so that this branch —
@@ -261,6 +295,7 @@ final class VoiceModeController {
                     if let last = conversation.turns.last, last.id != before,
                        last.isAssistant, last.awaitingCall != nil || last.awaitsTool {
                         outcome = .question
+                        questionTurnID = last.id
                         break
                     }
                     // The answer itself failed — say what the model said, not
@@ -318,7 +353,21 @@ final class VoiceModeController {
                 try? await Task.sleep(for: Self.settleBeat)
                 if Task.isCancelled { break }
             }
-            guard let turn = conversation.turns.last else { continue cycle }
+            // The parked turn is re-read BY id, not as `turns.last`: the
+            // settle beat is half a second in which the user may well have
+            // answered through the tool UI, and then `turns.last` is the
+            // user's own answer (or the run it started) — reading that back
+            // would speak the user's words at them. If the turn is gone
+            // entirely (a stop-discard), this cycle has nothing left to read.
+            let turn: Turn
+            if let id = questionTurnID {
+                guard let parked = conversation.turns.first(where: { $0.id == id })
+                else { continue cycle }
+                turn = parked
+            } else {
+                guard let last = conversation.turns.last else { continue cycle }
+                turn = last
+            }
             var speakText = turn.text.trimmingCharacters(in: .whitespacesAndNewlines)
             if let prompt = AskUserPrompt(arguments: turn.awaitingCall?.arguments) {
                 let question = prompt.questions.map(\.text).joined(separator: " ")
@@ -426,19 +475,30 @@ final class VoiceRecorderCapture: VoiceModeRecorder {
         // stopped advancing it), finish the recording so the audio that does
         // exist is transcribed now instead of sitting there unfetched.
         var lastElapsed = recorder.elapsed
-        var frozenPolls = 0
+        /// Wall time of the last observed advance of `elapsed`.
+        var lastAdvance = ContinuousClock.now
         while !finishRequested {
             try await Task.sleep(for: .milliseconds(50))
             if recorder.phase != .recording { return nil }
             if recorder.elapsed > lastElapsed {
                 lastElapsed = recorder.elapsed
-                frozenPolls = 0
-            } else {
-                frozenPolls += 1
+                lastAdvance = ContinuousClock.now
             }
-            // The ticker ticks every 250 ms; twelve silent 50 ms polls mean
-            // it stopped ticking.
-            if recorder.elapsed >= VoiceRecorder.limit || frozenPolls >= 12 {
+            if recorder.elapsed >= VoiceRecorder.limit {
+                finishRequested = true
+                break
+            }
+            // The freeze trip is gated on wall-clock drift, not on a count
+            // of silent polls. A poll count measured this task's patience,
+            // not the ticker's: `Task.sleep` continuations run during scroll
+            // tracking, so ~600 ms of scrolling mid-recording read as a dead
+            // ticker and auto-finished a healthy recording. (The ticker is
+            // now added in `.common` run-loop modes, which fixes the
+            // starvation itself; this gate is the belt.) A ticker that
+            // really died leaves `elapsed` frozen for a full second of wall
+            // time — a scroll, a busy main thread, or a slow poll loop does
+            // not.
+            if ContinuousClock.now - lastAdvance > .seconds(1) {
                 finishRequested = true
                 break
             }

@@ -50,6 +50,9 @@ struct ComposerView: View {
     var voiceModeActive = false
     @State private var pressStart: Date? = nil
     @State private var startedByPress = false
+    /// The recorder's session token as of the last moment this gesture's
+    /// stop path had a right to act (see `VoiceRecorder.recordingGeneration`).
+    @State private var pressGeneration = 0
     #endif
 
     private enum Sheet: Identifiable {
@@ -389,9 +392,16 @@ struct ComposerView: View {
                 guard pressStart == nil, !conversation.phase.isBusy else { return }
                 pressStart = Date()
                 startedByPress = !voice.isBusy
+                pressGeneration = voice.recordingGeneration
                 if startedByPress {
                     haptic(.light)
-                    Task { await voice.start() }
+                    Task {
+                        await voice.start()
+                        // The start opened a new session; from here on the
+                        // recording this gesture owns is the one that start
+                        // made, whatever generation it landed on.
+                        pressGeneration = voice.recordingGeneration
+                    }
                 }
             }
             .onEnded { _ in
@@ -405,6 +415,15 @@ struct ComposerView: View {
                 // everything else — a long hold, or any press while already
                 // recording — ends it and transcribes.
                 if startedByPress && held < Self.holdThreshold { return }
+                // Multi-touch handoff: if the generation changed since this
+                // press, the recording that exists now is not the one this
+                // finger started or found — e.g. a second finger tapped the
+                // voice-mode toggle, which cancelled this dictation and took
+                // the mic for a hands-free recording of its own. The lift
+                // must not stop *that* recording (its words would land in
+                // the draft mid-cycle); it is no longer this gesture's
+                // business.
+                guard voice.recordingGeneration == pressGeneration else { return }
                 haptic(.medium)
                 Task {
                     await voice.stop(client: conversation.client) { text in

@@ -36,6 +36,16 @@ public final class VoiceRecorder {
     public private(set) var phase: Phase = .idle
     public private(set) var elapsed: TimeInterval = 0
 
+    /// Identifies the current recording session: bumped on every start and
+    /// every cancel. A holder of the mic captures it and checks it before
+    /// stopping to tell "the recording I was dealing with" from "whatever is
+    /// recording now" — the composer's hold-to-record gesture does exactly
+    /// that, so a second finger tapping the voice-mode toggle (which
+    /// cancels the dictation and starts a hands-free recording of its own)
+    /// cannot have the dictation finger's lift stop *that* recording and
+    /// transcribe voice mode's audio into the draft.
+    public private(set) var recordingGeneration: Int = 0
+
     /// Beyond this the recording is abandoned rather than transcribed. Whisper
     /// chunks long audio and a fifteen-minute pocket-dial would sit in the
     /// queue for a while, and nobody means to record that.
@@ -72,6 +82,9 @@ public final class VoiceRecorder {
     // MARK: - recording
 
     private func begin() async {
+        // Every start opens a new session as far as any previous holder is
+        // concerned — including a start the guard below refuses.
+        recordingGeneration += 1
         // Already recording: a second start would overwrite `recorder` and
         // orphan the running `AVAudioRecorder` — the mic stays lit with
         // nothing transcribing it. The composer's own toggle routes
@@ -129,7 +142,7 @@ public final class VoiceRecorder {
             self.url = file
             phase = .recording
             elapsed = 0
-            ticker = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            let ticker = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.elapsed += 0.25
@@ -138,6 +151,14 @@ public final class VoiceRecorder {
                     if self.elapsed >= Self.limit { await self.stopOnly() }
                 }
             }
+            // `.common`, not the default mode: a default-mode timer is
+            // starved while the user scrolls, and a hold-to-record finger
+            // over a scrollable transcript hits exactly that — `elapsed`
+            // froze mid-recording and everything downstream (voice mode's
+            // freeze watch, the limit stop) read a healthy mic as a dead
+            // one. Dictation benefits from the same fix.
+            RunLoop.main.add(ticker, forMode: .common)
+            self.ticker = ticker
         } catch {
             note(.failed("Could not start recording: \(error.localizedDescription)"))
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
@@ -200,6 +221,9 @@ public final class VoiceRecorder {
     /// Called by the view when it goes away mid-recording, so a discarded sheet
     /// does not leave the microphone lit.
     public func cancel() {
+        // The recording this session was is over; whoever was holding it
+        // must find out it is no longer theirs to stop.
+        recordingGeneration += 1
         noteTask?.cancel()
         if let file = url { try? FileManager.default.removeItem(at: file) }
         url = nil

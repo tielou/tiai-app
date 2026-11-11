@@ -438,3 +438,102 @@ private final class StubSpeaker: VoiceModeSpeaker {
     // And the state is genuinely re-startable, not a corpse.
     #expect(conversation.turns.isEmpty)
 }
+
+@Test @MainActor func onlyConsecutiveRecorderFailuresStrikeOut() async throws {
+    let (conversation, transport, _) = makeVoiceFixture()
+    let message = "The microphone is in use by another app."
+    // A recording that worked (silence counts: the mic opened and the server
+    // heard nothing) resets the count, so the loop exits on the third
+    // CONSECUTIVE failure — the fifth recording, not the fourth.
+    let recorder = StubRecorder([
+        .failure(message), .empty, .failure(message), .failure(message),
+        .failure(message), .hang,
+    ])
+    let speaker = StubSpeaker()
+    let controller = VoiceModeController(
+        conversation: conversation, recorder: recorder, speaker: speaker,
+        poll: .milliseconds(2), runTimeout: .seconds(10))
+
+    controller.start()
+    try await waitUntil { recorder.startCount >= 5 && controller.phase == .off }
+    #expect(recorder.startCount == 5,
+            "the success in the middle reset the count; the exit was at the third consecutive failure")
+    #expect(controller.error?.contains("microphone") == true)
+    #expect(!transport.paths.contains("/api/v1/chat/completions"))
+    #expect(conversation.turns.isEmpty)
+}
+
+@Test @MainActor func aRestartAfterThreeStrikesGetsAFreshFailureCount() async throws {
+    let (conversation, transport, _) = makeVoiceFixture()
+    let message = "The microphone is in use by another app."
+    // Three strikes exit the loop; the next manual start is the user saying
+    // "try again", so the old session's strikes must not carry over — the
+    // first failure of the new session re-arms, it does not exit.
+    let recorder = StubRecorder([
+        .failure(message), .failure(message), .failure(message),
+        .failure(message), .hang,
+    ])
+    let speaker = StubSpeaker()
+    let controller = VoiceModeController(
+        conversation: conversation, recorder: recorder, speaker: speaker,
+        poll: .milliseconds(2), runTimeout: .seconds(10))
+
+    controller.start()
+    try await waitUntil { recorder.startCount >= 3 && controller.phase == .off }
+
+    controller.start()
+    // The fourth failure is the first of the new session: back off and
+    // re-arm. Without the reset in `start()` the loop would be back in
+    // `.off` here and the fifth recording would never happen.
+    try await waitUntil(timeout: .seconds(10)) { recorder.startCount >= 5 }
+    #expect(controller.phase == .listening)
+    controller.stop()
+}
+
+@Test @MainActor func stopDuringTheLoopsOwnQueuedRunStopsThatRun() async throws {
+    let (conversation, transport, hub) = makeVoiceFixture()
+    // A run the user started by hand is in flight when voice mode starts,
+    // so the voice send goes into the #37 queue behind it.
+    conversation.draft = "user first"
+    #expect(conversation.send())
+    try await transport.awaitCompletion()
+    let userRun = try #require(transport.assistantMessageID)
+
+    let recorder = StubRecorder([.text("hello"), .hang])
+    let speaker = StubSpeaker()
+    let controller = VoiceModeController(
+        conversation: conversation, recorder: recorder, speaker: speaker,
+        poll: .milliseconds(2), runTimeout: .seconds(10))
+    controller.start()
+    try await waitUntil { controller.phase == .thinking }
+    #expect(conversation.queue.items.map(\.text) == ["hello"],
+            "the voice send queued behind the user's run")
+    #expect(!transport.paths.contains("/api/tasks/chat/chat-1/stop"),
+            "the loop does not stop the user's run it is queued behind")
+
+    // The user's run ends; the queued voice message drains into its own run.
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: userRun,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    try await transport.awaitCompletion(2)
+    let loopRun = try #require(transport.assistantMessageID)
+    // Wait for the ownership flip itself, not just for the busy phase: the
+    // loop's poll has to have run since the drain, and under full-suite load
+    // "a few polls" is not the same as "a few milliseconds".
+    try await waitUntil { controller.loopOwnsCurrentRun }
+    try await waitUntil { conversation.phase.isBusy }
+
+    // The streaming run is the loop's own now. The bug this pins: the
+    // ownership flip was gated on the conversation being `.ready`, which
+    // never happens during the loop's own streaming run — `stop()` skipped
+    // `conversation.stop()`, voice mode went dark, and its own answer kept
+    // streaming into nobody.
+    controller.stop()
+    #expect(controller.phase == .off)
+    try await waitUntil { transport.paths.contains("/api/tasks/chat/chat-1/stop") }
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-1", messageID: loopRun,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+    try await waitUntil { conversation.phase == .ready }
+    #expect(speaker.spoken.isEmpty, "stop is stop: the loop read nothing aloud")
+}
