@@ -2528,6 +2528,178 @@ enum AskUserFixture {
             "the new run still owns the phase — the stale heal must not hand the composer back")
 }
 
+// #42 close-out (G2): the file card arrives live, not after a re-enter.
+// The `display_file` RESULT is written when the server saves the message,
+// which can land after the run ended — and when the stream never showed the
+// call (owesFile false), the adopt loop made exactly one look and gave up.
+// The record itself says a file is owed (the call is in `output` before the
+// result is); the loop has to read that signal, not just the stream's.
+@Test @MainActor func aFileThatLandsInTheRecordAfterTheRunEndsAppearsLive() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-42-filelive", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.adoptRetryInterval = .milliseconds(50)
+    defer { conversation.adoptRetryInterval = .seconds(1) }
+
+    conversation.draft = "make me a pdf"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    // The stored record's `output`: the call, and (once the save lands) the
+    // result joined by `call_id` — the wire shape pinned by
+    // TerminalFileTests.
+    func outputJSON(withResult: Bool) -> String {
+        let meta = """
+        {"path":"/home/user/deck.pdf","exists":true,"type":"file",\
+        "source":"open_terminal","terminal_selector":"sandbox",\
+        "name":"deck.pdf","mime_type":"application/pdf"}
+        """
+        var items: [JSONValue] = [
+            .object([
+                "type": .string("function_call"), "name": .string("display_file"),
+                "call_id": .string("c1"),
+                "arguments": .string("{\"path\":\"/home/user/deck.pdf\"}"),
+            ]),
+        ]
+        if withResult {
+            items.append(.object([
+                "type": .string("function_call_output"), "call_id": .string("c1"),
+                "output": .array([.object([
+                    "type": .string("input_text"), "text": .string(meta),
+                ])]),
+            ]))
+        }
+        return String(decoding: try! JSONEncoder().encode(items), as: UTF8.self)
+    }
+    func record(withResult: Bool) -> Data {
+        Data("""
+        {"id":"chat-42-filelive","title":"t","updated_at":1,"created_at":1,
+         "chat":{"models":["local-personal"],"history":{"currentId":"\(id)","messages":{
+           "\(id)":{"id":"\(id)","role":"assistant","content":"all done","model":"local-personal",
+                    "done":true,"parentId":null,"childrenIds":[],"output":\(outputJSON(withResult: withResult))}}}}}
+        """.utf8)
+    }
+    // Read 1 is the finish frame's `serverStillOpen` refetch: closed, but
+    // the file result is not saved yet. Reads 2 and 3 (the adopt loop's
+    // first look and the post-terminal reconcile, whichever wins which)
+    // still lack the result; from read 4 on it is there.
+    transport.chatDetailQueue = [
+        record(withResult: false), record(withResult: false), record(withResult: false),
+    ]
+    transport.chatDetailOverride = record(withResult: true)
+
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-42-filelive", messageID: id, inner: [
+        "type": "response.output_text.delta", "delta": "all done", "output_index": 1]))
+    // No `display_file` ever shows in the stream — the adopt loop's stream-
+    // side signal is false; only the record knows a card is owed.
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-42-filelive", messageID: id,
+                              inner: ["choices": [["index": 0, "finish_reason": "stop"]]]))
+
+    try await waitUntil(timeout: .seconds(2)) {
+        conversation.turns.last?.terminalFiles.isEmpty == false
+    }
+    #expect(conversation.turns.last?.terminalFiles.first?.name == "deck.pdf",
+            "the card the record grew after the run ended has to reach the screen without a re-enter (#42)")
+}
+
+// The other half of the union predicate: a run that owes no file from
+// EITHER signal (no `display_file` in the stream, none in the record) must
+// settle and stop looking after the one adoption GET — not spin the retry
+// budget. This is the pin against the tempting "just always retry 5" fix.
+@Test @MainActor func aRunWithNoFileDoesNotSpinTheAdoptionLoop() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-42-nofile", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.adoptRetryInterval = .milliseconds(50)
+    conversation.adoptRetryCount = 5
+    defer { conversation.adoptRetryInterval = .seconds(1) }
+
+    conversation.draft = "just talk"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    // The record every read answers: closed, text, no `display_file` anywhere.
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-42-nofile","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"\(id)","messages":{
+       "\(id)":{"id":"\(id)","role":"assistant","content":"plain prose","model":"local-personal",
+                "done":true,"parentId":null,"childrenIds":[]}}}}}
+    """.utf8)
+
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-42-nofile", messageID: id, inner: [
+        "type": "response.output_text.delta", "delta": "plain prose", "output_index": 1]))
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-42-nofile", messageID: id,
+                              inner: ["choices": [["index": 0, "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+
+    // The adoption loop gets exactly one look for a run that owes no file —
+    // plus at most one GET already in flight when the settle was observed,
+    // because the loop is a fire-and-forget task racing the run's own
+    // bookkeeping. A window of ten retry intervals must then add nothing.
+    let atSettle = transport.chatFetchCount
+    try await Task.sleep(for: .milliseconds(500))
+    #expect(transport.chatFetchCount <= atSettle + 1,
+            "a no-file run kept the adoption loop spinning: \(transport.chatFetchCount - atSettle) extra GETs after the settle (#42)")
+}
+
+// The adoption loop outlives its run by design (it sleeps between looks) —
+// so it stands down when superseded, the same generation discipline #19
+// established for the rebuild inside `adoptStoredMessage`. Here the stream
+// owes a file that never lands, so the loop is provably still retrying when
+// a newer generation takes over.
+@Test @MainActor func aSupersededAdoptionLoopStopsFetching() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-42-adoptgen", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.adoptRetryInterval = .milliseconds(50)
+    conversation.adoptRetryCount = 50  // the loop outlives the whole test
+    defer { conversation.adoptRetryInterval = .seconds(1); conversation.adoptRetryCount = 5 }
+
+    conversation.draft = "make me a pdf"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    // Closed record, no `display_file` anywhere — the stream-side signal is
+    // the only one saying a file is owed, so the loop retries on it.
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-42-adoptgen","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"\(id)","messages":{
+       "\(id)":{"id":"\(id)","role":"assistant","content":"all done","model":"local-personal",
+                "done":true,"parentId":null,"childrenIds":[]}}}}}
+    """.utf8)
+
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-42-adoptgen", messageID: id, inner: [
+        "type": "response.output_text.delta", "delta": "all done", "output_index": 1]))
+    // The stream saw the call (settled, so the finish frame still ends the
+    // run) — the record never grows the result.
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-42-adoptgen", messageID: id, inner: [
+        "done": false, "output": [[
+            "type": "function_call", "name": "display_file", "call_id": "c1",
+            "status": "completed", "arguments": "{\"path\":\"/home/user/deck.pdf\"}",
+        ]]]))
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-42-adoptgen", messageID: id,
+                              inner: ["choices": [["index": 0, "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+
+    conversation.abandon()  // supersede: bumps the generation, no GETs
+    let baseline = transport.chatFetchCount
+    try await Task.sleep(for: .milliseconds(400))  // ~8 retry intervals
+    #expect(transport.chatFetchCount <= baseline + 1,
+            "superseded adoption loop kept fetching: \(transport.chatFetchCount - baseline) extra GETs (#42)")
+}
+
 // #26: the temporary:/local:/incognito early return in load() used to stamp
 // `.ready` unconditionally — mid-run, that unlocked the composer and
 // disarmed reconcile's phase guard, the exact bug #19 closed for the plain

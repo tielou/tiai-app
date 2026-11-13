@@ -3455,10 +3455,12 @@ public final class ConversationModel {
         if outcome.failure == nil, !userStopped, let chat = chatID {
             let id = finished.id
             let streamed = finished.text
-            // A `display_file` call means a card is owed. The result is written
-            // when the server saves the message, which can land a beat after the
-            // run ends, so keep looking for a few seconds rather than concluding
-            // there is no file on the first miss.
+            // A `display_file` call in the STREAM means a card is owed. It is
+            // only one of the two signals — the record may know about a call
+            // the stream never showed (#42), which is what the union
+            // predicate inside `adoptStoredMessage` decides on. The loop
+            // therefore always carries the full budget; the predicate breaks
+            // it early for a run that owes nothing.
             let owesFile = finished.calls.contains { $0.name == "display_file" }
             let api = client
             // Which run this adopt belongs to. The retry loop below can outlive
@@ -3470,14 +3472,24 @@ public final class ConversationModel {
             // Instance knobs for the same reason as `silenceLimit`: a test that
             // has to prove the loop retried (or did NOT retry) cannot sit out
             // five one-second sleeps to find out.
-            let retries = owesFile ? adoptRetryCount : 1
+            let retries = adoptRetryCount
             let retryInterval = adoptRetryInterval
             Task { @MainActor [weak self] in
                 for attempt in 0..<retries {
+                    // #42: the loop outlives its run by design — it sleeps
+                    // between looks — so every look is owned. A newer run has
+                    // started by the time a sleep wakes: its placeholder rows
+                    // are not in any server tree, and a rebuild (or even a
+                    // plain adopt) aimed at the old run's message is at best
+                    // a wasted GET and at worst the #19 clobber. Stand down
+                    // at the top, before the fetch and before the sleep, so
+                    // a superseded loop performs at most the one GET already
+                    // in flight when the supersede landed.
+                    guard let model = self, model.runGeneration == gen else { return }
                     if attempt > 0 { try? await Task.sleep(for: retryInterval) }
-                    guard let model = self else { return }
                     if await ConversationModel.adoptStoredMessage(
-                        model, client: api, chat: chat, id: id, streamed: streamed, gen: gen)
+                        model, client: api, chat: chat, id: id, streamed: streamed, gen: gen,
+                        streamOwed: owesFile)
                     { break }
                 }
             }
@@ -3502,7 +3514,7 @@ public final class ConversationModel {
     /// back.
     private static func adoptStoredMessage(
         _ model: ConversationModel, client: OWUIClient, chat: String,
-        id: String, streamed: String, gen: Int
+        id: String, streamed: String, gen: Int, streamOwed: Bool
     ) async -> Bool {
         guard let detail = try? await client.chat(id: chat),
             let stored = detail.messages[id]
@@ -3545,8 +3557,17 @@ public final class ConversationModel {
         if storedText.count > streamed.count + 1 {
             model.turns[at].text = storedText
         }
-        return model.turns[at].terminalFiles.isEmpty == false
-            || stored.terminalFiles.isEmpty == false
+        // Whether a file card is still owed — the UNION of the two signals:
+        // the record says the run called `display_file` (the result is
+        // written when the server saves the message and can land a beat
+        // after the run ended — the #42 gap: the stream never showed the
+        // call, so the stream-side signal alone concluded "no file owed" and
+        // the card only appeared after leaving and re-entering), or the
+        // stream saw the call. A run that owes a file from either signal
+        // gets the full retry budget; a run that owes none from both breaks
+        // after the first look instead of spinning five GETs.
+        let fileOwed = Turn(stored).calls.contains { $0.name == "display_file" } || streamOwed
+        return !fileOwed || model.turns[at].terminalFiles.isEmpty == false
     }
 
     /// Whether the server still considers this assistant message open.
@@ -3787,6 +3808,12 @@ public final class ConversationModel {
         if !fresh.calls.isEmpty { turn.calls = fresh.calls }
         if !fresh.sources.isEmpty { turn.sources = fresh.sources }
         if !fresh.attachments.isEmpty { turn.attachments = fresh.attachments }
+        // #42: grow-only like the copies above — the reconcile path has to
+        // be able to surface a file card too, and a later read must never
+        // take one away.
+        if turn.terminalFiles.isEmpty, !fresh.terminalFiles.isEmpty {
+            turn.terminalFiles = fresh.terminalFiles
+        }
         turn.usage = fresh.usage ?? turn.usage
         // The stored message is the authority on how the run ended. If it is
         // settled and we are still showing a spinner, the live stream missed
