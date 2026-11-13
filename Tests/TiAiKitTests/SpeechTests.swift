@@ -97,3 +97,60 @@ func nothingToRead() {
     player.dismissError()
     #expect(player.error == nil)
 }
+
+// MARK: - StreamingSentenceReader (issue #53)
+
+@Test func theReaderHoldsTheLastSentenceUntilItIsProvedComplete() {
+    var r = StreamingSentenceReader()
+    // One sentence, however final it looks, is still the LAST one: it is
+    // held. Emitting it and then receiving " more" would speak a word twice.
+    #expect(r.feed("Hello world.") == [])
+    #expect(r.feed("Hello world. Se") == ["Hello world."])
+    #expect(r.feed("Hello world. Second one. Thi") == ["Second one."])
+    // The flush is the only way the tail comes out, and it comes out once.
+    // ("Second one." already went out with the feed that proved it.)
+    #expect(r.flush("Hello world. Second one. Third one.") == ["Third one."])
+    #expect(r.flush("Hello world. Second one. Third one.") == [])
+}
+
+@Test func theReaderNeverRepeatsAcrossFeeds() {
+    var r = StreamingSentenceReader()
+    var heard: [String] = []
+    let full = "Alpha. Beta. Gamma. Delta. Epsilon"
+    // Feed it one character at a time: the worst case for a splitter.
+    for i in 1...full.count {
+        heard += r.feed(String(full.prefix(i)))
+    }
+    heard += r.flush(full)
+    #expect(heard == ["Alpha.", "Beta.", "Gamma.", "Delta.", "Epsilon"])
+}
+
+@Test func theReaderKeepsTheListMarkerAndUrlTraps() {
+    var r = StreamingSentenceReader()
+    // "1." is a list marker, not a sentence end; the whole line is ONE
+    // sentence and must not come out until a successor exists.
+    #expect(r.feed("Steps: 1. Fundament is the base. Next") == ["Steps: 1. Fundament is the base."])
+    var u = StreamingSentenceReader()
+    #expect(u.feed("See https://example.com/page for more. Done") == ["See https://example.com/page for more."])
+}
+
+@Test func theReaderStaysQuietInsideAStreamingCodeFence() {
+    var r = StreamingSentenceReader()
+    // Fences live on their own lines (that is what stripCode keys on).
+    // Mid-fence the code is not speakable, and the sentence before the
+    // fence is only released once something provably follows it.
+    #expect(r.feed("Intro.\n```\ncode()") == [])
+    #expect(r.feed("Intro.\n```\ncode()\n```") == [])
+    // Fence closed, prose after it: stripCode leaves "Intro." and "Out".
+    #expect(r.feed("Intro.\n```\ncode()\n```\nOut") == ["Intro."])
+    #expect(r.flush("Intro.\n```\ncode()\n```\nOut") == ["Out"])
+}
+
+@Test func theReaderSurvivesASettledSingleSentenceAnswer() {
+    // The shape every short answer takes: nothing ever streams out, and
+    // the settle flush says the whole thing — identical to the pre-#53
+    // whole-text read.
+    var r = StreamingSentenceReader()
+    #expect(r.feed("MAGIC") == [])
+    #expect(r.flush("MAGIC") == ["MAGIC"])
+}

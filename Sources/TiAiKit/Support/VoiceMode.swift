@@ -254,6 +254,31 @@ final class VoiceModeController {
             // the parked-question test pins after the mic re-arms.
             lastOutcome = .answer
 
+            // 3a. Read-as-it-streams. Sentences go to the speaker while the
+            // answer is still arriving, instead of waiting for the last
+            // token: `reader` releases only sentences that cannot change
+            // any more, and this child task speaks them in order while the
+            // wait loop below keeps polling. The `defer` closes the stream
+            // on EVERY way out of this cycle — normal end, `continue`,
+            // timeout `return`, cancellation — so the child can never
+            // outlive the cycle that made it, which is what makes it safe
+            // to be a child task at all.
+            let (speech, speechFeed) = AsyncStream<String>.makeStream()
+            var reader = StreamingSentenceReader()
+            var streamedAny = false
+            let speakTask = Task { () -> String? in
+                for await sentence in speech {
+                    if Task.isCancelled { return nil }
+                    do { try await speaker.speak(sentence) }
+                    catch {
+                        return (error as? VoiceModeFailure)?.message
+                            ?? error.localizedDescription
+                    }
+                }
+                return nil
+            }
+            defer { speechFeed.finish(); speakTask.cancel() }
+
             // 3. Wait for the answer to settle — or for one of the ways a send
             // ends without an answer to appear. Every branch here either
             // breaks with something to read or re-arms the mic; none of them
@@ -286,6 +311,17 @@ final class VoiceModeController {
                 if let last = conversation.turns.last, last.id != before,
                    last.isAssistant {
                     loopOwnsCurrentRun = true
+                }
+                // Feed the growing answer. Only the loop's own run is ever
+                // fed — text from a run the loop does not own must not be
+                // read aloud by it.
+                if loopOwnsCurrentRun, let live = conversation.turns.last,
+                   live.id != before, live.isAssistant, live.error == nil {
+                    for sentence in reader.feed(live.text) {
+                        speechFeed.yield(sentence)
+                        streamedAny = true
+                        if phase != .speaking { phase = .speaking }
+                    }
                 }
                 if settled(before: before) { break }
                 if conversation.phase == .ready {
@@ -383,14 +419,44 @@ final class VoiceModeController {
             // `speakText.isEmpty` is the point: a code-only answer is not
             // empty, but everything in it is stripped before speaking, and
             // `SpeechPlayer.read` would answer "nothing to read" every cycle.
-            if !SpeechText.chunks(speakText).isEmpty {
-                phase = .speaking
-                do {
-                    try await speaker.speak(speakText)
-                } catch {
+            if outcome == .question {
+                // A parked question keeps the whole-text read: it is short,
+                // and the settle beat's refetch can rewrite the text the
+                // streaming reader already saw. Whatever the streamer got
+                // out first is part of the question — repeating a phrase
+                // beats reading a half-arrived question.
+                speechFeed.finish()
+                speakTask.cancel()
+                if !SpeechText.chunks(speakText).isEmpty {
+                    phase = .speaking
+                    do {
+                        try await speaker.speak(speakText)
+                    } catch {
+                        if Task.isCancelled { break }
+                        self.error = (error as? VoiceModeFailure)?.message
+                            ?? error.localizedDescription
+                        continue cycle
+                    }
+                }
+            } else {
+                // The tail: the last sentence had no successor to prove it
+                // complete while streaming, and anything that landed after
+                // the wait loop's final poll lives here too.
+                var speakable = streamedAny
+                for sentence in reader.flush(speakText) {
+                    speechFeed.yield(sentence)
+                    speakable = true
+                }
+                speechFeed.finish()
+                if speakable { phase = .speaking }
+                // The child drains in order. A failure it returns is a TTS
+                // round trip dying — the first one, or (since each sentence
+                // is now its own request) one that died mid-answer. Both
+                // surface, because a reading that silently stops halfway
+                // is worse than one that says it is gone.
+                if let failure = await speakTask.value {
                     if Task.isCancelled { break }
-                    self.error = (error as? VoiceModeFailure)?.message
-                        ?? error.localizedDescription
+                    self.error = failure
                     continue cycle
                 }
             }

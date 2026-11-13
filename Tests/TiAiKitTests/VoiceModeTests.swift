@@ -544,3 +544,55 @@ private final class StubSpeaker: VoiceModeSpeaker {
     try await waitUntil { conversation.phase == .ready }
     #expect(speaker.spoken.isEmpty, "stop is stop: the loop read nothing aloud")
 }
+
+@Test @MainActor func theAnswerIsSpokenWhileItIsStillStreaming() async throws {
+    // Issue #53's acceptance rule: the first sentence reaches the speaker
+    // while the run is still streaming, not after the terminal frame.
+    let (conversation, transport, hub) = makeVoiceFixture()
+    let recorder = StubRecorder([.textOnFinish("hello"), .hang])
+    let speaker = StubSpeaker()
+    let controller = VoiceModeController(
+        conversation: conversation, recorder: recorder, speaker: speaker,
+        poll: .milliseconds(2), runTimeout: .seconds(10))
+
+    controller.start()
+    try await waitUntil { recorder.startCount == 1 && controller.phase == .listening }
+    controller.toggle()
+    try await transport.awaitCompletion()
+    let assistantID = try #require(transport.assistantMessageID)
+    func delta(_ text: String) -> ChatEventSocket.Frame {
+        ChatEventSocket.Frame.fixture(
+            kind: "response:completion", chatID: "chat-1", messageID: assistantID,
+            inner: ["type": "response.output_text.delta", "delta": text, "output_index": 1])
+    }
+    hub.receive(ChatEventSocket.Frame.fixture(kind: "response:completion", chatID: "chat-1", messageID: assistantID, inner: [
+        "id": "chatcmpl-1", "object": "chat.completion.chunk", "model": "local-personal",
+        "choices": [["index": 0, "delta": ["content": "", "role": "assistant"]]],
+    ]))
+    // Two sentences: the second is what PROVES the first is complete.
+    hub.receive(delta("First sentence. Second sentence is longer."))
+
+    try await waitUntil { speaker.spoken == ["First sentence."] }
+    // The proof of "while streaming": the run has not settled — no terminal
+    // frame has been fed at all. This same assertion failing to hold is what
+    // the pre-#53 whole-text read would produce.
+    #expect(conversation.phase.isBusy)
+    #expect(controller.phase == .speaking)
+
+    // The tail arrives and finishes: the flush must deliver the rest, in
+    // order, exactly once.
+    hub.receive(delta(" And the tail."))
+    hub.receive(ChatEventSocket.Frame.fixture(kind: "chat:completion", chatID: "chat-1", messageID: assistantID, inner: [
+        "choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]],
+    ]))
+    try await waitUntil {
+        speaker.spoken == [
+            "First sentence.",
+            "Second sentence is longer.",
+            "And the tail.",
+        ]
+    }
+    // The mic re-arms after the reading, as always.
+    try await waitUntil { controller.phase == .listening }
+    controller.stop()
+}

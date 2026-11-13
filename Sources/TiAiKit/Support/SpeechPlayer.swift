@@ -86,6 +86,51 @@ enum SpeechText {
     }
 }
 
+/// Incremental sentence splitter for reading an answer WHILE it streams.
+///
+/// Fed the full text of the growing answer on each poll (streaming text is
+/// cumulative, not deltas) and it emits only sentences that can no longer
+/// change — everything except the last, which may still be growing. The
+/// remainder goes out through `flush` when the answer settles.
+///
+/// The conservative bias is the design: holding a possibly-complete final
+/// sentence until the flush costs at most one sentence of latency, while
+/// emitting a half-sentence would speak a word mid-stream and then say it
+/// again. Two known soft edges, both accepted: a post-streaming correction
+/// that REPLACES earlier text can make the sentence count shrink (the
+/// reader then goes quiet and the flush says whatever survives), and a
+/// markdown marker that streams open across a sentence boundary can leak
+/// its `**` into an emitted sentence — pair-closed markers are always
+/// complete inside an emitted sentence, since only complete sentences are
+/// emitted.
+struct StreamingSentenceReader {
+    private var emitted = 0
+
+    private static func sentences(_ markdown: String) -> [String] {
+        SpeechText.sentences(TextSanitizer.plain(SpeechText.stripCode(markdown)))
+    }
+
+    /// Newly complete sentences, if any. Never returns the trailing,
+    /// possibly-still-growing sentence.
+    mutating func feed(_ markdown: String) -> [String] {
+        let all = Self.sentences(markdown)
+        guard all.count > emitted + 1 else { return [] }
+        let out = Array(all[emitted..<(all.count - 1)])
+        emitted = all.count - 1
+        return out
+    }
+
+    /// Everything not yet spoken, including the final sentence. Call once,
+    /// when the answer settles.
+    mutating func flush(_ markdown: String) -> [String] {
+        let all = Self.sentences(markdown)
+        guard all.count > emitted else { return [] }
+        let out = Array(all[emitted...])
+        emitted = all.count
+        return out
+    }
+}
+
 /// Plays an answer out loud.
 ///
 /// Chunks are fetched one at a time and queued, so speech starts after the first
