@@ -768,14 +768,17 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
 extension ChatEventSocket.Frame {
     /// Builds a frame the way the server does, so the code under test sees the
     /// same dictionary shape `SocketIOClient` hands it.
+    /// `messageID` is optional so a test can build the message-less shape the
+    /// live capture also contains — a frame that names a chat but no message
+    /// (#42 hardening).
     static func fixture(
-        kind: String, chatID: String, messageID: String, inner: [String: Any]
+        kind: String, chatID: String, messageID: String?, inner: [String: Any]
     ) -> ChatEventSocket.Frame {
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "chat_id": chatID,
-            "message_id": messageID,
             "data": ["type": kind, "data": inner],
         ]
+        if let messageID { payload["message_id"] = messageID }
         guard let frame = ChatEventSocket.Frame(payload) else {
             preconditionFailure("test fixture did not round-trip: \(payload)")
         }

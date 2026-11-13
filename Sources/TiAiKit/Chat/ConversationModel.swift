@@ -3467,9 +3467,14 @@ public final class ConversationModel {
             // has started: that run's placeholder rows exist only locally and
             // a rebuild would delete them (issue #19).
             let gen = runGeneration
+            // Instance knobs for the same reason as `silenceLimit`: a test that
+            // has to prove the loop retried (or did NOT retry) cannot sit out
+            // five one-second sleeps to find out.
+            let retries = owesFile ? adoptRetryCount : 1
+            let retryInterval = adoptRetryInterval
             Task { @MainActor [weak self] in
-                for attempt in 0..<(owesFile ? 5 : 1) {
-                    if attempt > 0 { try? await Task.sleep(for: .seconds(1)) }
+                for attempt in 0..<retries {
+                    if attempt > 0 { try? await Task.sleep(for: retryInterval) }
                     guard let model = self else { return }
                     if await ConversationModel.adoptStoredMessage(
                         model, client: api, chat: chat, id: id, streamed: streamed, gen: gen)
@@ -3954,6 +3959,15 @@ public final class ConversationModel {
     /// production default; the budget is read once when the drain installs
     /// the timer, so set it before the run starts.
     var runCeiling: Duration = ConversationModel.runCeiling
+
+    /// Tuning for the post-run file-card adoption loop (the retry loop in the
+    /// drain epilogue), same reasoning as the knobs above: a test that has to
+    /// prove the loop kept looking for a late-landing `display_file` result —
+    /// or stopped looking when no file is owed — cannot sit out five
+    /// one-second sleeps to find out. Both are read when the loop is armed,
+    /// so set them before the run ends.
+    var adoptRetryInterval: Duration = .seconds(1)
+    var adoptRetryCount: Int = 5
 
     /// A failed POST is reported only if the run has not already ended on its own
     /// terms — a stream closed by `stop()` errors on the way out, and calling
