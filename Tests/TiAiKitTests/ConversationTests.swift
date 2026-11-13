@@ -2420,6 +2420,114 @@ enum AskUserFixture {
             "the ceiling must end a stream that never goes quiet and never terminates (#42)")
 }
 
+// #42 close-out (G5): a run that never flushed a token. A tool-only run —
+// or a socket that died before the first delta — lives its whole life at
+// `.waiting`, and `reconcileUntilClosed` refused to watch it ("a run nobody
+// considers live"), so the record was never read and the turn settled on
+// nothing: "The server sent nothing." over a server record that had held
+// the whole answer the entire time. `.waiting` under the CURRENT generation
+// is a live run; the generation gate is what keeps the #19 one-watcher
+// invariant intact while widening the phase guard.
+@Test @MainActor func aRunThatNeverFlushedATokenReconcilesAgainstTheRecord() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-42-waiting", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.silenceLimit = .milliseconds(200)
+    conversation.reconcileInterval = .milliseconds(50)
+    defer {
+        conversation.silenceLimit = ConversationModel.silenceLimit
+        conversation.reconcileInterval = .seconds(2)
+    }
+
+    conversation.draft = "build me the deck"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    func record(done: Bool, content: String) -> Data {
+        Data("""
+        {"id":"chat-42-waiting","title":"t","updated_at":1,"created_at":1,
+         "chat":{"models":["local-personal"],"history":{"currentId":"\(id)","messages":{
+           "\(id)":{"id":"\(id)","role":"assistant","content":"\(content)","model":"local-personal",
+                    "done":\(done),"parentId":null,"childrenIds":[]}}}}}
+        """.utf8)
+    }
+    // The first two reads still have the message open with nothing written
+    // (the run is mid-tool); from the third on the answer is there and
+    // closed. The override keeps every later read — and whichever loop
+    // (adopt, reconcile) wins which entry of the FIFO queue — converging on
+    // the closed record.
+    transport.chatDetailQueue = [
+        record(done: false, content: ""),
+        record(done: false, content: ""),
+        record(done: true, content: "the whole answer"),
+    ]
+    transport.chatDetailOverride = record(done: true, content: "the whole answer")
+
+    // No delta frame ever arrives: the silence watchdog ends the drain with
+    // the run still at `.waiting` — the phase the guard used to bail on.
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+    #expect(conversation.turns.last?.text == "the whole answer",
+            "the stored record has to reach the screen even when no token was ever streamed (#42)")
+    #expect(conversation.error == nil,
+            "a record holding the full answer is not \"the server sent nothing\": \(conversation.error ?? "nil")")
+}
+
+// #19's one-watcher invariant, pinned across the #42 guard change: the
+// heal-on-open reconcile is running (`.streaming`), a new run takes over —
+// generation bumps — and the stale watch must stop polling even though the
+// phase still looks busy (it is the NEW run's phase now). Without the
+// generation gate, a guard widened to `.waiting` would have the stale heal
+// keep polling the new run's `.waiting` forever: two loops, double GETs,
+// one record — the #19 bug reborn.
+@Test @MainActor func aSupersededHealStopsWatchingAndTheNewRunOwnsTheRecord() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-42-healwatch", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.reconcileInterval = .milliseconds(50)
+    // The new run must still be live (and silent) for the whole measurement
+    // window — its own watchdog must not be what ends it.
+    conversation.silenceLimit = .seconds(30)
+    defer {
+        conversation.reconcileInterval = .seconds(2)
+        conversation.silenceLimit = ConversationModel.silenceLimit
+    }
+
+    // The record ends on an assistant message the server still has open —
+    // exactly the heal-on-open shape, and it stays open for the whole test.
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-42-healwatch","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"a-old","messages":{
+       "user-1":{"id":"user-1","role":"user","content":"before","done":true,"parentId":null,"childrenIds":["a-old"]},
+       "a-old":{"id":"a-old","role":"assistant","content":"half","model":"local-personal","done":false,"parentId":"user-1","childrenIds":[]}}}}}
+    """.utf8)
+    await conversation.load()
+    #expect(conversation.phase == .streaming, "the heal is running")
+    // The load's own GET plus at least one reconcile tick: the watch is
+    // provably polling before the supersede.
+    try await waitUntil { transport.chatFetchCount >= 2 }
+
+    conversation.abandon()  // supersede: bumps the generation, no GETs
+    conversation.draft = "next question"
+    conversation.send()
+    try await transport.awaitCompletion()
+    // The new run sits at `.waiting` (no frames delivered): the exact phase
+    // a guard widened without the generation check would let the stale heal
+    // keep polling.
+    let baseline = transport.chatFetchCount
+    try await Task.sleep(for: .milliseconds(400))  // ~8 stale ticks
+    #expect(transport.chatFetchCount <= baseline + 1,
+            "superseded heal kept polling: \(transport.chatFetchCount - baseline) extra GETs after the new run took over (#19)")
+    #expect(conversation.phase == .waiting,
+            "the new run still owns the phase — the stale heal must not hand the composer back")
+}
+
 // #26: the temporary:/local:/incognito early return in load() used to stamp
 // `.ready` unconditionally — mid-run, that unlocked the composer and
 // disarmed reconcile's phase guard, the exact bug #19 closed for the plain

@@ -3860,7 +3860,24 @@ public final class ConversationModel {
                 continue
             }
             // Stop if the user started something else while we were waiting.
-            guard phase == .streaming || phase == .stopping else { return }
+            //
+            // #42: `.waiting` belongs in this guard. A run whose first token
+            // never flushed — a tool-only run, a socket that died before the
+            // first delta — lives at `.waiting` until its drain unwinds, and
+            // bailing here no-op'd the watch for exactly the runs that most
+            // need the record read: the turn settled on "The server sent
+            // nothing." over a record holding the whole answer. `.waiting`
+            // under THIS generation is a live run.
+            //
+            // The generation gate is what keeps the #19 one-watcher invariant
+            // while the phase guard widens: a superseded watch — a heal-on-open
+            // overtaken by a new send, an older run overtaken by a newer one —
+            // must stop polling even though the phase (now the NEWER run's)
+            // still looks busy. Two loops, double GETs, one record is the #19
+            // bug; the stale streaming/stopping loops this gate also closes
+            // were reachable before this change.
+            guard isCurrent(gen),
+                phase == .streaming || phase == .stopping || phase == .waiting else { return }
             self.detail = detail
             guard let message = detail.messages[messageID] else { return }
             if turns.firstIndex(where: { $0.id == messageID }) != nil {
