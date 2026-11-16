@@ -400,7 +400,10 @@ public struct ConversationView: View {
             if let phrase = ProcessInfo.processInfo.environment["TIAI_SPEECH_PROBE"] {
                 Task {
                     do {
-                        let (data, type) = try await session.client.speech(text: phrase)
+                        // Same language-aware voice resolution as SpeechPlayer,
+                        // so probe phrases in the user's language sound right too.
+                        let (data, type) = try await session.client.speech(
+                            text: phrase, voice: VoiceLanguage.voice(for: phrase))
                         OWUIClient.debugLog("speech probe ok: \(data.count) bytes, \(type)")
                     } catch { OWUIClient.debugLog("speech probe failed: \(error)") }
                 }
