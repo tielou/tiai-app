@@ -138,7 +138,10 @@ private typealias Frame = ChatEventSocket.Frame
         kind: "chat:completion", chatID: "chat-1", messageID: assistantID,
         inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
     try await waitUntil { conversation.phase == .ready }
-    #expect(conversation.turns.last?.text == "1 2 3")
+    // The reveal/flush machinery publishes the tail of the buffer on its own
+    // tick, which can land a beat after `.ready` on a loaded runner (#59) —
+    // asserting the text atomically with the phase read the race, not the bug.
+    try await waitUntil { conversation.turns.last?.text == "1 2 3" }
 }
 
 /// Regression for the flaky stop race (issue #3).
@@ -6130,6 +6133,13 @@ private func chatDetailOpen(_ chatID: String, messageID: String, text: String) -
         inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
 
     try await waitUntil(timeout: .seconds(3)) { conversation.phase == .ready }
-    #expect(conversation.turns.first { $0.id == id }?.text == "arrived anyway",
+    // The post-run record read (`adoptStoredMessage`) is what lands "arrived
+    // anyway" over the partial streamed text, and it runs just AFTER `.ready`
+    // — waiting for the text waits for the adopt instead of racing it (#59).
+    // If the deadline regressed the drain never settles and this still fails.
+    try await waitUntil(timeout: .seconds(3)) {
+        conversation.turns.first { $0.id == id }?.text == "arrived anyway"
+    }
+    #expect(conversation.phase == .ready,
             "the run settled, so the loop outlived the hung ribbon update")
 }

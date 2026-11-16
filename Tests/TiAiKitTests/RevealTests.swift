@@ -106,6 +106,10 @@ private func doneFrame(_ chatID: String, _ messageID: String) -> ChatEventSocket
 
     conversation.stop()
     try await waitReveal { conversation.phase == .ready }
+    // The final publish can land one flush tick behind `.ready` on a loaded
+    // runner (#59); the property under test is that the whole buffer DOES
+    // get published, so wait for it rather than snapshotting the race.
+    try await waitReveal { conversation.turns.last?.text == burst }
     #expect(conversation.turns.last?.text == burst,
             "the stop must publish the whole buffer, not the reveal prefix")
 }
