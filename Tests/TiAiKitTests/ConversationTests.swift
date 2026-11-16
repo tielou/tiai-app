@@ -5807,3 +5807,329 @@ private struct NoopCredentials: CredentialStore {
     #expect(session.runPreferences() !== first,
             "another instance's tools and features are not these ones")
 }
+
+// MARK: - Issue #57: the foreground repair path
+
+// The bug: prompt -> background -> foreground -> the stop button pressed and
+// nothing ever answered. `ChatEventHub.isConnected` is only ever written by the
+// socket's own status callback, and iOS is allowed to drop the connection
+// underneath us without that callback ever firing. `resumeAfterBackground()`
+// asked "is the socket still down?" and got "no" from a flag that had been
+// `true` since before the phone ever slept — so nothing was expired, the
+// fallback poll never armed, and the run sat in `.streaming` with a dead
+// stream and a live-looking stop button.
+//
+// The fix has two halves: the hub stops trusting its own cached flag, and the
+// repair path stops asking a question it cannot verify.
+
+@MainActor
+private func makeHub() -> ChatEventHub {
+    ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+}
+
+/// The stale-`true` case, which is the one that produced the bug: the flag
+/// says connected, the transport says otherwise, and a foreground change has
+/// to be the moment that lie gets corrected.
+@Test @MainActor func aStaleConnectedFlagIsResyncedOnForeground() {
+    let hub = makeHub()
+    // No real socket has ever connected, so the transport's true answer is
+    // `false`; the simulation is the flag iOS left behind.
+    hub.simulateSocketStatus(true)
+    #expect(hub.isConnected, "the fixture is the lie, not the truth")
+
+    hub.reconnectIfNeeded()
+
+    #expect(!hub.isConnected,
+            "the resync must correct the flag before the guard reads it")
+    #expect(hub.isReconnecting,
+            "and having corrected it, the reconnect loop has to actually start")
+}
+
+/// The other direction and the quiet case: a flag that already matches the
+/// transport is left alone, and a second call while a retry loop is running
+/// does not start a second loop beside it.
+@Test @MainActor func aFlagThatMatchesTheSocketIsNotTouchedByTheResync() {
+    let hub = makeHub()
+    // The real socket is not connected and neither is the flag: agreement.
+    hub.simulateSocketStatus(false)
+
+    hub.reconnectIfNeeded()
+    #expect(!hub.isConnected, "nothing to correct, so nothing changes")
+    #expect(hub.isReconnecting)
+
+    hub.reconnectIfNeeded()
+    #expect(hub.isReconnecting, "still exactly one loop; the guard holds")
+}
+
+/// A record whose assistant message is still open — the server is still writing.
+private func chatDetailOpen(_ chatID: String, messageID: String, text: String) -> Data {
+    Data("""
+    {"id":"\(chatID)","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"\(messageID)","messages":{
+       "user-1":{"id":"user-1","role":"user","content":"go","done":true,"parentId":null,"childrenIds":["\(messageID)"]},
+       "\(messageID)":{"id":"\(messageID)","role":"assistant","content":"\(text)","model":"local-personal","done":false,"parentId":"user-1","childrenIds":[]}}}}}
+    """.utf8)
+}
+
+/// The headline shape of #57: the flag says connected, the transport says it
+/// is not, and the run is at `.streaming`. The repair has to survive the lie
+/// (commit 1's resync) and expire the watcher, so the answer comes from the
+/// server record in milliseconds instead of from the silence watchdog a
+/// minute later — with `silenceLimit` at 30 s, nothing else can end this run.
+@Test @MainActor func aStaleConnectedFlagStillGetsTheForegroundRepair() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-57-stale")
+    conversation.silenceLimit = .seconds(30)
+    conversation.runCeiling = .seconds(30)
+    conversation.resumeGrace = .milliseconds(50)
+    conversation.reconcileInterval = .milliseconds(20)
+
+    conversation.draft = "go"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-57-stale", messageID: id,
+        inner: ["type": "response.output_text.delta", "delta": "half"]))
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .streaming }
+    transport.chatDetailOverride =
+        chatDetailWithStoredAnswer("chat-57-stale", messageID: id, text: "the whole answer")
+
+    hub.simulateTransportStatus(false)
+    hub.simulateSocketStatus(true)
+    #expect(hub.isConnected, "the fixture is the lie: flag up, transport down")
+
+    conversation.resumeAfterBackground()
+    #expect(!hub.isConnected,
+            "the repair path must not act on the stale flag — commit 1's resync")
+
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+    #expect(conversation.turns.first { $0.id == id }?.text == "the whole answer",
+            "the repair must land the record's answer, not sit on a dead stream")
+    #expect(conversation.error == nil, "\(conversation.error ?? "nil")")
+}
+
+/// The half the stale-flag fix cannot cover: a run whose first token never
+/// flushed lives at `.waiting`, and the old guard was `phase == .streaming`,
+/// so it got no repair at all no matter what the flag said. Same hole #42
+/// closed on the reconcile side.
+@Test @MainActor func aRunThatNeverFlushedATokenGetsTheForegroundRepair() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-57-waiting")
+    conversation.silenceLimit = .seconds(30)
+    conversation.runCeiling = .seconds(30)
+    conversation.resumeGrace = .milliseconds(50)
+    conversation.reconcileInterval = .milliseconds(20)
+
+    conversation.draft = "go"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+    transport.chatDetailOverride =
+        chatDetailWithStoredAnswer("chat-57-waiting", messageID: id, text: "from the record")
+    #expect(conversation.phase == .waiting, "no frame ever arrived: the run is waiting, not streaming")
+    hub.simulateSocketStatus(true)
+
+    conversation.resumeAfterBackground()
+
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+    #expect(conversation.turns.first { $0.id == id }?.text == "from the record")
+}
+
+/// The socket really did come back — so "still down?" says nothing, and the
+/// old code would wait out the whole silence watchdog on a stream that had
+/// already missed its terminal frame. The server record is the only witness:
+/// it says `done`, so the frames are gone and the watcher has to go too.
+@Test @MainActor func aSocketThatCameBackButMissedTheFinishIsExpiredByTheRecord() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-57-back")
+    conversation.silenceLimit = .seconds(30)
+    conversation.runCeiling = .seconds(30)
+    conversation.resumeGrace = .milliseconds(50)
+    conversation.reconcileInterval = .milliseconds(20)
+
+    conversation.draft = "go"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+    transport.chatDetailOverride =
+        chatDetailWithStoredAnswer("chat-57-back", messageID: id, text: "finished while away")
+
+    hub.simulateTransportStatus(true)   // flag and transport agree: connected
+    #expect(hub.isConnected)
+    #expect(transport.chatFetchCount == 0)
+
+    conversation.resumeAfterBackground()
+
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+    #expect(transport.chatFetchCount >= 1, "the repair had to ask the server to know")
+    #expect(conversation.turns.first { $0.id == id }?.text == "finished while away")
+}
+
+/// The other side of the proof branch: the socket is up and the record says
+/// the message is still open, so the server is still writing and the live
+/// stream is worth keeping. Expiring here would trade a working stream for
+/// the chunky fallback poll — the failure mode #33 was about.
+@Test @MainActor func aSocketThatCameBackToAnOpenRecordIsLeftAlone() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-57-open")
+    conversation.silenceLimit = .seconds(30)
+    conversation.runCeiling = .seconds(30)
+    conversation.resumeGrace = .milliseconds(50)
+
+    conversation.draft = "go"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+    transport.chatDetailOverride = chatDetailOpen("chat-57-open", messageID: id, text: "half wri")
+
+    hub.simulateTransportStatus(true)
+    conversation.resumeAfterBackground()
+
+    // Several times the grace: long enough that a repair which was going to
+    // fire has fired, and long enough for a stray GET to show up.
+    try await Task.sleep(for: .milliseconds(400))
+    #expect(transport.chatFetchCount >= 1, "the repair did ask the server")
+    #expect(hub.hasListener(for: "chat-57-open"),
+            "an open record must leave the live listener alone")
+    #expect(conversation.phase == .waiting,
+            "and the run must still be live, not settled on a partial record")
+    #expect(conversation.turns.first { $0.id == id }?.text == "half wri" ||
+            conversation.turns.first { $0.id == id }?.text.isEmpty == true,
+            "nothing from the record should have been force-landed as final")
+}
+
+/// A repair that fires after its run has been replaced must not touch the
+/// listener the NEW run installed — issue #21's hazard, one branch over. The
+/// generation gate is what makes that true, and the phase check cannot: the
+/// phase belongs to the newer run and still looks busy.
+@Test @MainActor func aForegroundRepairDoesNotExpireASupersededRunsSuccessor() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-57-supersede")
+    conversation.silenceLimit = .seconds(30)
+    conversation.runCeiling = .seconds(30)
+    conversation.resumeGrace = .milliseconds(300)
+
+    conversation.draft = "first"
+    conversation.send()
+    try await transport.awaitCompletion()
+
+    conversation.resumeAfterBackground()   // repair armed against run 1
+    conversation.abandon()                 // supersede: bumps the generation
+    conversation.draft = "second"
+    conversation.send()
+    try await transport.awaitCompletion(2)
+    #expect(hub.hasListener(for: "chat-57-supersede"), "run 2 is listening")
+
+    try await Task.sleep(for: .milliseconds(500))   // past run 1's grace
+    #expect(hub.hasListener(for: "chat-57-supersede"),
+            "the stale repair expired the newer run's listener (#21 hazard)")
+    #expect(conversation.phase == .waiting,
+            "and the newer run still owns the phase")
+}
+
+/// Nothing in flight, nothing to repair: the guard has to short-circuit before
+/// scheduling anything, or every foreground change in the app becomes a GET.
+@Test @MainActor func anIdleModelDoesNotScheduleAForegroundRepair() async throws {
+    let (conversation, transport, _) = makePostFailureFixture(chatID: "chat-57-idle")
+    conversation.resumeGrace = .milliseconds(50)
+    transport.chatDetailOverride =
+        chatDetailWithStoredAnswer("chat-57-idle", messageID: "a-1", text: "old answer")
+    #expect(conversation.phase == .ready)
+
+    conversation.resumeAfterBackground()
+
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(transport.chatFetchCount == 0,
+            "an idle model scheduled a repair and went to the server unasked")
+    #expect(conversation.phase == .ready)
+}
+
+/// The veto on the other side of the proofs: text that grew during the grace
+/// window is proof the frames are arriving right now, and a run that is
+/// provably delivering is not a stuck run — even with the socket flag up and
+/// the server record already saying `done`, both of which would otherwise
+/// expire it. Expiring a live run is #33's failure mode (chunky fallback poll,
+/// truncated text, false banners) reintroduced by the repair itself.
+@Test @MainActor func aRunWithFramesStillFlowingIsNotExpiredByTheRepair() async throws {
+    let (conversation, transport, hub) = makePostFailureFixture(chatID: "chat-57-flowing")
+    conversation.silenceLimit = .seconds(30)
+    conversation.runCeiling = .seconds(30)
+    conversation.resumeGrace = .milliseconds(200)
+    conversation.reconcileInterval = .milliseconds(20)
+
+    conversation.draft = "go"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-57-flowing", messageID: id,
+        inner: ["type": "response.output_text.delta", "delta": "one "]))
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .streaming }
+    // The record is closed and the socket is up: both proofs for expiring are
+    // in place, and the only thing standing in the way is the live stream.
+    transport.chatDetailOverride =
+        chatDetailWithStoredAnswer("chat-57-flowing", messageID: id, text: "one two three")
+    hub.simulateTransportStatus(true)
+
+    conversation.resumeAfterBackground()
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-57-flowing", messageID: id,
+        inner: ["type": "response.output_text.delta", "delta": "two "]))
+    try await waitUntil(timeout: .seconds(5)) {
+        conversation.turns.first { $0.id == id }?.text == "one two "
+    }
+
+    try await Task.sleep(for: .milliseconds(600))   // well past the grace
+    #expect(hub.hasListener(for: "chat-57-flowing"),
+            "the repair expired a run whose frames were still arriving")
+    #expect(conversation.phase == .streaming, "and the run must still be live")
+    #expect(conversation.turns.first { $0.id == id }?.text == "one two ",
+            "nothing from the record should have been force-landed over the live text")
+    #expect(transport.chatFetchCount == 0,
+            "the veto comes before the GET: a live run is never interrogated")
+}
+
+/// The drain awaits the Live Activity update inside the frame loop, and that
+/// await is an XPC call into another process. A call that never came back would
+/// park the loop — frames arriving, text growing, the run never ending — and
+/// the silence watchdog cannot save it, because the watchdog is re-armed inside
+/// the loop that is parked. So the update runs in its own task and the drain
+/// waits on a deadline instead.
+///
+/// The stub ribbon is told to hang, and to ignore cancellation (the call that
+/// does not come back, not the one that comes back late); the deadline is a
+/// fraction of that. If the drain still finishes the run, it walked away from
+/// the update rather than waiting for it.
+@Test @MainActor func aRibbonUpdateThatNeverReturnsCannotWedgeTheFrameLoop() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let ribbon = GenerationActivity()
+    let conversation = ConversationModel(
+        chatID: "chat-57-ribbon", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport),
+        hub: hub, activity: ribbon)
+    ribbon.simulateUpdateHang = true
+    defer { ribbon.simulateUpdateHang = false }   // releases the abandoned task
+    conversation.activityUpdateLimit = .milliseconds(100)
+    conversation.silenceLimit = .seconds(30)
+    conversation.runCeiling = .seconds(30)
+    conversation.reconcileInterval = .milliseconds(20)
+
+    conversation.draft = "go"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+    try await waitUntil { ribbon.isRibbonActive }
+    transport.chatDetailOverride =
+        chatDetailWithStoredAnswer("chat-57-ribbon", messageID: id, text: "arrived anyway")
+
+    // The delta is the frame that raises the hung update; the terminal frame
+    // behind it is the thing the loop must still get to.
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-57-ribbon", messageID: id,
+        inner: ["type": "response.output_text.delta", "delta": "half"]))
+    hub.receive(Frame.fixture(
+        kind: "chat:completion", chatID: "chat-57-ribbon", messageID: id,
+        inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
+
+    try await waitUntil(timeout: .seconds(3)) { conversation.phase == .ready }
+    #expect(conversation.turns.first { $0.id == id }?.text == "arrived anyway",
+            "the run settled, so the loop outlived the hung ribbon update")
+}

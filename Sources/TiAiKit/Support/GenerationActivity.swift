@@ -235,9 +235,25 @@ public final class GenerationActivity {
         activeChatID = chatID
     }
 
+    /// Issue #57 test seam: makes `update` park until the flag goes back to
+    /// false, standing in for the ActivityKit XPC call that never comes back.
+    /// It ignores task cancellation on purpose — what is being simulated is the
+    /// call that does not return, not one that returns late — so a "fix" that
+    /// merely cancels the update and waits for it does not pass. Tests clear
+    /// the flag when they are done; a forgotten flag gives up after 30s rather
+    /// than hanging the process. Production code must never set this.
+    var simulateUpdateHang = false
+
     public func update(phase: GenerationActivityAttributes.ContentState.Phase,
                        characters: Int, chatID: String?) async {
         guard isRibbonActive, ribbonMatches(owner: activeChatID, caller: chatID) else { return }
+        if simulateUpdateHang {
+            let deadline = ContinuousClock.now + .seconds(30)
+            while simulateUpdateHang, ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            return
+        }
         acceptedUpdates += 1
     }
 

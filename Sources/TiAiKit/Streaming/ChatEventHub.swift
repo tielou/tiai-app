@@ -104,6 +104,19 @@ public final class ChatEventHub {
     /// a send still works without the socket, and the refetch a run already does
     /// recovers any frames that were missed.
     public func reconnectIfNeeded() {
+        // Issue #57: resync the cached flag from the transport before
+        // trusting it. `isConnected` is only ever written by the socket's own
+        // status callback and by `connect()`, and iOS can drop the underlying
+        // connection without that callback ever firing. The foreground repair
+        // path calls this and then asks "still down?" — and a stale `true`
+        // answered "no" forever: no expiry, no fallback poll, a stop button
+        // pressed on a run that was never going to answer.
+        //
+        // Reading `socket.isConnected` is a synchronous status read, so this
+        // cannot block or suspend, and it only ever writes on a difference.
+        let actual = simulatedTransportStatus ?? socket.isConnected
+        if actual != isConnected { isConnected = actual }
+
         guard !isConnected, !reconnecting else { return }
         reconnecting = true
         Task { [weak self] in
@@ -125,6 +138,34 @@ public final class ChatEventHub {
             self.reconnecting = false
         }
     }
+
+    /// Test seam: forces the cached `isConnected` flag without a real socket,
+    /// standing in for the iOS behaviour this issue is about — the flag lying
+    /// because the status callback never fired. Production code must never call
+    /// this.
+    func simulateSocketStatus(_ connected: Bool) {
+        isConnected = connected
+    }
+
+    /// Test seam for the other half of the same bug: what the *transport*
+    /// reports, as opposed to what the cached flag says (set that one with
+    /// `simulateSocketStatus`). Setting it also moves the flag to match, which
+    /// is what a real status callback does — so a test that wants "the socket
+    /// genuinely came back" sets only this one, and a test that wants "the flag
+    /// is a lie" sets this to false and the flag to true.
+    /// Production code must never call this.
+    func simulateTransportStatus(_ connected: Bool) {
+        simulatedTransportStatus = connected
+        isConnected = connected
+    }
+
+    private var simulatedTransportStatus: Bool?
+
+    /// Whether a retry loop is running. Test-support for the issue #57 resync
+    /// tests: "the resync got past the guard and actually started a reconnect"
+    /// is not observable from outside otherwise (`reconnecting` is private and
+    /// the loop's first attempt is a real network call).
+    var isReconnecting: Bool { reconnecting }
 
     public func disconnect() {
         socket.disconnect()

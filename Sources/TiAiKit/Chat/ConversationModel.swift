@@ -1294,22 +1294,127 @@ public final class ConversationModel {
         catch let problem { error = "Live streaming is unavailable: \(problem.localizedDescription)" }
     }
 
-    /// Coming back to the foreground with a run still marked as streaming.
+    /// Coming back to the foreground with a run still in flight.
     ///
     /// iOS kills the socket in the background and the server keeps writing, so
-    /// the answer is already finished by the time you look again — but the run is
-    /// sitting on a frame stream that will never see them. If the reconnect does
-    /// not come back, end the stream so the run reconciles against the server
-    /// record now instead of after the silence watchdog.
+    /// the answer is often already finished by the time you look again — but the
+    /// run is sitting on a frame stream that will never see them. Left alone it
+    /// sits there for the whole silence watchdog (a minute of stop button),
+    /// which is the issue #57 symptom: prompt, background, foreground, stop.
+    ///
+    /// The old version asked one question — "is the socket still down after the
+    /// reconnect grace?" — and had three holes:
+    ///
+    /// * the guard was `phase == .streaming`, so a run whose first token never
+    ///   flushed (`.waiting`) or a run the user had pressed stop on (`.stopping`)
+    ///   got no repair at all. Same class of hole #42 closed for reconcile.
+    /// * `ChatEventHub.isConnected` could be a stale `true` (issue #57's first
+    ///   commit), so the question answered "no" forever and nothing was expired.
+    /// * even when the socket did come back, nothing checked whether the run was
+    ///   still alive: a terminal frame lost during the handover left the stream
+    ///   open, the record closed, and the run waiting for a frame that already
+    ///   went past us in the dark.
+    ///
+    /// So: wait out the reconnect grace, and then act on one of two proofs.
+    /// Either the socket is *still* down — nothing is coming, end the stream and
+    /// let the run reconcile against the server record now — or the socket came
+    /// back but the server says this message is already `done`, which means the
+    /// frames we missed are never going to arrive and the same expiry is the
+    /// right answer. A failed read or an open record means the server is still
+    /// working and the wait is honest, so it is left alone: expiring there would
+    /// trade a live stream for the chunky fallback poll.
+    ///
+    /// And before either proof is allowed to fire, one veto: if this run's text
+    /// grew during the grace window, frames are arriving right now and the run
+    /// is not stuck at all, whatever the flag or the record says.
     public func resumeAfterBackground() {
         hub.reconnectIfNeeded()
-        guard phase == .streaming, let chat = chatID else { return }
-        Task { [weak self] in
-            try? await Task.sleep(for: ChatEventHub.reconnectGrace)
-            guard let self, self.phase == .streaming, !self.hub.isConnected else { return }
-            self.hub.expire(chatID: chat)
+        // Issue #57: `.isBusy`, not `.streaming` — see the doc comment.
+        guard phase.isBusy else { return }
+
+        let gen = runGeneration
+        // Single flight: `scenePhase` bounces active → background → active in a
+        // moment (a notification sheet, a control-centre swipe), and two repairs
+        // watching one run is two GETs and two expiries for the same fact. The
+        // newest foreground is the one that matters, so the older is cancelled.
+        foregroundRepair?.cancel()
+        foregroundRepairID += 1
+        let repairID = foregroundRepairID
+        // How much had arrived when the repair was armed: text that grew during
+        // the grace window is proof the frames are flowing right now, and a run
+        // that is provably delivering is not a stuck run whatever the flag or
+        // the record says.
+        let charactersAtSchedule = pending?.text.count ?? 0
+        foregroundRepair = Task { [weak self] in
+            guard let self else { return }
+            // The slot is ours until a newer repair replaces it; a repair that
+            // finishes must not clear a slot that has since been taken over.
+            defer { if self.foregroundRepairID == repairID { self.foregroundRepair = nil } }
+            try? await Task.sleep(for: self.resumeGrace)
+            // Everything is re-checked after the sleep: ten seconds of
+            // foreground is long enough for the run to finish, to be stopped,
+            // or to be replaced by the next question.
+            guard !Task.isCancelled,
+                  self.foregroundRepairID == repairID,
+                  self.isCurrent(gen),
+                  self.phase.isBusy else { return }
+
+            // Frames are provably still arriving — the same evidence the
+            // silence watchdog accepts (a frame for THIS message re-arms it).
+            // Expiring here would trade live streaming for the chunky fallback
+            // poll, which is #33's failure mode reintroduced by the repair.
+            if (self.pending?.text.count ?? 0) > charactersAtSchedule { return }
+
+            if !self.hub.isConnected {
+                // Proof 1: still down after the grace. Nothing is coming.
+                self.expireForegroundListener()
+                return
+            }
+
+            // Proof 2 needs the server's opinion. Without an id there is no
+            // record to read, and guessing is what the old code was doing.
+            guard let chat = self.chatID, let message = self.pending?.id else { return }
+            guard let detail = try? await self.client.chat(id: chat),
+                  detail.messages[message]?.done == true else { return }
+            // The GET was a suspension: a newer run may have taken over while it
+            // was in flight, and expiring now would end THAT run's listener
+            // (issue #21's hazard, one branch over). Same full gate as the
+            // pre-GET one — a repair cancelled by a newer .active must not
+            // land its expire after the suspension either.
+            guard !Task.isCancelled,
+                  self.foregroundRepairID == repairID,
+                  self.isCurrent(gen),
+                  self.phase.isBusy else { return }
+            self.expireForegroundListener()
         }
     }
+
+    /// Issue #57: ends the listener this run installed. That is the mechanism by
+    /// which "no frames are coming" becomes "the drain unwinds and reconciles
+    /// against the server record", and it is the same address-selection idiom as
+    /// the silence watchdog: a brand-new chat's listener may never have adopted a
+    /// chat id, and `expire(chatID:)` on a nil id matches nothing.
+    private func expireForegroundListener() {
+        if let chat = chatID {
+            hub.expire(chatID: chat)
+        } else if let token = waitingToken {
+            hub.expire(waitingToken: token)
+        }
+    }
+
+    /// The in-flight foreground repair, at most one per model — see
+    /// `resumeAfterBackground`.
+    @ObservationIgnored private var foregroundRepair: Task<Void, Never>?
+    /// Monotonic id of the last scheduled repair, so a repair can tell "I am
+    /// still the current one" from "a newer foreground already replaced me".
+    @ObservationIgnored private var foregroundRepairID = 0
+
+    /// Tuning for `resumeAfterBackground`, same reasoning as `silenceLimit`: a
+    /// test that has to prove the repair fired cannot sit out ten seconds, and a
+    /// test that has to prove it did NOT fire cannot wait on them either. The
+    /// static stays the production default — the hub's own grace, which is how
+    /// long the socket is allowed to be down before runs stop waiting for it.
+    var resumeGrace: Duration = ChatEventHub.reconnectGrace
 
     // MARK: - loading
 
@@ -3345,10 +3450,9 @@ public final class ConversationModel {
             if let delta = frame.delta { pending?.text += delta }
             if let thinking = frame.reasoningDelta { pending?.reasoning += thinking }
             if let pending {
-                await activity.update(
+                await updateActivityBounded(
                     phase: pending.text.isEmpty ? .thinking : .writing,
-                    characters: pending.text.count,
-                    chatID: chatID)
+                    characters: pending.text.count)
             }
             // Abandon plus a newer send can interleave at `activity.update`'s
             // await: everything below belongs to whoever owns `pending` now.
@@ -3979,6 +4083,57 @@ public final class ConversationModel {
     var reconcileInterval: Duration = .seconds(2)
     var reconcileStallLimit = 15
     var reconcileBudget = 150
+
+    /// Issue #57: the drain's live-activity update, with a deadline.
+    ///
+    /// `GenerationActivity.update` is an XPC round trip into another process,
+    /// awaited inside the frame loop because `Activity` is not `Sendable` (see
+    /// that type). A call that never came back would park the drain there —
+    /// frames arriving, text growing, the run never ending — which is #57's
+    /// symptom from a completely different direction, and one the watchdog
+    /// cannot save: the watchdog is re-armed inside the loop that is parked.
+    ///
+    /// So the update runs in its own task and the drain waits on the deadline
+    /// rather than on the update. A plain `withTaskGroup` cannot express that:
+    /// a group waits for every child before it returns, so a group that owns a
+    /// hung call is a drain that owns a hung call. The group here owns only the
+    /// two things guaranteed to finish — the deadline, and a waiter on the
+    /// update's completion signal — and the update itself is abandoned if it
+    /// overruns. A ribbon that missed one tick is a stale ribbon for a moment;
+    /// the next frame updates it again, and `update` throttles itself to one
+    /// call per 200 characters anyway, so this is not per-frame machinery.
+    private func updateActivityBounded(
+        phase: GenerationActivityAttributes.ContentState.Phase,
+        characters: Int
+    ) async {
+        let (signal, finished) = AsyncStream<Void>.makeStream()
+        let update = Task { [activity, chatID] in
+            await activity.update(phase: phase, characters: characters, chatID: chatID)
+            finished.finish()
+        }
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { for await _ in signal {} }
+            group.addTask {
+                try? await Task.sleep(for: self.activityUpdateLimit)
+                finished.finish()   // the deadline releases the waiter
+            }
+            await group.next()
+            group.cancelAll()
+        }
+        // Best effort: a ribbon update that overran its budget is not worth
+        // another one, but it is worth cancelling (a completed task ignores
+        // it). Not awaited — that is the whole point of this function.
+        update.cancel()
+    }
+
+    /// How long a live-activity update may take before the drain walks away
+    /// from it. Generous for a call that normally returns in microseconds and
+    /// fires once per 200 characters; short enough that a wedged XPC call costs
+    /// a stalled frame rather than a stuck run.
+    /// Instance knob for the same reason as `silenceLimit`: a test has to prove
+    /// the deadline fired without sitting out the real two seconds.
+    var activityUpdateLimit: Duration = ConversationModel.activityUpdateLimit
+    static let activityUpdateLimit: Duration = .seconds(2)
 
     /// Tuning for the drain flush timer, same reasoning as `reconcileInterval`:
     /// a test that has to prove the flusher did *not* tick cannot sit out a
