@@ -154,3 +154,111 @@ func nothingToRead() {
     #expect(r.feed("MAGIC") == [])
     #expect(r.flush("MAGIC") == ["MAGIC"])
 }
+
+// MARK: - language-aware voice + prefetch (TTS improvement, no issue)
+
+@Test("the language of the answer picks the voice; english keeps the server default")
+func languagePicksTheVoice() {
+    // Detection needs a few words to have an opinion; real answers always
+    // have them. English is deliberately NOT in the map — the server
+    // default is English and stays the authority for it.
+    #expect(VoiceLanguage.voice(
+        for: "Hallo, hier ist eine ausfuehrliche Antwort auf Deutsch, damit die Erkennung etwas hat.")
+        == "de-DE-KatjaNeural")
+    #expect(VoiceLanguage.voice(
+        for: "Bonjour, voici une reponse un peu longue en francais pour la reconnaissance.")
+        == "fr-FR-DeniseNeural")
+    #expect(VoiceLanguage.voice(
+        for: "Hello, this is a longer English answer so the recognizer has something to work with.")
+        == nil)
+}
+
+/// Transport that answers /audio/speech with a small body, records the
+/// `voice` of every request and the moment each request started, and takes
+/// a beat per request so fetch/play overlap is observable.
+@MainActor
+final class SpeechRecordingTransport: APITransport, @unchecked Sendable {
+    struct Call { let voice: String?; let started: Date }
+    private(set) var calls: [Call] = []
+    var fetchDelay: Duration = .milliseconds(100)
+
+    func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        calls.append(Call(voice: Self.voice(in: request), started: .now))
+        try await Task.sleep(for: fetchDelay)
+        let http = HTTPURLResponse(
+            url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "audio/mpeg"])!
+        return (Data([0xFF, 0xFB, 0x90, 0x00]), http)
+    }
+    func bytes(_ request: URLRequest) async throws -> (ByteStream, HTTPURLResponse) {
+        let http = HTTPURLResponse(
+            url: request.url!, statusCode: 405, httpVersion: "HTTP/1.1", headerFields: nil)!
+        return (ByteStream { AsyncThrowingStream { $0.finish() } }, http)
+    }
+
+    private static func voice(in request: URLRequest) -> String? {
+        guard let body = request.httpBody,
+            let json = try? JSONSerialization.jsonObject(with: body) as? [String: String]
+        else { return nil }
+        return json["voice"]
+    }
+}
+
+/// Playback seam double: "plays" by sleeping, and records when it finished.
+@MainActor
+final class FakeSpeechEngine: SpeechPlaying, @unchecked Sendable {
+    private(set) var playEnds: [Date] = []
+    var playTime: Duration = .milliseconds(300)
+
+    func play(data: Data, mime: String) async {
+        try? await Task.sleep(for: playTime)
+        playEnds.append(.now)
+    }
+    func stop() {}
+}
+
+@Test("a picked voice always wins over the detected language")
+@MainActor func userVoiceWins() async throws {
+    let transport = SpeechRecordingTransport()
+    let client = OWUIClient(
+        server: Server(baseURL: URL(string: "https://chat.example.co")!, token: "tok"),
+        transport: transport)
+    let player = SpeechPlayer(client: client, engine: FakeSpeechEngine())
+    let german = "Hallo, hier ist eine ausfuehrliche Antwort auf Deutsch, damit die Erkennung etwas hat."
+
+    player.read(german)
+    for _ in 0..<200 where player.isPlaying { try await Task.sleep(for: .milliseconds(20)) }
+    #expect(transport.calls.first?.voice == "de-DE-KatjaNeural")
+
+    transport.calls.removeAll()
+    player.setVoice("my-voice")
+    player.read(german)
+    for _ in 0..<200 where player.isPlaying { try await Task.sleep(for: .milliseconds(20)) }
+    #expect(transport.calls.first?.voice == "my-voice")
+}
+
+@Test("the next chunk is fetched while the current one is still playing")
+@MainActor func prefetchOverlapsPlayback() async throws {
+    // Three chunks: fetch takes 100ms, playback 300ms. Sequential code
+    // starts fetch #2 only after play #1 ends (~400ms in); a prefetching
+    // reader starts it right after fetch #1 lands (~100ms in). The margin
+    // is wide enough that a loaded CI runner cannot flip the verdict.
+    let transport = SpeechRecordingTransport()
+    let engine = FakeSpeechEngine()
+    let client = OWUIClient(
+        server: URL(string: "https://chat.example.co")!.withToken("tok").server.map { $0 }
+            ?? Server(baseURL: URL(string: "https://chat.example.co")!, token: "tok"),
+        transport: transport)
+    let player = SpeechPlayer(client: client, engine: engine)
+
+    let sentence = String(repeating: "wort ", count: 130)   // ~650 chars, one chunk each
+    player.read("\(sentence). A. \(sentence). B. \(sentence). C.")
+    for _ in 0..<500 where player.isPlaying { try await Task.sleep(for: .milliseconds(20)) }
+
+    #expect(transport.calls.count >= 2)
+    #expect(engine.playEnds.count >= 1)
+    let margin: TimeInterval = 0.15
+    #expect(transport.calls[1].started.timeIntervalSince(transport.calls[0].started)
+            < engine.playEnds[0].timeIntervalSince(transport.calls[0].started) - margin,
+            "chunk 2 was fetched only after chunk 1 finished playing — no prefetch")
+}
