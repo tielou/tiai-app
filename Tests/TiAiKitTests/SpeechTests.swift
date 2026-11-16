@@ -228,13 +228,14 @@ final class FakeSpeechEngine: SpeechPlaying, @unchecked Sendable {
 
     player.read(german)
     for _ in 0..<200 where player.isPlaying { try await Task.sleep(for: .milliseconds(20)) }
-    #expect(transport.calls.first?.voice == "de-DE-KatjaNeural")
+    #expect(transport.calls.allSatisfy { $0.voice == "de-DE-KatjaNeural" })
 
     transport.calls.removeAll()
     player.setVoice("my-voice")
     player.read(german)
     for _ in 0..<200 where player.isPlaying { try await Task.sleep(for: .milliseconds(20)) }
-    #expect(transport.calls.first?.voice == "my-voice")
+    #expect(!transport.calls.isEmpty)
+    #expect(transport.calls.allSatisfy { $0.voice == "my-voice" })
 }
 
 @Test("the next chunk is fetched while the current one is still playing")

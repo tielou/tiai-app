@@ -194,8 +194,11 @@ public final class SpeechPlayer: ObservableObject {
             // Voice resolution runs ONCE on the full text, not per chunk: a
             // two-word chunk gives the recognizer nothing to work with, while
             // the whole answer gives it plenty. An explicit pick from Settings
-            // always wins over detection.
-            let voice = self.voice ?? VoiceLanguage.voice(for: markdown)
+            // always wins over detection. Detection sees the SAME text the
+            // speech will hear — a German answer with a big English code
+            // block must not detect as English through the code.
+            let voice = self.voice
+                ?? VoiceLanguage.voice(for: TextSanitizer.plain(SpeechText.stripCode(markdown)))
             // Unstructured child tasks do not inherit the parent's
             // cancellation, so every break path below cancels `next`
             // explicitly.
@@ -221,8 +224,12 @@ public final class SpeechPlayer: ObservableObject {
                     await self.engine.play(data: data, mime: type)
                 } catch {
                     next?.cancel()
-                    // Only the first failure is worth saying out loud.
-                    if index == 0 {
+                    // Only the first failure is worth saying out loud — and
+                    // a failure that lands after stop() cancelled this task
+                    // is not a failure the user asked for (the reviewer's
+                    // stop-then-read race: a stale task must not paint the
+                    // fresh session's banner).
+                    if index == 0, !Task.isCancelled {
                         self.error = (error as? LocalizedError)?.errorDescription
                             ?? "Could not produce audio."
                     }
@@ -230,7 +237,9 @@ public final class SpeechPlayer: ObservableObject {
                 }
                 if let next { inflight = next }
             }
-            self.isPlaying = false
+            // `stop()` already clears this; writing it from a cancelled task
+            // would clobber the NEXT read()'s state (stop-then-read race).
+            if !Task.isCancelled { self.isPlaying = false }
         }
     }
 
