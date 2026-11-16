@@ -768,14 +768,17 @@ final class ScriptedTransport: APITransport, @unchecked Sendable {
 extension ChatEventSocket.Frame {
     /// Builds a frame the way the server does, so the code under test sees the
     /// same dictionary shape `SocketIOClient` hands it.
+    /// `messageID` is optional so a test can build the message-less shape the
+    /// live capture also contains — a frame that names a chat but no message
+    /// (#42 hardening).
     static func fixture(
-        kind: String, chatID: String, messageID: String, inner: [String: Any]
+        kind: String, chatID: String, messageID: String?, inner: [String: Any]
     ) -> ChatEventSocket.Frame {
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "chat_id": chatID,
-            "message_id": messageID,
             "data": ["type": kind, "data": inner],
         ]
+        if let messageID { payload["message_id"] = messageID }
         guard let frame = ChatEventSocket.Frame(payload) else {
             preconditionFailure("test fixture did not round-trip: \(payload)")
         }
@@ -2415,6 +2418,358 @@ enum AskUserFixture {
     try await waitUntil(timeout: .seconds(3)) { conversation.phase == .ready }
     #expect(conversation.phase == .ready,
             "the ceiling must end a stream that never goes quiet and never terminates (#42)")
+}
+
+// #42 close-out (G5): a run that never flushed a token. A tool-only run —
+// or a socket that died before the first delta — lives its whole life at
+// `.waiting`, and `reconcileUntilClosed` refused to watch it ("a run nobody
+// considers live"), so the record was never read and the turn settled on
+// nothing: "The server sent nothing." over a server record that had held
+// the whole answer the entire time. `.waiting` under the CURRENT generation
+// is a live run; the generation gate is what keeps the #19 one-watcher
+// invariant intact while widening the phase guard.
+@Test @MainActor func aRunThatNeverFlushedATokenReconcilesAgainstTheRecord() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-42-waiting", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.silenceLimit = .milliseconds(200)
+    conversation.reconcileInterval = .milliseconds(50)
+    defer {
+        conversation.silenceLimit = ConversationModel.silenceLimit
+        conversation.reconcileInterval = .seconds(2)
+    }
+
+    conversation.draft = "build me the deck"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    func record(done: Bool, content: String) -> Data {
+        Data("""
+        {"id":"chat-42-waiting","title":"t","updated_at":1,"created_at":1,
+         "chat":{"models":["local-personal"],"history":{"currentId":"\(id)","messages":{
+           "\(id)":{"id":"\(id)","role":"assistant","content":"\(content)","model":"local-personal",
+                    "done":\(done),"parentId":null,"childrenIds":[]}}}}}
+        """.utf8)
+    }
+    // The first two reads still have the message open with nothing written
+    // (the run is mid-tool); from the third on the answer is there and
+    // closed. The override keeps every later read — and whichever loop
+    // (adopt, reconcile) wins which entry of the FIFO queue — converging on
+    // the closed record.
+    transport.chatDetailQueue = [
+        record(done: false, content: ""),
+        record(done: false, content: ""),
+        record(done: true, content: "the whole answer"),
+    ]
+    transport.chatDetailOverride = record(done: true, content: "the whole answer")
+
+    // No delta frame ever arrives: the silence watchdog ends the drain with
+    // the run still at `.waiting` — the phase the guard used to bail on.
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+    #expect(conversation.turns.last?.text == "the whole answer",
+            "the stored record has to reach the screen even when no token was ever streamed (#42)")
+    #expect(conversation.error == nil,
+            "a record holding the full answer is not \"the server sent nothing\": \(conversation.error ?? "nil")")
+}
+
+// #19's one-watcher invariant, pinned across the #42 guard change: the
+// heal-on-open reconcile is running (`.streaming`), a new run takes over —
+// generation bumps — and the stale watch must stop polling even though the
+// phase still looks busy (it is the NEW run's phase now). Without the
+// generation gate, a guard widened to `.waiting` would have the stale heal
+// keep polling the new run's `.waiting` forever: two loops, double GETs,
+// one record — the #19 bug reborn.
+@Test @MainActor func aSupersededHealStopsWatchingAndTheNewRunOwnsTheRecord() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-42-healwatch", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.reconcileInterval = .milliseconds(50)
+    // The new run must still be live (and silent) for the whole measurement
+    // window — its own watchdog must not be what ends it.
+    conversation.silenceLimit = .seconds(30)
+    defer {
+        conversation.reconcileInterval = .seconds(2)
+        conversation.silenceLimit = ConversationModel.silenceLimit
+    }
+
+    // The record ends on an assistant message the server still has open —
+    // exactly the heal-on-open shape, and it stays open for the whole test.
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-42-healwatch","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"a-old","messages":{
+       "user-1":{"id":"user-1","role":"user","content":"before","done":true,"parentId":null,"childrenIds":["a-old"]},
+       "a-old":{"id":"a-old","role":"assistant","content":"half","model":"local-personal","done":false,"parentId":"user-1","childrenIds":[]}}}}}
+    """.utf8)
+    await conversation.load()
+    #expect(conversation.phase == .streaming, "the heal is running")
+    // The load's own GET plus at least one reconcile tick: the watch is
+    // provably polling before the supersede.
+    try await waitUntil { transport.chatFetchCount >= 2 }
+
+    conversation.abandon()  // supersede: bumps the generation, no GETs
+    conversation.draft = "next question"
+    conversation.send()
+    try await transport.awaitCompletion()
+    // The new run sits at `.waiting` (no frames delivered): the exact phase
+    // a guard widened without the generation check would let the stale heal
+    // keep polling.
+    let baseline = transport.chatFetchCount
+    try await Task.sleep(for: .milliseconds(400))  // ~8 stale ticks
+    #expect(transport.chatFetchCount <= baseline + 1,
+            "superseded heal kept polling: \(transport.chatFetchCount - baseline) extra GETs after the new run took over (#19)")
+    #expect(conversation.phase == .waiting,
+            "the new run still owns the phase — the stale heal must not hand the composer back")
+}
+
+// #42 close-out (G2): the file card arrives live, not after a re-enter.
+// The `display_file` RESULT is written when the server saves the message,
+// which can land after the run ended — and when the stream never showed the
+// call (owesFile false), the adopt loop made exactly one look and gave up.
+// The record itself says a file is owed (the call is in `output` before the
+// result is); the loop has to read that signal, not just the stream's.
+@Test @MainActor func aFileThatLandsInTheRecordAfterTheRunEndsAppearsLive() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-42-filelive", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.adoptRetryInterval = .milliseconds(50)
+    defer { conversation.adoptRetryInterval = .seconds(1) }
+
+    conversation.draft = "make me a pdf"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    // The stored record's `output`: the call, and (once the save lands) the
+    // result joined by `call_id` — the wire shape pinned by
+    // TerminalFileTests.
+    func outputJSON(withResult: Bool) -> String {
+        let meta = """
+        {"path":"/home/user/deck.pdf","exists":true,"type":"file",\
+        "source":"open_terminal","terminal_selector":"sandbox",\
+        "name":"deck.pdf","mime_type":"application/pdf"}
+        """
+        var items: [JSONValue] = [
+            .object([
+                "type": .string("function_call"), "name": .string("display_file"),
+                "call_id": .string("c1"),
+                "arguments": .string("{\"path\":\"/home/user/deck.pdf\"}"),
+            ]),
+        ]
+        if withResult {
+            items.append(.object([
+                "type": .string("function_call_output"), "call_id": .string("c1"),
+                "output": .array([.object([
+                    "type": .string("input_text"), "text": .string(meta),
+                ])]),
+            ]))
+        }
+        return String(decoding: try! JSONEncoder().encode(items), as: UTF8.self)
+    }
+    func record(withResult: Bool) -> Data {
+        Data("""
+        {"id":"chat-42-filelive","title":"t","updated_at":1,"created_at":1,
+         "chat":{"models":["local-personal"],"history":{"currentId":"\(id)","messages":{
+           "\(id)":{"id":"\(id)","role":"assistant","content":"all done","model":"local-personal",
+                    "done":true,"parentId":null,"childrenIds":[],"output":\(outputJSON(withResult: withResult))}}}}}
+        """.utf8)
+    }
+    // Read 1 is the finish frame's `serverStillOpen` refetch: closed, but
+    // the file result is not saved yet. Reads 2 and 3 (the adopt loop's
+    // first look and the post-terminal reconcile, whichever wins which)
+    // still lack the result; from read 4 on it is there.
+    transport.chatDetailQueue = [
+        record(withResult: false), record(withResult: false), record(withResult: false),
+    ]
+    transport.chatDetailOverride = record(withResult: true)
+
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-42-filelive", messageID: id, inner: [
+        "type": "response.output_text.delta", "delta": "all done", "output_index": 1]))
+    // No `display_file` ever shows in the stream — the adopt loop's stream-
+    // side signal is false; only the record knows a card is owed.
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-42-filelive", messageID: id,
+                              inner: ["choices": [["index": 0, "finish_reason": "stop"]]]))
+
+    try await waitUntil(timeout: .seconds(2)) {
+        conversation.turns.last?.terminalFiles.isEmpty == false
+    }
+    #expect(conversation.turns.last?.terminalFiles.first?.name == "deck.pdf",
+            "the card the record grew after the run ended has to reach the screen without a re-enter (#42)")
+}
+
+// The other half of the union predicate: a run that owes no file from
+// EITHER signal (no `display_file` in the stream, none in the record) must
+// settle and stop looking after the one adoption GET — not spin the retry
+// budget. This is the pin against the tempting "just always retry 5" fix.
+@Test @MainActor func aRunWithNoFileDoesNotSpinTheAdoptionLoop() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-42-nofile", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.adoptRetryInterval = .milliseconds(50)
+    conversation.adoptRetryCount = 5
+    defer { conversation.adoptRetryInterval = .seconds(1) }
+
+    conversation.draft = "just talk"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    // The record every read answers: closed, text, no `display_file` anywhere.
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-42-nofile","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"\(id)","messages":{
+       "\(id)":{"id":"\(id)","role":"assistant","content":"plain prose","model":"local-personal",
+                "done":true,"parentId":null,"childrenIds":[]}}}}}
+    """.utf8)
+
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-42-nofile", messageID: id, inner: [
+        "type": "response.output_text.delta", "delta": "plain prose", "output_index": 1]))
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-42-nofile", messageID: id,
+                              inner: ["choices": [["index": 0, "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+
+    // The adoption loop gets exactly one look for a run that owes no file —
+    // plus at most one GET already in flight when the settle was observed,
+    // because the loop is a fire-and-forget task racing the run's own
+    // bookkeeping. A window of ten retry intervals must then add nothing.
+    let atSettle = transport.chatFetchCount
+    try await Task.sleep(for: .milliseconds(500))
+    #expect(transport.chatFetchCount <= atSettle + 1,
+            "a no-file run kept the adoption loop spinning: \(transport.chatFetchCount - atSettle) extra GETs after the settle (#42)")
+}
+
+// The adoption loop outlives its run by design (it sleeps between looks) —
+// so it stands down when superseded, the same generation discipline #19
+// established for the rebuild inside `adoptStoredMessage`. Here the stream
+// owes a file that never lands, so the loop is provably still retrying when
+// a newer generation takes over.
+@Test @MainActor func aSupersededAdoptionLoopStopsFetching() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-42-adoptgen", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.adoptRetryInterval = .milliseconds(50)
+    conversation.adoptRetryCount = 50  // the loop outlives the whole test
+    defer { conversation.adoptRetryInterval = .seconds(1); conversation.adoptRetryCount = 5 }
+
+    conversation.draft = "make me a pdf"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    // Closed record, no `display_file` anywhere — the stream-side signal is
+    // the only one saying a file is owed, so the loop retries on it.
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-42-adoptgen","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"\(id)","messages":{
+       "\(id)":{"id":"\(id)","role":"assistant","content":"all done","model":"local-personal",
+                "done":true,"parentId":null,"childrenIds":[]}}}}}
+    """.utf8)
+
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-42-adoptgen", messageID: id, inner: [
+        "type": "response.output_text.delta", "delta": "all done", "output_index": 1]))
+    // The stream saw the call (settled, so the finish frame still ends the
+    // run) — the record never grows the result.
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-42-adoptgen", messageID: id, inner: [
+        "done": false, "output": [[
+            "type": "function_call", "name": "display_file", "call_id": "c1",
+            "status": "completed", "arguments": "{\"path\":\"/home/user/deck.pdf\"}",
+        ]]]))
+    hub.receive(Frame.fixture(kind: "chat:completion", chatID: "chat-42-adoptgen", messageID: id,
+                              inner: ["choices": [["index": 0, "finish_reason": "stop"]]]))
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+
+    conversation.abandon()  // supersede: bumps the generation, no GETs
+    let baseline = transport.chatFetchCount
+    try await Task.sleep(for: .milliseconds(400))  // ~8 retry intervals
+    #expect(transport.chatFetchCount <= baseline + 1,
+            "superseded adoption loop kept fetching: \(transport.chatFetchCount - baseline) extra GETs (#42)")
+}
+
+// #42 hardening (G3): the silence watchdog measures silence ON THIS RUN'S
+// MESSAGE. Live capture shows real frames carry `message_id`, so this is
+// not the incident shape — it is the hole next to it: an unattributed
+// frame (a chat's chatter with no message id) is not proof THIS run is
+// alive, but the re-arm sat under the attribution filter's `continue`, so
+// it re-armed anyway and a dead run stayed "running" until the 900 s
+// ceiling. The fallback is reconcile, robust for `.waiting` runs since the
+// G5 fix. (Frames for a DIFFERENT message id are pinned by
+// `foreignFramesDoNotReArmTheSilenceWatchdog` — the drain filter already
+// stands them down.)
+//
+// The discriminator is timing, same shape as the #33 test: the burst
+// outlives the settle window, so the fixed code must settle ~silenceLimit
+// after the LAST ATTRIBUTED frame — while the burst is still arriving —
+// and the broken code can only settle after the burst ends.
+@Test @MainActor func messageLessFramesDoNotKeepADeadRunAlive() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-42-unattributed", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    // Budgets are read at arm time, so both go in before the run.
+    conversation.silenceLimit = .milliseconds(300)
+    conversation.runCeiling = .seconds(30)
+    defer {
+        conversation.silenceLimit = ConversationModel.silenceLimit
+        conversation.runCeiling = ConversationModel.runCeiling
+    }
+
+    conversation.draft = "hello"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+    // The record the watchdog's reconcile fallback reads once the run is
+    // stood down: a complete answer, so settling on it is not a failure.
+    transport.chatDetailOverride =
+        chatDetailWithStoredAnswer("chat-42-unattributed", messageID: id, text: "one answer.")
+
+    // One attributed delta: the run is live, the watchdog is armed from it.
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-42-unattributed", messageID: id, inner: [
+        "type": "response.output_text.delta", "delta": "one", "output_index": 1]))
+
+    // Then a burst of frames that name the chat but no message (the shape
+    // of the #42 `bare` frame with the chat_id half kept), delta-less so the
+    // test is about the re-arm and not about text attribution: faster than
+    // the silence budget (~50 ms against 300 ms) and LONGER than the settle
+    // window below (~2 s against 1 s). If unattributed frames re-arm, the
+    // watchdog can only fire after the burst ends — past the window — and
+    // the run is only saved by the 30 s ceiling, which is the bug.
+    let burst = Task { @MainActor in
+        for n in 0..<40 {
+            hub.receive(Frame.fixture(
+                kind: "response:completion", chatID: "chat-42-unattributed", messageID: nil,
+                inner: ["type": "response.keepalive\(n)"]))
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+    }
+
+    // Well inside the ceiling and shorter than the burst: the watchdog —
+    // not the ceiling — must end the run WHILE the chatter is arriving.
+    try await waitUntil(timeout: .seconds(1)) { conversation.phase == .ready }
+    burst.cancel()
+    #expect(conversation.phase == .ready,
+            "unattributed chatter must not keep a dead run alive to the ceiling (#42)")
+    let row = try #require(conversation.turns.first { $0.id == id })
+    #expect(row.text == "one answer.",
+            "the dead run must settle on the stored record: got \"\(row.text)\"")
+    #expect(conversation.error == nil,
+            "settling on the stored record is not a failure: \(conversation.error ?? "nil")")
 }
 
 // #26: the temporary:/local:/incognito early return in load() used to stamp

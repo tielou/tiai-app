@@ -3328,8 +3328,20 @@ public final class ConversationModel {
             // answer. Frames for OTHER message ids never reach this line
             // (the filter above `continue`s past them) and must not re-arm:
             // a chatty neighbour must not keep a dead run's listener alive.
-            watchdog.cancel()
-            watchdog = hubExpireTimer(after: silenceLimit, gen: gen, assistantID: assistantID)
+            //
+            // #42 closed the third leg: a frame with NO message id also
+            // passed the filter (nil is not `!=`) and re-armed, so chatter
+            // that names the chat but no message kept a dead run "running"
+            // until the ceiling. Re-arming requires ATTRIBUTION —
+            // `messageID == assistantID` — because unattributed chatter is
+            // not proof THIS run is alive. A run that is really alive keeps
+            // naming its message; one that only sees unattributed chatter
+            // falls to the watchdog, and reconcile (which since the G5 fix
+            // also watches `.waiting` runs) reads the truth off the record.
+            if frame.messageID == assistantID {
+                watchdog.cancel()
+                watchdog = hubExpireTimer(after: silenceLimit, gen: gen, assistantID: assistantID)
+            }
             if let delta = frame.delta { pending?.text += delta }
             if let thinking = frame.reasoningDelta { pending?.reasoning += thinking }
             if let pending {
@@ -3455,10 +3467,12 @@ public final class ConversationModel {
         if outcome.failure == nil, !userStopped, let chat = chatID {
             let id = finished.id
             let streamed = finished.text
-            // A `display_file` call means a card is owed. The result is written
-            // when the server saves the message, which can land a beat after the
-            // run ends, so keep looking for a few seconds rather than concluding
-            // there is no file on the first miss.
+            // A `display_file` call in the STREAM means a card is owed. It is
+            // only one of the two signals — the record may know about a call
+            // the stream never showed (#42), which is what the union
+            // predicate inside `adoptStoredMessage` decides on. The loop
+            // therefore always carries the full budget; the predicate breaks
+            // it early for a run that owes nothing.
             let owesFile = finished.calls.contains { $0.name == "display_file" }
             let api = client
             // Which run this adopt belongs to. The retry loop below can outlive
@@ -3467,12 +3481,27 @@ public final class ConversationModel {
             // has started: that run's placeholder rows exist only locally and
             // a rebuild would delete them (issue #19).
             let gen = runGeneration
+            // Instance knobs for the same reason as `silenceLimit`: a test that
+            // has to prove the loop retried (or did NOT retry) cannot sit out
+            // five one-second sleeps to find out.
+            let retries = adoptRetryCount
+            let retryInterval = adoptRetryInterval
             Task { @MainActor [weak self] in
-                for attempt in 0..<(owesFile ? 5 : 1) {
-                    if attempt > 0 { try? await Task.sleep(for: .seconds(1)) }
-                    guard let model = self else { return }
+                for attempt in 0..<retries {
+                    // #42: the loop outlives its run by design — it sleeps
+                    // between looks — so every look is owned. A newer run has
+                    // started by the time a sleep wakes: its placeholder rows
+                    // are not in any server tree, and a rebuild (or even a
+                    // plain adopt) aimed at the old run's message is at best
+                    // a wasted GET and at worst the #19 clobber. Stand down
+                    // at the top, before the fetch and before the sleep, so
+                    // a superseded loop performs at most the one GET already
+                    // in flight when the supersede landed.
+                    guard let model = self, model.runGeneration == gen else { return }
+                    if attempt > 0 { try? await Task.sleep(for: retryInterval) }
                     if await ConversationModel.adoptStoredMessage(
-                        model, client: api, chat: chat, id: id, streamed: streamed, gen: gen)
+                        model, client: api, chat: chat, id: id, streamed: streamed, gen: gen,
+                        streamOwed: owesFile)
                     { break }
                 }
             }
@@ -3497,7 +3526,7 @@ public final class ConversationModel {
     /// back.
     private static func adoptStoredMessage(
         _ model: ConversationModel, client: OWUIClient, chat: String,
-        id: String, streamed: String, gen: Int
+        id: String, streamed: String, gen: Int, streamOwed: Bool
     ) async -> Bool {
         guard let detail = try? await client.chat(id: chat),
             let stored = detail.messages[id]
@@ -3540,8 +3569,17 @@ public final class ConversationModel {
         if storedText.count > streamed.count + 1 {
             model.turns[at].text = storedText
         }
-        return model.turns[at].terminalFiles.isEmpty == false
-            || stored.terminalFiles.isEmpty == false
+        // Whether a file card is still owed — the UNION of the two signals:
+        // the record says the run called `display_file` (the result is
+        // written when the server saves the message and can land a beat
+        // after the run ended — the #42 gap: the stream never showed the
+        // call, so the stream-side signal alone concluded "no file owed" and
+        // the card only appeared after leaving and re-entering), or the
+        // stream saw the call. A run that owes a file from either signal
+        // gets the full retry budget; a run that owes none from both breaks
+        // after the first look instead of spinning five GETs.
+        let fileOwed = Turn(stored).calls.contains { $0.name == "display_file" } || streamOwed
+        return !fileOwed || model.turns[at].terminalFiles.isEmpty == false
     }
 
     /// Whether the server still considers this assistant message open.
@@ -3782,6 +3820,12 @@ public final class ConversationModel {
         if !fresh.calls.isEmpty { turn.calls = fresh.calls }
         if !fresh.sources.isEmpty { turn.sources = fresh.sources }
         if !fresh.attachments.isEmpty { turn.attachments = fresh.attachments }
+        // #42: grow-only like the copies above — the reconcile path has to
+        // be able to surface a file card too, and a later read must never
+        // take one away.
+        if turn.terminalFiles.isEmpty, !fresh.terminalFiles.isEmpty {
+            turn.terminalFiles = fresh.terminalFiles
+        }
         turn.usage = fresh.usage ?? turn.usage
         // The stored message is the authority on how the run ended. If it is
         // settled and we are still showing a spinner, the live stream missed
@@ -3855,7 +3899,24 @@ public final class ConversationModel {
                 continue
             }
             // Stop if the user started something else while we were waiting.
-            guard phase == .streaming || phase == .stopping else { return }
+            //
+            // #42: `.waiting` belongs in this guard. A run whose first token
+            // never flushed — a tool-only run, a socket that died before the
+            // first delta — lives at `.waiting` until its drain unwinds, and
+            // bailing here no-op'd the watch for exactly the runs that most
+            // need the record read: the turn settled on "The server sent
+            // nothing." over a record holding the whole answer. `.waiting`
+            // under THIS generation is a live run.
+            //
+            // The generation gate is what keeps the #19 one-watcher invariant
+            // while the phase guard widens: a superseded watch — a heal-on-open
+            // overtaken by a new send, an older run overtaken by a newer one —
+            // must stop polling even though the phase (now the NEWER run's)
+            // still looks busy. Two loops, double GETs, one record is the #19
+            // bug; the stale streaming/stopping loops this gate also closes
+            // were reachable before this change.
+            guard isCurrent(gen),
+                phase == .streaming || phase == .stopping || phase == .waiting else { return }
             self.detail = detail
             guard let message = detail.messages[messageID] else { return }
             if turns.firstIndex(where: { $0.id == messageID }) != nil {
@@ -3954,6 +4015,15 @@ public final class ConversationModel {
     /// production default; the budget is read once when the drain installs
     /// the timer, so set it before the run starts.
     var runCeiling: Duration = ConversationModel.runCeiling
+
+    /// Tuning for the post-run file-card adoption loop (the retry loop in the
+    /// drain epilogue), same reasoning as the knobs above: a test that has to
+    /// prove the loop kept looking for a late-landing `display_file` result —
+    /// or stopped looking when no file is owed — cannot sit out five
+    /// one-second sleeps to find out. Both are read when the loop is armed,
+    /// so set them before the run ends.
+    var adoptRetryInterval: Duration = .seconds(1)
+    var adoptRetryCount: Int = 5
 
     /// A failed POST is reported only if the run has not already ended on its own
     /// terms — a stream closed by `stop()` errors on the way out, and calling
