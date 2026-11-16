@@ -4030,6 +4030,73 @@ enum AskUserFixture {
     #expect(conversation.phase == .ready, "and the composer unlocks when it closes")
 }
 
+// Issue #55 item 2: the reconcile path had to be able to surface image blocks
+// too. `adoptStoredMessage` copied `contentImageURLs`, but `apply(_:to:)` —
+// the write `reconcileUntilClosed` uses on every tick — copied everything else
+// it grew and not the images, so a chat opened onto a still-open answer (or a
+// run reconciled after the terminal frame) converged its text and its files
+// while the image blocks the record knew about never reached the screen until
+// a leave-and-re-enter. Same grow-only shape as the `terminalFiles` copy right
+// above it in `apply`: a later read must never take an image away, and a turn
+// whose images were trimmed (#2) must not get them back from a stale read —
+// the deliberate difference from `adoptStoredMessage`'s overwrite-if-stored-
+// nonempty idiom, which runs once at the end of a run rather than per tick.
+@Test @MainActor func reconcilingAnOpenAnswerSurfacesItsStoredImages() async throws {
+    let hub = ChatEventHub(server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"))
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-55-images",
+        models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(
+            server: Server(baseURL: URL(string: "https://test.invalid")!, token: "t"),
+            transport: transport),
+        hub: hub)
+    conversation.reconcileInterval = .milliseconds(50)
+    defer { conversation.reconcileInterval = .seconds(2) }
+
+    // The stored content as the server writes it for a message with image
+    // blocks: a multipart array, `text` plus `image_url` entries.
+    func stored(content: String, done: String, images: [String] = []) -> Data {
+        var blocks: [[String: Any]] = [["type": "text", "text": content]]
+        for url in images {
+            blocks.append(["type": "image_url", "image_url": ["url": url]])
+        }
+        let contentJSON = String(
+            decoding: try! JSONSerialization.data(withJSONObject: blocks), as: UTF8.self)
+        let template = """
+        {"id":"chat-55-images","title":"T","updated_at":1,"created_at":1,"chat":{"models":["local-personal"],
+         "history":{"currentId":"assistant-1","messages":{
+           "user-1":{"id":"user-1","role":"user","content":"hi","childrenIds":["assistant-1"]},
+           "assistant-1":{"id":"assistant-1","role":"assistant","content":\(contentJSON),
+             "parentId":"user-1","done":\(done)}}}}}
+        """
+        return Data(template.utf8)
+    }
+    // Read 1 (the load): open, no image blocks yet. Read 2: the record grew
+    // ONE image while still open — the reconcile tick has to put it on the
+    // turn. Read 3: closed, and the record now knows TWO images — the local
+    // turn already has one, so grow-only means it keeps its own and never
+    // gets a second from the later read.
+    transport.chatDetailQueue = [
+        stored(content: "half an answ", done: "false"),
+        stored(content: "half an answer, with a pict", done: "false",
+               images: ["file_id://img-1"]),
+        stored(content: "half an answer, with a picture", done: "true",
+               images: ["file_id://img-1", "file_id://img-2"]),
+    ]
+    await conversation.load()
+
+    try await waitUntil(timeout: .seconds(5)) {
+        conversation.turns.last?.text == "half an answer, with a picture"
+    }
+    // The red-first assertion: the image block the record grew mid-watch has
+    // to reach the turn through the reconcile path, not only through the
+    // post-run adopt.
+    #expect(conversation.turns.last?.contentImageURLs == ["file_id://img-1"],
+            "the reconcile path must surface stored image blocks (#55) — and grow-only means the two-image read must not add img-2 to a turn that already has its own image")
+    #expect(conversation.phase == .ready, "and the composer unlocks when it closes")
+}
+
 /// A chat abandoned server-side keeps `done: false` for ever. Watching that
 /// forever would hang a spinner over a dead chat, so the loop gives up once the
 /// answer stops growing — and leaves the partial answer on screen.
@@ -5541,13 +5608,15 @@ private func chatDetailWithStoredAnswer(_ chatID: String, messageID: String, tex
         // consuming the frame, then the 60 ms flusher) and on a loaded CI
         // runner that queues behind every other @MainActor test, so the tight
         // default flakes with no real defect. Matches the phase waits below.
-        try await waitUntil(timeout: .seconds(5)) { conversation.turns.last?.text == expected }
+        // 10 s, up from 5 (#55 review): publishing is main-actor work and the
+        // suite keeps growing; under parallel load the tight default flaked.
+        try await waitUntil(timeout: .seconds(10)) { conversation.turns.last?.text == expected }
         try await Task.sleep(for: .milliseconds(90))
     }
     hub.receive(Frame.fixture(
         kind: "chat:completion", chatID: "chat-1", messageID: id,
         inner: ["choices": [["index": 0, "delta": NSNull(), "finish_reason": "stop"]]]))
-    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+    try await waitUntil(timeout: .seconds(10)) { conversation.phase == .ready }
 
     #expect(conversation.turns.last?.text == expected,
             "a run with steady frames must stream live past the silence limit, not be expired: got \"\(conversation.turns.last?.text ?? "nil")\"")
@@ -6142,4 +6211,347 @@ private func chatDetailOpen(_ chatID: String, messageID: String, text: String) -
     }
     #expect(conversation.phase == .ready,
             "the run settled, so the loop outlived the hung ribbon update")
+}
+
+// MARK: - #55 item 1: stopped runs adopt the record's cards, never its text
+
+// The #42 symptom with the stop button pressed first: a run the reader
+// stopped after the file was created showed no card until leaving and
+// re-entering the chat. The drain epilogue's adopt was gated on
+// `outcome.failure == nil, !userStopped` — and the `failure == nil` half
+// was vacuous there (a drain never stamps `failure` on its own outcome;
+// that happens caller-side after the drain returns), so the only thing the
+// gate ever actually did was skip stopped runs. Now every run that has a
+// chat looks at the record; a stopped run adopts its files, images and
+// sources — but NOT its text: the server usually outwrites the answer
+// after the stop POST lands, and the partial answer the reader watched IS
+// the answer they got (#52).
+@Test @MainActor func aStoppedRunAdoptsItsFileCardButNotItsStoredText() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-55-stoppedcard", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.adoptRetryInterval = .milliseconds(50)
+    defer { conversation.adoptRetryInterval = .seconds(1) }
+
+    conversation.draft = "make me a pdf then explain"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    // The record as it stands after the stop: the server kept writing (the
+    // stored text is LONGER than what was streamed — the exact reason the
+    // text adopt exists), and the `display_file` call and its result landed
+    // with the save. Same wire shape as the #42 file-card tests.
+    transport.chatDetailOverride = Data(#"""
+    {"id":"chat-55-stoppedcard","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"\#(id)","messages":{
+       "\#(id)":{"id":"\#(id)","role":"assistant",
+         "content":"partial answer plus everything the server wrote after the stop",
+         "model":"local-personal","done":true,"parentId":null,"childrenIds":[],
+         "output":[
+           {"type":"function_call","name":"display_file","call_id":"c1",
+            "arguments":"{\"path\":\"/home/user/deck.pdf\"}"},
+           {"type":"function_call_output","call_id":"c1","output":[{"type":"input_text",
+             "text":"{\"path\":\"/home/user/deck.pdf\",\"exists\":true,\"type\":\"file\",\"source\":\"open_terminal\",\"terminal_selector\":\"sandbox\",\"name\":\"deck.pdf\",\"mime_type\":\"application/pdf\"}"}]}
+         ]}}}}}
+    """#.utf8)
+
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-55-stoppedcard",
+                              messageID: id, inner: [
+        "type": "response.output_text.delta", "delta": "partial ans", "output_index": 1]))
+    // No terminal frame: the reader presses Stop mid-answer. The stop POST
+    // resolves, `finishLocally` ends the stream, and the drain epilogue runs
+    // with `userStopped` set — the case the old gate skipped.
+    conversation.stop()
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+
+    // The red-first half: the card the record holds has to reach the screen
+    // without a re-enter, stop button or not.
+    try await waitUntil(timeout: .seconds(2)) {
+        conversation.turns.last?.terminalFiles.isEmpty == false
+    }
+    #expect(conversation.turns.last?.terminalFiles.first?.name == "deck.pdf",
+            "a stopped run still owes its file card (#55)")
+    // The other half: the LONGER stored text must not overwrite the partial
+    // answer. One test covers both halves of the stopped-run policy — the
+    // adopt happens, the text stays locked (#52).
+    #expect(conversation.turns.last?.text == "partial ans",
+            "the partial answer IS the answer they got — a stopped run does not adopt stored text (#52)")
+}
+
+// The cost bound for opening the gate to stopped runs: a stopped run that
+// owes nothing must cost ONE look, not the retry budget. The `fileOwed`
+// early-break inside `adoptStoredMessage` ends the loop after the first
+// read; with the retry interval at 50 ms and the full 5-retry budget left
+// in place, a loop that failed to break early would add several GETs inside
+// the measurement window. (The exchange's own post-run reconcile probes add
+// two more GETs; that is pre-existing behaviour, bounded and generation-
+// guarded, and not what this pins.)
+@Test @MainActor func aStoppedRunThatOwesNothingDoesNotSpinTheAdoptionLoop() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-55-quiet", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.adoptRetryInterval = .milliseconds(50)
+    conversation.adoptRetryCount = 5  // the default, left in place on purpose
+    defer { conversation.adoptRetryInterval = .seconds(1) }
+
+    conversation.draft = "just talk"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+
+    // Closed record, plain prose, no `display_file` anywhere — nothing owed.
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-55-quiet","title":"t","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"\(id)","messages":{
+       "\(id)":{"id":"\(id)","role":"assistant","content":"plain prose","model":"local-personal",
+                "done":true,"parentId":null,"childrenIds":[]}}}}}
+    """.utf8)
+
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-55-quiet",
+                              messageID: id, inner: [
+        "type": "response.output_text.delta", "delta": "plain ans", "output_index": 1]))
+    let beforeStop = transport.chatFetchCount
+    conversation.stop()
+    try await waitUntil(timeout: .seconds(5)) { conversation.phase == .ready }
+    // The adopt loop is fire-and-forget and the exchange's two reconcile
+    // probes (the no-terminal one and the "reconcile even after a clean
+    // end" one — each a single GET before the phase guard stands them
+    // down) all unwind AFTER `finishLocally` stamps `.ready`, so `.ready`
+    // alone does not mean the record-reading has started. Wait out the
+    // whole (capped) retry budget instead of measuring a quiet window:
+    // a loop that failed to break early would burn its five looks at 50 ms
+    // apart inside this window, while the correct code adds nothing after
+    // its first look.
+    try await Task.sleep(for: .milliseconds(1200))  // 24 retry intervals
+    let total = transport.chatFetchCount - beforeStop
+    #expect(total <= 4,
+            "a stopped run owing nothing cost \(total) GETs — the adopt loop should break after its first look (one GET), leaving only the exchange's two pre-existing reconcile probes; the retry budget is 5 (#55)")
+}
+
+// The #34 discard must survive the now-unconditional adopt gate. A stop on
+// a never-named chat discards the transcript and leaves `chatID` nil — and
+// `stop()` deliberately does NOT bump the generation, so a stale adopt loop
+// cannot see the discard through the generation guard alone. The chat-
+// identity guards added to the retry loop and to `adoptStoredMessage`'s
+// rebuild are the belt; the nil `chatID` at the epilogue gate is the
+// braces: the epilogue runs for the discarded run (the silence watchdog
+// ends its drain) and must start nothing. Regression pin — the discard
+// path never started an adopt loop before this change either; what changed
+// is that the epilogue now reaches the gate on every stopped run, so the
+// discard shape has to be re-pinned against the widened gate.
+@Test @MainActor func aDiscardedNewChatIsNotResurrectedByTheAdoptionLoop() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: nil, models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    // Short enough that the drain unwinds (and the epilogue runs) inside the
+    // test window; the epilogue running is the point — it must start no loop.
+    conversation.silenceLimit = .milliseconds(200)
+    defer { conversation.silenceLimit = ConversationModel.silenceLimit }
+
+    transport.gateNextCompletion()
+    defer { transport.releaseCompletion() }
+    conversation.draft = "hello"
+    conversation.send()
+    try await waitUntil { transport.isCompletionGateParked }
+    conversation.stop()  // #34: discard — chat never named, transcript cleared
+    try await waitUntil(timeout: .seconds(2)) { conversation.phase == .ready }
+    #expect(conversation.chatID == nil, "a stopped new chat stays unnamed")
+
+    // Let the late POST land: the server answers into a chat nobody watches.
+    transport.releaseCompletion()
+    try await Task.sleep(for: .milliseconds(400))
+
+    #expect(conversation.turns.isEmpty,
+            "nothing from the discarded chat may reappear: \(conversation.turns)")
+    #expect(conversation.chatID == nil)
+    #expect(transport.chatFetchCount == 0,
+            "no adopt or reconcile loop may fetch for a discarded, never-named chat (#55)")
+}
+
+// MARK: - #55 item 3: heal an open assistant mid-transcript (silently)
+
+/// A branching or edited chat leaves an open assistant row in the MIDDLE of
+/// the transcript: user-1 → assistant-1(open) → user-2 → assistant-2(done).
+/// Heal-on-open only ever looked at `turns.last`, so the abandoned half
+/// answer in the middle never healed — the #42 symptom one branch over.
+/// The fix heals at most one target: the newest non-user turn whose STORED
+/// record is open. When that is the tail, the existing path runs verbatim;
+/// when it is mid-transcript, a SILENT watch converges the row in the
+/// background — no `.streaming` stamp (the chat is idle and must look
+/// idle), no composer hand-back, generation-guard-only supersede.
+@Test @MainActor func anOpenAssistantMidTranscriptHealsSilently() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-55-midheal", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.reconcileInterval = .milliseconds(50)
+    defer { conversation.reconcileInterval = .seconds(2) }
+
+    func tree(assistant1: (String, Bool)) -> Data {
+        Data("""
+        {"id":"chat-55-midheal","title":"T","updated_at":1,"created_at":1,
+         "chat":{"models":["local-personal"],"history":{"currentId":"assistant-2","messages":{
+           "user-1":{"id":"user-1","role":"user","content":"q1","done":true,"parentId":null,"childrenIds":["assistant-1"]},
+           "assistant-1":{"id":"assistant-1","role":"assistant","content":"\(assistant1.0)","model":"local-personal",
+             "done":\(assistant1.1 ? "true" : "false"),"parentId":"user-1","childrenIds":["user-2"]},
+           "user-2":{"id":"user-2","role":"user","content":"q2","done":true,"parentId":"assistant-1","childrenIds":["assistant-2"]},
+           "assistant-2":{"id":"assistant-2","role":"assistant","content":"second answer","model":"local-personal",
+             "done":true,"parentId":"user-2","childrenIds":[]}}}}}
+        """.utf8)
+    }
+    // Read 1 (the load): the middle row is open with half an answer, the tail
+    // is closed — the shape the tail-only heal walked past. Every later read:
+    // the middle row grew and closed.
+    transport.chatDetailQueue = [tree(assistant1: ("half", false))]
+    transport.chatDetailOverride = tree(assistant1: ("half, now finished", true))
+
+    await conversation.load()
+    // The chat is idle: an open row in the MIDDLE must not stamp the whole
+    // chat into `.streaming` — the composer stays free for the next question.
+    #expect(conversation.phase == .ready,
+            "a mid-transcript heal must not put the idle chat into .streaming (#55)")
+
+    try await waitUntil(timeout: .seconds(5)) {
+        conversation.turns.first(where: { $0.id == "assistant-1" })?.text == "half, now finished"
+    }
+    #expect(conversation.phase == .ready, "and it stays .ready while and after the row converges (#55)")
+    #expect(conversation.turns.first(where: { $0.id == "assistant-1" })?.streaming == false,
+            "the healed row never carries the working flag — the watch is silent (#55)")
+    // The tail row is untouched by all of this.
+    #expect(conversation.turns.first(where: { $0.id == "assistant-2" })?.text == "second answer")
+}
+
+/// #19's one-watcher discipline applies to the silent watch too: a send
+/// while the heal is polling bumps the generation, and the stale watch must
+/// stop fetching — even though the phase (now the NEW run's) still looks
+/// busy, which is exactly why the silent mode is generation-guard-ONLY.
+@Test @MainActor func aSupersededSilentHealStopsFetching() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-55-midsupersede", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.reconcileInterval = .milliseconds(50)
+    // The new run must still be live (and silent) for the whole measurement
+    // window — its own watchdog must not be what ends it.
+    conversation.silenceLimit = .seconds(30)
+    defer {
+        conversation.reconcileInterval = .seconds(2)
+        conversation.silenceLimit = ConversationModel.silenceLimit
+    }
+
+    // The middle row stays open for the whole test: the silent watch is
+    // provably still polling when the supersede lands.
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-55-midsupersede","title":"T","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"assistant-2","messages":{
+       "user-1":{"id":"user-1","role":"user","content":"q1","done":true,"parentId":null,"childrenIds":["assistant-1"]},
+       "assistant-1":{"id":"assistant-1","role":"assistant","content":"half","model":"local-personal",
+         "done":false,"parentId":"user-1","childrenIds":["user-2"]},
+       "user-2":{"id":"user-2","role":"user","content":"q2","done":true,"parentId":"assistant-1","childrenIds":["assistant-2"]},
+       "assistant-2":{"id":"assistant-2","role":"assistant","content":"second answer","model":"local-personal",
+         "done":true,"parentId":"user-2","childrenIds":[]}}}}}
+    """.utf8)
+    await conversation.load()
+    // The load's GET plus at least one silent-watch tick: the watch is
+    // provably polling before the supersede.
+    try await waitUntil { transport.chatFetchCount >= 2 }
+
+    conversation.draft = "next question"
+    conversation.send()  // supersede: bumps the generation
+    try await transport.awaitCompletion()
+    let baseline = transport.chatFetchCount
+    try await Task.sleep(for: .milliseconds(400))  // ~8 stale ticks
+    #expect(transport.chatFetchCount <= baseline + 1,
+            "superseded silent heal kept polling: \(transport.chatFetchCount - baseline) extra GETs after the new run took over (#19 discipline, #55)")
+}
+
+/// A chat abandoned server-side keeps `done: false` forever — for a row in
+/// the MIDDLE of the transcript just as for the tail. The silent watch runs
+/// the same stall logic (no growth in `reconcileStallLimit` ticks → give
+/// up), so the fetches plateau instead of grinding the whole budget, and —
+/// because the watch is silent — the chat stayed `.ready` throughout.
+@Test @MainActor func aSilentHealOfADeadZombieStopsGrowing() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-55-zombie", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.reconcileInterval = .milliseconds(1)
+    conversation.reconcileStallLimit = 5
+
+    // Static record: the middle row is open and never moves.
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-55-zombie","title":"T","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"assistant-2","messages":{
+       "user-1":{"id":"user-1","role":"user","content":"q1","done":true,"parentId":null,"childrenIds":["assistant-1"]},
+       "assistant-1":{"id":"assistant-1","role":"assistant","content":"abandoned here","model":"local-personal",
+         "done":false,"parentId":"user-1","childrenIds":["user-2"]},
+       "user-2":{"id":"user-2","role":"user","content":"q2","done":true,"parentId":"assistant-1","childrenIds":["assistant-2"]},
+       "assistant-2":{"id":"assistant-2","role":"assistant","content":"second answer","model":"local-personal",
+         "done":true,"parentId":"user-2","childrenIds":[]}}}}}
+    """.utf8)
+    await conversation.load()
+    #expect(conversation.phase == .ready)
+
+    // Let the stall fire, then prove the fetch count has plateaued: a watch
+    // that ignored the stall would still be grinding (budget 150 ticks at
+    // 1 ms) and the count would keep climbing between the two reads.
+    try await Task.sleep(for: .milliseconds(300))
+    let plateau = transport.chatFetchCount
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(transport.chatFetchCount <= plateau + 1,
+            "the silent watch never stalled out: \(transport.chatFetchCount - plateau) GETs after the plateau (#55)")
+    #expect(plateau <= 20,
+            "the silent watch burned \(plateau) GETs on a dead zombie — the stall limit should end it in single digits (#55)")
+    #expect(conversation.phase == .ready,
+            "and the chat looked idle the whole time (#55)")
+}
+
+/// The scan for the heal target must never pick a USER turn. User records
+/// usually carry no `done` at all — and missing `done` reads as "not done"
+/// (`nil != true`) — so a scan that only looked at the stored flag would
+/// put a silent watcher on a question that already happened, polling a
+/// record that will never change. The guard: `!isUser` AND a stored-record
+/// lookup (which also skips local placeholder rows).
+@Test @MainActor func anOpenUserTurnAtTheHeadIsNotHealed() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-55-usertail", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    conversation.reconcileInterval = .milliseconds(50)
+    defer { conversation.reconcileInterval = .seconds(2) }
+
+    // The newest row is a USER turn with no `done` field; the assistant
+    // above it is closed. Nothing is open — no watcher may start.
+    transport.chatDetailOverride = Data("""
+    {"id":"chat-55-usertail","title":"T","updated_at":1,"created_at":1,
+     "chat":{"models":["local-personal"],"history":{"currentId":"user-2","messages":{
+       "user-1":{"id":"user-1","role":"user","content":"q1","done":true,"parentId":null,"childrenIds":["assistant-1"]},
+       "assistant-1":{"id":"assistant-1","role":"assistant","content":"a1","model":"local-personal",
+         "done":true,"parentId":"user-1","childrenIds":["user-2"]},
+       "user-2":{"id":"user-2","role":"user","content":"q2","parentId":"assistant-1","childrenIds":[]}}}}}
+    """.utf8)
+    await conversation.load()
+    #expect(conversation.phase == .ready)
+    let baseline = transport.chatFetchCount
+    try await Task.sleep(for: .milliseconds(300))  // ~6 watch intervals
+    #expect(transport.chatFetchCount <= baseline,
+            "a user turn with no `done` field got a heal watcher: \(transport.chatFetchCount - baseline) extra GETs (#55)")
 }

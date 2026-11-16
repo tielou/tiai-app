@@ -1465,6 +1465,11 @@ public final class ConversationModel {
         // live run is already watching its own message, so a mid-run load must
         // neither restamp the phase nor start a second watcher on it.
         let runInFlight = phase.isBusy
+        // #55 item 3: which run owns the model at the moment this load began.
+        // The detail fetch below is a suspension point, and a `send()` can
+        // interleave — the generation is what says "that send owns the model
+        // now, not this load" when the heal decision is made after the fetch.
+        let genAtLoad = runGeneration
         // Cached first. Opening a chat used to be a blank screen for the length
         // of a round trip, which is the single thing that most makes the app feel
         // slow — the transcript is already on the phone from the last time you
@@ -1494,28 +1499,76 @@ public final class ConversationModel {
             // mis-ended — dead socket, misread frame, app killed mid-answer —
             // re-entering the chat now converges on what the server has.
             //
-            // Only when no run is live (issue #19 review): a mid-run load whose
+            // Only when no run is live (issue #19): a mid-run load whose
             // reloaded tree happens to end on the run's own open assistant
             // used to stamp `.streaming` over `.waiting`/`.stopping` and spawn
             // a SECOND `reconcileUntilClosed` on the message the live run is
             // already watching — two loops, double GETs, one record. The live
             // run is watching that message; there is nothing to heal.
-            if !runInFlight, let last = turns.last, !last.isUser,
-               let stored = detail.messages[last.id], stored.done != true {
-                phase = .streaming
-                Task {
-                    await self.reconcileUntilClosed(messageID: last.id)
-                    // Only hand the composer back if nothing else took it while
-                    // we were watching — a send started mid-heal owns the phase.
-                    if case .streaming = phase, post == nil {
-                        phase = .ready
-                        // Issue #37: the heal is a run ending — the answer the
-                        // app had given up on is finished, and the chat is free.
-                        settleQueue()
+            //
+            // #55 item 3: the open message may not be the LAST turn. A branch
+            // or an edit leaves an open assistant row in the middle of the
+            // transcript (user-1 → assistant-1(open) → user-2 → assistant-2
+            // (done)), and the tail-only check walked right past it — the #42
+            // symptom one branch over. Pick at most ONE heal target: the
+            // newest non-user turn whose STORED record is open. The stored-
+            // record lookup is what skips local placeholder rows (a live run's
+            // own rows are in no server tree), and `!isUser` matters because
+            // user records usually carry no `done` at all — missing `done`
+            // reads as "not done" (`nil != true`), so a scan on the stored
+            // flag alone would put a watcher on a question that already
+            // happened.
+            //
+            // `isCurrent(genAtLoad)` closes a pre-existing race the tail-only
+            // check had: a send that started while the detail was in flight
+            // owns the model now — stamping `.streaming` over its phase (or
+            // letting a heal rebuild touch its rows) is the #19 clobber class.
+            // The generation bump is the supersede signal, the same one the
+            // silent watch below runs on.
+            if !runInFlight, isCurrent(genAtLoad) {
+                let open = turns.last(where: { turn in
+                    guard !turn.isUser, let stored = detail.messages[turn.id] else { return false }
+                    return stored.done != true
+                })
+                if let open, open.id == turns.last?.id {
+                    // The existing tail path, verbatim: the open answer is the
+                    // head of the transcript, so it owns the phase and hands
+                    // the composer back when it closes.
+                    phase = .streaming
+                    Task {
+                        await self.reconcileUntilClosed(messageID: open.id)
+                        // Only hand the composer back if nothing else took it
+                        // while we were watching — a send started mid-heal
+                        // owns the phase.
+                        if case .streaming = phase, post == nil {
+                            phase = .ready
+                            // Issue #37: the heal is a run ending — the answer
+                            // the app had given up on is finished, and the chat
+                            // is free.
+                            settleQueue()
+                        }
+                    }
+                } else {
+                    // `.loading` always releases on this branch: the only way
+                    // past the outer guard without stamping anything is a send
+                    // that superseded this load, and that send stamped its own
+                    // busy phase synchronously before the fetch resumed here.
+                    phase = .ready
+                    if let open {
+                        // Mid-transcript heal: the row is not the head of the
+                        // conversation, so it must not steal the composer or
+                        // draw the working indicator — the chat is idle and
+                        // has to LOOK idle while the abandoned row quietly
+                        // converges. Hence `silent`: generation-guard-only,
+                        // no phase stamp, no hand-back. The per-message
+                        // `apply` is id-keyed and grow-only, so converging a
+                        // row in the background cannot disturb anything else
+                        // on screen.
+                        Task {
+                            await self.reconcileUntilClosed(messageID: open.id, silent: true)
+                        }
                     }
                 }
-            } else if !runInFlight {
-                phase = .ready
             }
         } catch {
             // Only worth complaining about when there is nothing to show. With a
@@ -3272,9 +3325,11 @@ public final class ConversationModel {
         }
     }
 
-    /// Set when the reader pressed Stop. A stopped run has nothing new attached
-    /// to it, so the post-run refetch is skipped — it would only be a network call
-    /// racing with the screen that just stopped showing things.
+    /// Set when the reader pressed Stop. A stopped run still gets the post-run
+    /// refetch (#55) — the record may hold a file card, images or sources the
+    /// stream never showed — but it does not adopt the stored TEXT: the server
+    /// outwrites the answer after the stop POST lands, and the partial answer
+    /// the reader watched is the answer they got (#52).
     private var userStopped = false
     /// The text of the most recent `send()`, kept so a stop on a brand-new
     /// chat can put it back in the composer when discarding the chat (#34).
@@ -3596,7 +3651,19 @@ public final class ConversationModel {
         // never looked at the stored message. Which is where the file the model
         // had just wrote lives. The fetch is cheap and idempotent; the cases it
         // used to skip were the ones that needed it.
-        if outcome.failure == nil, !userStopped, let chat = chatID {
+        // #55 item 1: stopped runs look too. The old gate skipped them
+        // (`outcome.failure == nil, !userStopped`), so a run the user
+        // stopped after the file was created showed no card until leaving
+        // and re-entering the chat — the #42 symptom with the stop button
+        // pressed first. The `failure == nil` half was always vacuous here:
+        // a drain never sets `failure` on its own outcome (only
+        // `reportedError`; `failure` is stamped caller-side after the
+        // drain returns), so failed runs already adopted through this
+        // gate. A stopped run that owes nothing costs one GET — the
+        // fileOwed early-break inside `adoptStoredMessage` ends the loop
+        // after the first look — and the text it would have adopted is
+        // locked by the `adoptText` flag below (#52).
+        if let chat = chatID {
             let id = finished.id
             let streamed = finished.text
             // A `display_file` call in the STREAM means a card is owed. It is
@@ -3606,6 +3673,13 @@ public final class ConversationModel {
             // therefore always carries the full budget; the predicate breaks
             // it early for a run that owes nothing.
             let owesFile = finished.calls.contains { $0.name == "display_file" }
+            // #55: a stopped run adopts the record's files, images and
+            // sources — but NOT its text. The server usually outwrites the
+            // answer after the stop POST lands, so the stored text is
+            // longer than what the reader watched; the partial answer IS
+            // the answer they got (#52's shape: saying "Stopped." was
+            // rejected for the same reason).
+            let adoptText = !userStopped
             let api = client
             // Which run this adopt belongs to. The retry loop below can outlive
             // the run — and the rebuild in `adoptStoredMessage` is a wholesale
@@ -3629,11 +3703,19 @@ public final class ConversationModel {
                     // at the top, before the fetch and before the sleep, so
                     // a superseded loop performs at most the one GET already
                     // in flight when the supersede landed.
-                    guard let model = self, model.runGeneration == gen else { return }
+                    guard let model = self, model.runGeneration == gen,
+                        // #55: the generation is not the only identity a
+                        // stale loop can lose. `stop()` deliberately does
+                        // NOT bump it, and the #34 discard of a never-named
+                        // chat empties the transcript behind the loop's
+                        // back — a rebuild aimed at the discarded chat must
+                        // not put those rows back. The captured chat has to
+                        // still be the model's chat.
+                        model.chatID == chat else { return }
                     if attempt > 0 { try? await Task.sleep(for: retryInterval) }
                     if await ConversationModel.adoptStoredMessage(
                         model, client: api, chat: chat, id: id, streamed: streamed, gen: gen,
-                        streamOwed: owesFile)
+                        streamOwed: owesFile, adoptText: adoptText)
                     { break }
                 }
             }
@@ -3658,7 +3740,7 @@ public final class ConversationModel {
     /// back.
     private static func adoptStoredMessage(
         _ model: ConversationModel, client: OWUIClient, chat: String,
-        id: String, streamed: String, gen: Int, streamOwed: Bool
+        id: String, streamed: String, gen: Int, streamOwed: Bool, adoptText: Bool
     ) async -> Bool {
         guard let detail = try? await client.chat(id: chat),
             let stored = detail.messages[id]
@@ -3675,7 +3757,13 @@ public final class ConversationModel {
         // run's local placeholder rows are in no server tree, and rebuilding
         // over them would delete them.
         if model.turns.firstIndex(where: { $0.id == id }) == nil,
-           model.runGeneration == gen {
+           model.runGeneration == gen,
+           // #55: same identity discipline as the loop's own guard, at the
+           // one write in here that replaces `turns` wholesale. A stop does
+           // not bump the generation, so the generation alone cannot see a
+           // #34 discard; the chat match is what refuses to rebuild a
+           // transcript the user just threw away.
+           model.chatID == chat {
             model.apply(detail)
         }
         guard let at = model.turns.firstIndex(where: { $0.id == id })
@@ -3697,8 +3785,13 @@ public final class ConversationModel {
         }
         // If the stored answer is longer than what arrived, the run outlived the
         // stream. Adopt the stored text rather than leaving half an answer up.
+        // #55: unless the reader stopped the run. A stopped run's stored text
+        // is usually LONGER for exactly the reason the adopt exists — the
+        // server keeps writing after the stop POST — and the partial answer
+        // IS the answer they got (#52). The files, images and sources above
+        // are still adopted; only the text is locked.
         let storedText = stored.content.text
-        if storedText.count > streamed.count + 1 {
+        if adoptText, storedText.count > streamed.count + 1 {
             model.turns[at].text = storedText
         }
         // Whether a file card is still owed — the UNION of the two signals:
@@ -3958,6 +4051,21 @@ public final class ConversationModel {
         if turn.terminalFiles.isEmpty, !fresh.terminalFiles.isEmpty {
             turn.terminalFiles = fresh.terminalFiles
         }
+        // #55 item 2: the same grow-only shape for the image blocks. The
+        // reconcile/heal path has to be able to surface them too — a run
+        // whose answer carried images converged its text and its files but
+        // left the pictures off the screen until a re-enter.
+        //
+        // Grow-only here is deliberate, and it differs on purpose from
+        // `adoptStoredMessage`'s overwrite-if-stored-nonempty idiom: that
+        // read runs once at the end of a run and the record is the authority
+        // on what the message body holds; this one ticks repeatedly against
+        // reads that may be older than what is on screen, and a turn whose
+        // images were trimmed (#2) must never get them back from a stale
+        // read.
+        if turn.contentImageURLs.isEmpty, !fresh.contentImageURLs.isEmpty {
+            turn.contentImageURLs = fresh.contentImageURLs
+        }
         turn.usage = fresh.usage ?? turn.usage
         // The stored message is the authority on how the run ended. If it is
         // settled and we are still showing a spinner, the live stream missed
@@ -4002,7 +4110,7 @@ public final class ConversationModel {
             : "The server sent nothing."
     }
 
-    private func reconcileUntilClosed(messageID: String) async {
+    private func reconcileUntilClosed(messageID: String, silent: Bool = false) async {
         guard let chat = chatID else { return }
         // A chat abandoned server-side — browser closed mid-run, worker died —
         // keeps `done: false` forever. Polling that for five minutes would show a
@@ -4047,8 +4155,16 @@ public final class ConversationModel {
             // still looks busy. Two loops, double GETs, one record is the #19
             // bug; the stale streaming/stopping loops this gate also closes
             // were reachable before this change.
+            //
+            // #55 item 3: `silent` mode is generation-guard-ONLY. A heal of an
+            // open row in the middle of the transcript runs while the chat is
+            // idle — the phase is `.ready` and must stay `.ready`, so the
+            // phase half of the guard would stand the watch down on its first
+            // tick. Supersede for a silent watch is a generation bump (a send,
+            // an abandon), never a phase change, and this loop stamps no phase
+            // and settles nothing itself, which is what makes silent use safe.
             guard isCurrent(gen),
-                phase == .streaming || phase == .stopping || phase == .waiting else { return }
+                silent || phase == .streaming || phase == .stopping || phase == .waiting else { return }
             self.detail = detail
             guard let message = detail.messages[messageID] else { return }
             if turns.firstIndex(where: { $0.id == messageID }) != nil {
