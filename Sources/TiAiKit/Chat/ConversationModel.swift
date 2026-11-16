@@ -2394,6 +2394,34 @@ public final class ConversationModel {
         // flushed, or the run never got a buffer).
         let bufferIndex = pending.flatMap { p in turns.firstIndex(where: { $0.id == p.id }) }
         if let index = bufferIndex ?? turns.lastIndex(where: \.isAssistant) {
+            // Issue #52: advance the leaf HERE, not only in the run's unwind.
+            // A steered run ("send now") is started by `settleQueue` in this
+            // same synchronous turn and its POST reads `leafID` before the
+            // stopped run's Task ever resumes — and once `beginRun` bumps the
+            // generation, the unwind's leafID write is behind a G4 guard that
+            // NEVER passes, so without this advance the steered completion
+            // carries the parent from *before* the stopped run (null on a
+            // fresh chat) and the server answers it without the exchange the
+            // user was steering. For a plain stop (no steer) the unwind still
+            // runs and writes the same id again — an idempotent same-value
+            // write.
+            //
+            // The guards, each a bug this must not become:
+            // * `turns[index].streaming` — only the in-flight placeholder
+            //   becomes the leaf; an older completed assistant turn must
+            //   never be re-adopted as the head of the history.
+            // * `chatID != nil` — the #34 discard: the server never learned
+            //   this chat exists, so its message ids are meaningless for the
+            //   next send. `stop()`'s nil branch nils the leaf right after
+            //   calling this; the guard makes the two order-independent.
+            //
+            // No gate against the #9/outbox rollback is needed here: those
+            // arms only fire while `phase == .waiting`, and `finishLocally`
+            // only runs from `stop()` (phase `.ready`/`.stopping`) — the two
+            // cannot co-occur.
+            if chatID != nil, turns[index].streaming {
+                leafID = turns[index].id
+            }
             turns[index].streaming = false
         }
         // Publish the buffer *before* declaring ready: any first-`.ready`

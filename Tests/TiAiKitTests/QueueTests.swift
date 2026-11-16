@@ -571,3 +571,124 @@ private func finishRun(chat: String, message: String, hub: ChatEventHub, answer:
     #expect(transport.completionBodies.isEmpty, "nothing waiting, nothing sent")
     #expect(conversation.phase == .ready)
 }
+
+// MARK: - #52: the steered run parents off the stopped run's partial answer
+
+// The steering bug: the steered completion is started by `settleQueue` in the
+// same main-actor turn that `finishLocally` runs in, and its POST reads
+// `leafID` as the parent. The stopped run's own unwind — the only place that
+// used to advance the leaf for a user stop — is generation-gated, and
+// `beginRun` has already bumped the generation by the time that unwind could
+// run, so the steered POST went out with the parent from *before* the stopped
+// run: on a fresh chat, no parent at all, and the steered answer ignored
+// everything the stopped question had said.
+@Test @MainActor func steeredRunParentsOffTheStoppedRunsPartialAnswer() async throws {
+    let hub = ChatEventHub(server: testServer)
+    let transport = ScriptedTransport()
+    let conversation = makeQueueConversation(chatID: "chat-1", transport: transport, hub: hub)
+
+    let assistant = try await startOpenRun(conversation, transport: transport, hub: hub)
+    // One delta so the partial has visible text — the shape a real steering
+    // press sees: a half-answer on screen and a user who wants to redirect it.
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: assistant,
+        inner: ["type": "response.output_text.delta", "delta": "Hel"]))
+
+    conversation.draft = "urgent"
+    conversation.send()
+    transport.gateNextStop()
+    let urgent = try #require(conversation.queue.items.first)
+    conversation.sendNow(id: urgent.id)
+    try await waitUntilQueue { transport.isStopGateParked }
+    transport.releaseStopGate()
+    try await waitUntilQueue { transport.completionBodies.count == 2 }
+
+    let body = String(decoding: try #require(transport.completionBodies.last), as: UTF8.self)
+    // The server's history is a tree: parent_id is what decides whether the
+    // steered question continues the stopped exchange or forks off the
+    // message before it. It must continue it.
+    #expect(body.contains("\"parent_id\":\"\(assistant)\""),
+            "the steered run must branch off the stopped run's partial answer: \(body)")
+}
+
+// The same bug on a brand-new chat, where the pre-stop leaf is nil: the steered
+// completion opened a root-level branch and the first question vanished from
+// the server's side of the conversation entirely.
+@Test @MainActor func steeredRunOnAFreshChatParentsOffTheAdoptedPartial() async throws {
+    let hub = ChatEventHub(server: testServer)
+    let transport = ScriptedTransport()
+    let conversation = makeQueueConversation(chatID: nil, transport: transport, hub: hub)
+
+    let assistant = try await startOpenRun(conversation, transport: transport, hub: hub)
+    // The first frame naming a chat adopts it — the run is now on "chat-1",
+    // so a stop here is a real stop (not the #34 local discard) and steering
+    // is allowed.
+    hub.receive(Frame.fixture(
+        kind: "response:completion", chatID: "chat-1", messageID: assistant,
+        inner: ["type": "response.output_text.delta", "delta": "Hel"]))
+    try await waitUntilQueue { conversation.chatID == "chat-1" }
+
+    conversation.draft = "urgent"
+    conversation.send()
+    transport.gateNextStop()
+    let urgent = try #require(conversation.queue.items.first)
+    conversation.sendNow(id: urgent.id)
+    try await waitUntilQueue { transport.isStopGateParked }
+    transport.releaseStopGate()
+    try await waitUntilQueue { transport.completionBodies.count == 2 }
+
+    let body = String(decoding: try #require(transport.completionBodies.last), as: UTF8.self)
+    #expect(body.contains("\"parent_id\":\"\(assistant)\""),
+            "the steered run on an adopted fresh chat must parent off the adopted partial: \(body)")
+}
+
+// The guard, green before and after the fix: a run stopped before a single
+// delta has no server-confirmed partial, and the next send must not be handed
+// a parent id the server may never have seen. On a fresh chat that is the #34
+// discard (no chat ever reached the server); the next completion still opens
+// with an explicit null parent.
+@Test @MainActor func stopBeforeTheFirstDeltaLeavesNoPhantomParent() async throws {
+    let hub = ChatEventHub(server: testServer)
+    let transport = ScriptedTransport()
+    let conversation = makeQueueConversation(chatID: nil, transport: transport, hub: hub)
+
+    _ = try await startOpenRun(conversation, transport: transport, hub: hub)
+    // No frames at all: the placeholder turn is streaming with empty text.
+    conversation.stop()
+    try await waitUntilQueue { conversation.phase == .ready }
+    #expect(conversation.chatID == nil)
+
+    conversation.draft = "next question"
+    conversation.send()
+    try await transport.awaitCompletion(2)
+    let body = String(decoding: try #require(transport.completionBodies.last), as: UTF8.self)
+    #expect(body.contains("\"parent_id\":null"),
+            "a stopped empty placeholder must not become the next send's parent: \(body)")
+}
+
+// The other side of that guard, pinned after review (#52): on an EXISTING
+// chat the POST already landed, so the server knows the assistant id even
+// when not a single delta arrived — stopping there must still chain the
+// steered run through that assistant, not fork off the older leaf. The
+// phantom-parent risk the fresh-chat guard protects against does not exist
+// here: the id is server-confirmed by the landed completion.
+@Test @MainActor func steeredRunAfterAStopBeforeAnyDeltaStillParentsOffTheAssistant() async throws {
+    let hub = ChatEventHub(server: testServer)
+    let transport = ScriptedTransport()
+    let conversation = makeQueueConversation(chatID: "chat-1", transport: transport, hub: hub)
+
+    let assistant = try await startOpenRun(conversation, transport: transport, hub: hub)
+    // No frames at all — empty streaming placeholder on a chat the server has.
+    conversation.draft = "urgent"
+    conversation.send()
+    transport.gateNextStop()
+    let urgent = try #require(conversation.queue.items.first)
+    conversation.sendNow(id: urgent.id)
+    try await waitUntilQueue { transport.isStopGateParked }
+    transport.releaseStopGate()
+    try await waitUntilQueue { transport.completionBodies.count == 2 }
+
+    let body = String(decoding: try #require(transport.completionBodies.last), as: UTF8.self)
+    #expect(body.contains("\"parent_id\":\"\(assistant)\""),
+            "the stopped run's assistant is server-known even with no deltas: \(body)")
+}
