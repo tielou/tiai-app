@@ -179,7 +179,7 @@ func languagePicksTheVoice() {
 @MainActor
 final class SpeechRecordingTransport: APITransport, @unchecked Sendable {
     struct Call { let voice: String?; let started: Date }
-    private(set) var calls: [Call] = []
+    var calls: [Call] = []
     var fetchDelay: Duration = .milliseconds(100)
 
     func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
@@ -246,8 +246,7 @@ final class FakeSpeechEngine: SpeechPlaying, @unchecked Sendable {
     let transport = SpeechRecordingTransport()
     let engine = FakeSpeechEngine()
     let client = OWUIClient(
-        server: URL(string: "https://chat.example.co")!.withToken("tok").server.map { $0 }
-            ?? Server(baseURL: URL(string: "https://chat.example.co")!, token: "tok"),
+        server: Server(baseURL: URL(string: "https://chat.example.co")!, token: "tok"),
         transport: transport)
     let player = SpeechPlayer(client: client, engine: engine)
 

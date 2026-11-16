@@ -131,12 +131,28 @@ struct StreamingSentenceReader {
     }
 }
 
+/// The playback seam: takes audio bytes, makes sound, and can be stopped.
+///
+/// Extracted from SpeechPlayer so the queueing logic can be tested without an
+/// audio hardware layer (the macOS test build has no AVAudioPlayer path).
+@MainActor
+protocol SpeechPlaying: AnyObject {
+    func play(data: Data, mime: String) async
+    func stop()
+}
+
 /// Plays an answer out loud.
 ///
-/// Chunks are fetched one at a time and queued, so speech starts after the first
-/// one lands. A failure on the first chunk is reported; a failure later on just
-/// ends the reading, because losing the tail of an answer is not worth an error
-/// banner over the transcript.
+/// Chunks are prefetched one ahead of playback: while chunk N is audible, chunk
+/// N+1 is already being fetched, so the network round-trip hides inside audio
+/// the listener is hearing anyway. Sequential fetch-then-play was the "very
+/// slow" complaint — every chunk boundary paid the edge-tts cloud latency
+/// (~0.5-1.5s) as dead air. Memory stays flat: at most two chunks are ever in
+/// flight (the one playing, the one being fetched).
+///
+/// A failure on the first chunk is reported; a failure later on just ends the
+/// reading, because losing the tail of an answer is not worth an error banner
+/// over the transcript.
 @MainActor
 public final class SpeechPlayer: ObservableObject {
     @Published public private(set) var isPlaying = false
@@ -144,11 +160,17 @@ public final class SpeechPlayer: ObservableObject {
 
     private let client: OWUIClient
     private var voice: String?
-    private let engine = SpeechEngine()
+    private let engine: SpeechPlaying
     private var task: Task<Void, Never>?
+
+    init(client: OWUIClient, engine: SpeechPlaying) {
+        self.client = client
+        self.engine = engine
+    }
 
     public init(client: OWUIClient) {
         self.client = client
+        self.engine = SpeechEngine()
     }
 
     public func setVoice(_ voice: String?) { self.voice = voice }
@@ -169,13 +191,36 @@ public final class SpeechPlayer: ObservableObject {
         isPlaying = true
         task = Task { [weak self] in
             guard let self else { return }
-            for (index, chunk) in chunks.enumerated() {
-                if Task.isCancelled { break }
+            // Voice resolution runs ONCE on the full text, not per chunk: a
+            // two-word chunk gives the recognizer nothing to work with, while
+            // the whole answer gives it plenty. An explicit pick from Settings
+            // always wins over detection.
+            let voice = self.voice ?? VoiceLanguage.voice(for: markdown)
+            // Unstructured child tasks do not inherit the parent's
+            // cancellation, so every break path below cancels `next`
+            // explicitly.
+            func fetch(_ chunk: String) -> Task<Result<(Data, String), any Error>, Never> {
+                Task {
+                    do { return .success(try await self.client.speech(text: chunk, voice: voice)) }
+                    catch { return .failure(error) }
+                }
+            }
+            var inflight = fetch(chunks[0])
+            for index in chunks.indices {
+                if Task.isCancelled { inflight.cancel(); break }
+                // Arm the fetch for the NEXT chunk before awaiting playback of
+                // this one — that ordering is the whole prefetch. If the loop
+                // breaks before the result is wanted the child may still
+                // complete and be discarded: one wasted GET, acceptable next
+                // to never paying cloud latency between chunks.
+                var next: Task<Result<(Data, String), any Error>, Never>?
+                if index + 1 < chunks.count { next = fetch(chunks[index + 1]) }
                 do {
-                    let (data, type) = try await self.client.speech(text: chunk, voice: self.voice)
-                    if Task.isCancelled { break }
+                    let (data, type) = try await inflight.value.get()
+                    if Task.isCancelled { next?.cancel(); break }
                     await self.engine.play(data: data, mime: type)
                 } catch {
+                    next?.cancel()
                     // Only the first failure is worth saying out loud.
                     if index == 0 {
                         self.error = (error as? LocalizedError)?.errorDescription
@@ -183,6 +228,7 @@ public final class SpeechPlayer: ObservableObject {
                     }
                     break
                 }
+                if let next { inflight = next }
             }
             self.isPlaying = false
         }
@@ -203,7 +249,7 @@ public final class SpeechPlayer: ObservableObject {
 /// like its owner: `AVAudioPlayer` is, and the wait loop yields the actor while a
 /// chunk plays rather than blocking it.
 @MainActor
-final class SpeechEngine {
+final class SpeechEngine: SpeechPlaying {
     #if os(iOS)
     private var player: AVAudioPlayer?
 
@@ -215,9 +261,9 @@ final class SpeechEngine {
         let player = try? AVAudioPlayer(contentsOf: file)
         self.player = player
         player?.play()
-        // The queue is sequential by construction: the next chunk is not asked
-        // for until this one has finished, which keeps memory flat on a long
-        // answer instead of holding the whole reading in RAM.
+        // At most one chunk is ever fetched ahead of playback (see
+        // SpeechPlayer.read), which keeps memory flat on a long answer
+        // instead of holding the whole reading in RAM.
         while let p = self.player, p.isPlaying {
             try? await Task.sleep(for: .milliseconds(120))
         }
