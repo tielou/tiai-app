@@ -3328,8 +3328,20 @@ public final class ConversationModel {
             // answer. Frames for OTHER message ids never reach this line
             // (the filter above `continue`s past them) and must not re-arm:
             // a chatty neighbour must not keep a dead run's listener alive.
-            watchdog.cancel()
-            watchdog = hubExpireTimer(after: silenceLimit, gen: gen, assistantID: assistantID)
+            //
+            // #42 closed the third leg: a frame with NO message id also
+            // passed the filter (nil is not `!=`) and re-armed, so chatter
+            // that names the chat but no message kept a dead run "running"
+            // until the ceiling. Re-arming requires ATTRIBUTION —
+            // `messageID == assistantID` — because unattributed chatter is
+            // not proof THIS run is alive. A run that is really alive keeps
+            // naming its message; one that only sees unattributed chatter
+            // falls to the watchdog, and reconcile (which since the G5 fix
+            // also watches `.waiting` runs) reads the truth off the record.
+            if frame.messageID == assistantID {
+                watchdog.cancel()
+                watchdog = hubExpireTimer(after: silenceLimit, gen: gen, assistantID: assistantID)
+            }
             if let delta = frame.delta { pending?.text += delta }
             if let thinking = frame.reasoningDelta { pending?.reasoning += thinking }
             if let pending {

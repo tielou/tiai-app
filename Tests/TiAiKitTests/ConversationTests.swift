@@ -2700,6 +2700,78 @@ enum AskUserFixture {
             "superseded adoption loop kept fetching: \(transport.chatFetchCount - baseline) extra GETs (#42)")
 }
 
+// #42 hardening (G3): the silence watchdog measures silence ON THIS RUN'S
+// MESSAGE. Live capture shows real frames carry `message_id`, so this is
+// not the incident shape — it is the hole next to it: an unattributed
+// frame (a chat's chatter with no message id) is not proof THIS run is
+// alive, but the re-arm sat under the attribution filter's `continue`, so
+// it re-armed anyway and a dead run stayed "running" until the 900 s
+// ceiling. The fallback is reconcile, robust for `.waiting` runs since the
+// G5 fix. (Frames for a DIFFERENT message id are pinned by
+// `foreignFramesDoNotReArmTheSilenceWatchdog` — the drain filter already
+// stands them down.)
+//
+// The discriminator is timing, same shape as the #33 test: the burst
+// outlives the settle window, so the fixed code must settle ~silenceLimit
+// after the LAST ATTRIBUTED frame — while the burst is still arriving —
+// and the broken code can only settle after the burst ends.
+@Test @MainActor func messageLessFramesDoNotKeepADeadRunAlive() async throws {
+    let server = Server(baseURL: URL(string: "https://test.invalid")!, token: "t")
+    let hub = ChatEventHub(server: server)
+    let transport = ScriptedTransport()
+    let conversation = ConversationModel(
+        chatID: "chat-42-unattributed", models: [ChatModel.stub("local-personal")],
+        client: OWUIClient(server: server, transport: transport), hub: hub)
+    // Budgets are read at arm time, so both go in before the run.
+    conversation.silenceLimit = .milliseconds(300)
+    conversation.runCeiling = .seconds(30)
+    defer {
+        conversation.silenceLimit = ConversationModel.silenceLimit
+        conversation.runCeiling = ConversationModel.runCeiling
+    }
+
+    conversation.draft = "hello"
+    conversation.send()
+    try await transport.awaitCompletion()
+    let id = try #require(transport.assistantMessageID)
+    // The record the watchdog's reconcile fallback reads once the run is
+    // stood down: a complete answer, so settling on it is not a failure.
+    transport.chatDetailOverride =
+        chatDetailWithStoredAnswer("chat-42-unattributed", messageID: id, text: "one answer.")
+
+    // One attributed delta: the run is live, the watchdog is armed from it.
+    hub.receive(Frame.fixture(kind: "response:completion", chatID: "chat-42-unattributed", messageID: id, inner: [
+        "type": "response.output_text.delta", "delta": "one", "output_index": 1]))
+
+    // Then a burst of frames that name the chat but no message (the shape
+    // of the #42 `bare` frame with the chat_id half kept), delta-less so the
+    // test is about the re-arm and not about text attribution: faster than
+    // the silence budget (~50 ms against 300 ms) and LONGER than the settle
+    // window below (~2 s against 1 s). If unattributed frames re-arm, the
+    // watchdog can only fire after the burst ends — past the window — and
+    // the run is only saved by the 30 s ceiling, which is the bug.
+    let burst = Task { @MainActor in
+        for n in 0..<40 {
+            hub.receive(Frame.fixture(
+                kind: "response:completion", chatID: "chat-42-unattributed", messageID: nil,
+                inner: ["type": "response.keepalive\(n)"]))
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+    }
+
+    // Well inside the ceiling and shorter than the burst: the watchdog —
+    // not the ceiling — must end the run WHILE the chatter is arriving.
+    try await waitUntil(timeout: .seconds(1)) { conversation.phase == .ready }
+    burst.cancel()
+    #expect(conversation.phase == .ready,
+            "unattributed chatter must not keep a dead run alive to the ceiling (#42)")
+    let row = try #require(conversation.turns.first { $0.id == id })
+    #expect(row.text == "one answer.",
+            "the dead run must settle on the stored record: got \"\(row.text)\"")
+    #expect(conversation.error == nil,
+            "settling on the stored record is not a failure: \(conversation.error ?? "nil")")
+}
+
 // #26: the temporary:/local:/incognito early return in load() used to stamp
 // `.ready` unconditionally — mid-run, that unlocked the composer and
 // disarmed reconcile's phase guard, the exact bug #19 closed for the plain
