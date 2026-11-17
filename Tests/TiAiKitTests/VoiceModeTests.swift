@@ -252,6 +252,15 @@ private final class StubSpeaker: VoiceModeSpeaker {
         hub.receive(frame)
     }
     try await waitUntil { speaker.spoken == ["MAGIC"] }
+    // #58: the controller retires the stale complaint at the END of the
+    // cycle — a few instructions after the speaker records the utterance
+    // (the clear must not run if speech itself failed, so it lives after
+    // the speak await by design). Under full-suite main-actor load the
+    // poll above can observe the speech before the clear gets its turn,
+    // which is what made this flake ~1/8 runs. Test-only: production
+    // converges the same cycle, microseconds later — so wait for the
+    // clear instead of reading it once.
+    try await waitUntil { controller.error == nil }
     #expect(controller.error == nil, "a full cycle retires the old complaint")
     controller.stop()
 }
