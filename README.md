@@ -43,9 +43,10 @@ stay where they are. If you have the web UI, you have everything tiAi needs.
 
 ## How it was built
 
-Most of the code in this repository was written by AI coding agents — Claude,
-driven through a coding-agent harness with custom skills and subagents. I would
-rather say that up front than have you infer it from the commit log.
+Most of the code in this repository was written by AI coding agents — a terminal
+coding-agent harness with custom skills and subagents, pointed at hosted models
+and at a model I run on my own hardware. I would rather say that up front than
+have you infer it from the commit log.
 
 The split, concretely:
 
