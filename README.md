@@ -41,6 +41,31 @@ There is no backend here: tiAi speaks the HTTP API of whatever Open WebUI you
 already run, so accounts, history, memories, tools, web search and retrieval all
 stay where they are. If you have the web UI, you have everything tiAi needs.
 
+## How it was built
+
+Most of the code in this repository was written by AI coding agents — Claude,
+driven through a coding-agent harness with custom skills and subagents. I would
+rather say that up front than have you infer it from the commit log.
+
+The split, concretely:
+
+- **Mine:** what to build and why, the architecture (`docs/ARCHITECTURE.md`), the
+  issue each change is written against, the review that decides whether it merges,
+  and the release call.
+- **The agents':** implementation, test authoring, refactors, and the first pass
+  at diagnosing a bug report. Commits reading *review round 2* or *final review*
+  are an implement → review → fix loop, not one shot at a diff.
+- **The gate:** `make test` (swift-testing against real captured server fixtures)
+  plus the contract probe in `Sources/TiAiProbe` run against a live server.
+  "It compiles" is not a review.
+
+The workflow is the interesting part, which is why this section exists. An agent
+will happily send a chat-title request under the wrong key because the field name
+looks obvious; the reason it must go under `background_tasks` is that the server
+pops that key and ignores the other, and that only comes from reading the server
+source. Findings like that get written down in `docs/ARCHITECTURE.md`, so the next
+run does not have to rediscover them.
+
 ## Using it
 
 Install, type your server's URL, sign in with the same credentials the web UI
