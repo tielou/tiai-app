@@ -60,12 +60,10 @@ The split, concretely:
   plus the contract probe in `Sources/TiAiProbe` run against a live server.
   "It compiles" is not a review.
 
-The workflow is the interesting part, which is why this section exists. An agent
-will happily send a chat-title request under the wrong key because the field name
-looks obvious; the reason it must go under `background_tasks` is that the server
-pops that key and ignores the other, and that only comes from reading the server
-source. Findings like that get written down in `docs/ARCHITECTURE.md`, so the next
-run does not have to rediscover them.
+The authorship matters less than the process around it. The issue text, `make test`
+and `docs/ARCHITECTURE.md` are as much part of this repository as the Swift is —
+findings go into the docs so the next run starts from them instead of rediscovering
+them.
 
 ## Using it
 
