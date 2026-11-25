@@ -9,6 +9,21 @@ conversations live.
 sign-in all work against a live server. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it is put together.
 
+## What it looks like
+
+| Home | Streaming | Markdown and code |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/01-new-chat.png" width="210"> | <img src="docs/screenshots/02-streaming.png" width="210"> | <img src="docs/screenshots/03-answer-code.png" width="210"> |
+| Opens on a chat, not a list of them. Model, tools and attachments sit in the composer. | Token by token, with the stop control live the whole time. | Headings, lists and tables, code with copy, and the model and token count under every answer. |
+
+| Reasoning and tools | Settings | Where you are |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/06-thoughts-expanded.png" width="210"> | <img src="docs/screenshots/04-settings.png" width="210"> | <img src="docs/screenshots/05-sidebar.png" width="210"> |
+| *Thoughts* opens the model's reasoning, and each tool call is its own chip. | Defaults per server: system prompt, temperature, notifications, read-aloud voice. | Chats, notes, memory and settings in one drawer, recents underneath. |
+
+Screenshots are from the iPhone 16e simulator against a live server; the account
+and conversations shown are throwaway.
+
 ## What is in it
 
 The app opens on a chat, not on a list of them: an empty one with a greeting, with
